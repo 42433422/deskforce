@@ -45,7 +45,7 @@ jobs:
       # This lane is deliberately non-publishable until Authenticode exists.
       XCAGI_REQUIRE_WINDOWS_SIGNING: "0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha }}
 

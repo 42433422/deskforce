@@ -48,7 +48,7 @@ jobs:
       XCAUTO_API_KEY: ${{ secrets.AUTONOMY_STRONG_API_KEY }}
       XCAUTO_BASE_URL: ${{ vars.AUTONOMY_STRONG_BASE_URL }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           token: ${{ secrets.CI_COMMIT_TOKEN || github.token }}
 
@@ -171,7 +171,7 @@ jobs:
     if: ${{ inputs.mode == 'acceptance' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           token: ${{ secrets.CI_COMMIT_TOKEN || github.token }}
 
@@ -393,7 +393,7 @@ jobs:
       #（实证：run 34636879093 llm-benchmark job "No such file or directory"）。
       # 因此 checkout 必须最先执行；凭据缺失时仅跳过昂贵步骤。
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           token: ${{ secrets.CI_COMMIT_TOKEN || github.token }}
 

@@ -38,7 +38,7 @@ jobs:
       run:
         working-directory: FHD/mobile-flutter-poc
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha }}
       - name: Lock Android checkout to the immutable release SHA

@@ -101,7 +101,7 @@ jobs:
       XCAGI_TEST_AGENT_POSTGRES_URL: postgresql+psycopg://agent_test:agent-test-only@127.0.0.1:5432/agent_test
       XCAGI_SKIP_INTENT_LLM: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha || github.sha }}
       - uses: actions/setup-python@v7
@@ -152,7 +152,7 @@ jobs:
               exit 1
             fi
           done
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha || github.sha }}
           # 保留 HEAD~1 给手动运行；PR/base 与 push/before 在下方精确补取。
@@ -203,7 +203,7 @@ jobs:
       backend_matrix: ${{ steps.plan.outputs.matrix }}
       backend_total: ${{ steps.plan.outputs.total }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha || github.sha }}
           fetch-depth: 1
@@ -250,7 +250,7 @@ jobs:
           --health-retries 5
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha || github.sha }}
           # CI 加速：默认浅克隆；分类器/覆盖率地板自取 base（见下），失败即 fail-open 跑全量。
@@ -385,7 +385,7 @@ jobs:
       XCAGI_SKIP_LEGACY_COMPAT_ROUTES: "1"
       INTENT_BENCHMARK_RUN: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha || github.sha }}
           fetch-depth: 1
@@ -497,7 +497,7 @@ jobs:
             true:false) test "$SHARDS" = success ;;
             *) echo "::error::Invalid classifier decision"; exit 1 ;;
           esac
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha || github.sha }}
           fetch-depth: 1
@@ -576,7 +576,7 @@ jobs:
     needs: [guard-temp-scripts, classify]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha || github.sha }}
           fetch-depth: 1
@@ -632,7 +632,7 @@ jobs:
       FRONTEND_SHARD_TOTAL: "4"
       FRONTEND_SOURCE_SHA: ${{ inputs.release_sha || github.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha || github.sha }}
           fetch-depth: 1
@@ -694,7 +694,7 @@ jobs:
             true:false) test "$SHARDS" = success ;;
             *) echo "::error::Invalid classifier decision"; exit 1 ;;
           esac
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha || github.sha }}
           fetch-depth: 1
@@ -765,7 +765,7 @@ jobs:
         env:
           FRONTEND_RESULT: ${{ needs.frontend-test.result }}
         run: test "$FRONTEND_RESULT" = success
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha || github.sha }}
       - name: Preserve the original repository hygiene prerequisite
@@ -777,7 +777,7 @@ jobs:
     if: needs.classify.outputs.backend == 'true' || needs.classify.outputs.frontend == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha || github.sha }}
 
@@ -865,7 +865,7 @@ jobs:
     needs: guard-temp-scripts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha || github.sha }}
           fetch-depth: 0
@@ -934,7 +934,7 @@ jobs:
     needs: guard-temp-scripts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha || github.sha }}
 
@@ -962,7 +962,7 @@ jobs:
     if: needs.classify.outputs.backend == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha || github.sha }}
 
@@ -1035,7 +1035,7 @@ jobs:
     if: needs.classify.outputs.backend == 'true' || needs.classify.outputs.frontend == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha || github.sha }}
 
@@ -1090,7 +1090,7 @@ jobs:
       attestations: write  # actions/attest-build-provenance (SLSA)
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha || github.sha }}
 
@@ -1251,7 +1251,7 @@ jobs:
     # 正常发布只推必需 tarball + manifest；离线镜像归档仅手动显式启用。
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha || github.sha }}
           fetch-depth: 0
@@ -1391,7 +1391,7 @@ jobs:
       XCAGI_SKIP_LEGACY_COMPAT_ROUTES: "1"
       XCAGI_TENANT_STRICT: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha || github.sha }}
           # release_verify.sh 内跑 ssot gate，capability-center --check 需完整历史
@@ -1448,7 +1448,7 @@ jobs:
     if: needs.classify.outputs.macos != 'false'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha || github.sha }}
       - uses: actions/setup-node@v7
@@ -1469,7 +1469,7 @@ jobs:
     if: needs.classify.outputs.macos != 'false'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha || github.sha }}
       - uses: actions/setup-node@v7
@@ -1491,7 +1491,7 @@ jobs:
     if: needs.classify.outputs.windows != 'false'
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha || github.sha }}
       - uses: actions/setup-python@v7
@@ -1625,7 +1625,7 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha || github.sha }}
           # capability-center --check 需用 git log 重算证据 commit/verified_at，

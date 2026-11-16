@@ -57,7 +57,7 @@ jobs:
       matrix: ${{ steps.set.outputs.matrix }}
       parallel: ${{ steps.set.outputs.parallel }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
       - id: set
@@ -98,7 +98,7 @@ jobs:
       run:
         working-directory: FHD
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0

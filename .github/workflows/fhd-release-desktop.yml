@@ -138,7 +138,7 @@ jobs:
       XCAGI_WINDOWS_PUBLISHER_NAME: ${{ vars.XCAGI_WINDOWS_PUBLISHER_NAME }}
       XCAGI_WINDOWS_SIGNING_PROVIDER: sslcom
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha }}
       - name: Validate identity and resolve signing mode
@@ -286,7 +286,7 @@ jobs:
       DESKTOP_SSH_KEY: ${{ secrets.SERVER_SSH_KEY || secrets.FHD_PUSH_SSH_KEY }}
       DELIVERY_VERSION: ${{ inputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha }}
           fetch-depth: 0
@@ -510,7 +510,7 @@ jobs:
       FHD_PUSH_SSH_KEY: ${{ secrets.FHD_PUSH_SSH_KEY }}
       XCAGI_WINDOWS_PUBLISHER_NAME: ${{ vars.XCAGI_WINDOWS_PUBLISHER_NAME }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha }}
       - uses: actions/setup-python@v7
@@ -587,7 +587,7 @@ jobs:
       XCAGI_WINDOWS_PUBLISHER_NAME: ${{ vars.XCAGI_WINDOWS_PUBLISHER_NAME }}
       XCAGI_ARTIFACT_URL_PREFIX: https://xiu-ci.com/releases/builds/${{ inputs.version }}/${{ inputs.release_sha }}/enterprise
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha }}
       - name: Lock Windows checkout to release SHA
@@ -720,7 +720,7 @@ jobs:
       CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
       XCAGI_ARTIFACT_URL_PREFIX: https://xiu-ci.com/releases/builds/${{ inputs.version }}/${{ inputs.release_sha }}/enterprise
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha }}
       - name: Lock macOS checkout to release SHA
@@ -828,7 +828,7 @@ jobs:
       needs.macos.result == 'success'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha }}
       - name: Lock manifest checkout to release SHA
@@ -1092,7 +1092,7 @@ jobs:
       (inputs.verify_only == true || needs.generate-manifest.result == 'success')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 1
           ref: ${{ inputs.release_sha }}
@@ -1214,7 +1214,7 @@ jobs:
       (inputs.verify_only == true || needs.generate-manifest.result == 'success')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha }}
       - uses: actions/download-artifact@v8
@@ -1283,7 +1283,7 @@ jobs:
     env:
       XCAGI_WINDOWS_PUBLISHER_NAME: ${{ vars.XCAGI_WINDOWS_PUBLISHER_NAME }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha }}
       - name: Verify published Windows Authenticode signature
@@ -1563,7 +1563,7 @@ jobs:
       needs.verify-public-windows-signature.result == 'success' &&
       needs.verify-download-center.result == 'success'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha }}
       - uses: actions/download-artifact@v8

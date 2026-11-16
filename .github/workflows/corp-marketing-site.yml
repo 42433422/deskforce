@@ -61,7 +61,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # 能力中心 --check 需用 git log 重算证据 commit/verified_at，
           # 浅克隆（默认 1）只能命中 merge commit，必须完整历史（同 ssot-drift-gate）。
