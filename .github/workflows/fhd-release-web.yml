@@ -42,7 +42,7 @@ jobs:
   publish-frontend:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha }}
       - name: Lock web checkout to the immutable release SHA
@@ -88,7 +88,7 @@ jobs:
   docker:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha }}
       - name: Lock image checkout to the immutable release SHA

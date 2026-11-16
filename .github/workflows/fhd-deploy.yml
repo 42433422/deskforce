@@ -79,7 +79,7 @@ jobs:
 
       - name: Checkout exact production release for gate verification
         if: ${{ inputs.environment == 'production' && inputs.action == 'apply-latest' }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha }}
 

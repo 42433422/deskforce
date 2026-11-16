@@ -51,7 +51,7 @@ jobs:
       run:
         working-directory: .
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha }}
       - uses: actions/setup-python@v7
@@ -128,7 +128,7 @@ jobs:
       run:
         working-directory: FHD
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha || github.sha }}
       - uses: actions/setup-python@v7
@@ -167,7 +167,7 @@ jobs:
       run:
         working-directory: FHD
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha || github.sha }}
       - uses: actions/setup-node@v7
@@ -198,7 +198,7 @@ jobs:
       run:
         working-directory: .
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha }}
       - name: Deploy the exact SHA through the mandatory server sequence
@@ -325,7 +325,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_sha }}
       - name: Require every source and device to report the frozen release

@@ -26,7 +26,7 @@ jobs:
       X64_RUN: ${{ inputs.x64_run_id }}
       XCAGI_UPDATE_ED25519_PRIVATE_KEY: ${{ secrets.XCAGI_UPDATE_ED25519_PRIVATE_KEY }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with: {ref: '${{ inputs.build_sha }}'}
       - uses: actions/setup-python@v7
         with: {python-version: '3.12'}
