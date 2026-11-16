@@ -33,7 +33,7 @@ web = [
     "PyYAML>=6.0",
     "paramiko>=3.4",
     "cryptography>=50.0.2",
-    "prometheus-client>=0.20",
+    "prometheus-client>=0.26.0",
     "pika>=1.3",
     "edge-tts>=6.1",
     # Was previously pulled in transitively by qq-botpy; keep explicit after QQ Bot retirement.
