@@ -1,0 +1,700 @@
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+import yaml
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 release-gate runner.
+    import tomli as tomllib
+
+ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = ROOT.parents[1]
+RELEASE_SCRIPT = ROOT / "scripts/xcmax-immutable-release.sh"
+UPGRADE_DATABASE_SCRIPT = ROOT / "scripts/upgrade_database.py"
+PYPROJECT = ROOT / "pyproject.toml"
+
+
+def test_private_delivery_migration_uses_persistent_library_and_stopped_window():
+    script = RELEASE_SCRIPT.read_text(encoding="utf-8")
+    assert 'LIBRARY_DIR="${MODMAN_LIBRARY:-${RUNTIME_DIR%/}/library}"' in script
+    assert "MODMAN_LIBRARY=%s" in script
+    preflight = script.index("migrate_delivery_state true")
+    stop = script.index("systemctl stop modstore.service modstore-scheduler.service", preflight)
+    copied = script.index("migrate_delivery_state false", stop)
+    promote = script.index('ln -s "$FINAL_ROOT" "${CURRENT_LINK}.next"')
+    final_verify = script.rindex("verify_fixed_release_approval", 0, stop)
+    assert preflight < final_verify < stop < copied < promote
+    assert "verify_fixed_release_approval" not in script[stop:promote]
+    assert (
+        'TARGET_SHA="$PREVIOUS_SHA" LIBRARY_DIR="$PREVIOUS_LIBRARY_DIR" write_service_units'
+        in script
+    )
+    assert 'if [[ "$status" != 0 && "$CATALOG_SERVICES_STOPPED" == 1 ]]' in script
+    helper = script[script.index("migrate_delivery_state() {") : preflight]
+    assert "systemctl stop" not in helper
+    assert 'dry_run=mode == "true"' in helper
+    assert "legacy_library=Path(previous_library)" in helper
+
+
+@pytest.mark.parametrize("external", [False, True], ids=["release-library", "stable-library"])
+def test_delivery_library_selector_preserves_existing_stable_root(tmp_path, external):
+    script = RELEASE_SCRIPT.read_text(encoding="utf-8")
+    start = script.index("select_library_target() {")
+    end = script.index("\n}\n", start) + 3
+    releases = tmp_path / "releases"
+    previous = releases / ("a" * 40)
+    wanted = tmp_path / "runtime/library"
+    active = tmp_path / "existing/library" if external else previous / "library"
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            script[start:end] + '\nselect_library_target "$1" "$2" "$3" "$4"\n',
+            "library-probe",
+            str(wanted),
+            str(active),
+            str(previous),
+            str(releases),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(active if external else wanted)
+    assert not wanted.exists() and not active.exists()
+
+
+def _compiler_probe(release: Path, node: str) -> subprocess.CompletedProcess[str]:
+    script = RELEASE_SCRIPT.read_text(encoding="utf-8")
+    start = script.index("verify_runtime_mod_compiler() {")
+    end = script.index('\n[[ "$TARGET_SHA"', start)
+    probe = script[start:end] + '\nverify_runtime_mod_compiler "$1" "$2"\n'
+    env = dict(os.environ)
+    for name in ("NODE_PATH", "NODE_OPTIONS", "ESBUILD_BINARY_PATH"):
+        env.pop(name, None)
+    return subprocess.run(
+        ["bash", "-c", probe, "compiler-probe", str(release), node],
+        capture_output=True,
+        text=True,
+        cwd=release,
+        env=env,
+        timeout=30,
+    )
+
+
+@pytest.fixture
+def compiler_release(tmp_path: Path) -> tuple[Path, str, Path]:
+    node = shutil.which("node")
+    assert node, "the release contract requires Node.js and locked frontend dependencies"
+    node = str(Path(node).resolve())
+    platform = subprocess.run(
+        [node, "-p", 'process.platform + "-" + process.arch'],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    source = REPO_ROOT / "FHD/frontend"
+    frontend = tmp_path / "release/FHD/frontend"
+    frontend.mkdir(parents=True)
+    for name in ("package.json", "package-lock.json"):
+        shutil.copy2(source / name, frontend / name)
+    # Copy the real locked JS loader and this machine's native binary. No install,
+    # stubs, writes to shared node_modules, or execution of deployment actions.
+    for name in ("esbuild", f"@esbuild/{platform}"):
+        shutil.copytree(source / "node_modules" / name, frontend / "node_modules" / name)
+    return tmp_path / "release", node, frontend / "node_modules/@esbuild" / platform
+
+
+def test_runtime_mod_compiler_executes_locked_native_bundle_without_outputs(
+    compiler_release: tuple[Path, str, Path],
+) -> None:
+    release, node, _ = compiler_release
+    before = sorted(str(path.relative_to(release)) for path in release.rglob("*"))
+    result = _compiler_probe(release, node)
+    assert result.returncode == 0, result.stderr
+    receipt = json.loads(result.stdout)
+    lock = json.loads((release / "FHD/frontend/package-lock.json").read_text())
+    assert receipt["runtime_mod_compiler"] == "ready"
+    assert receipt["esbuild"] == lock["packages"]["node_modules/esbuild"]["version"]
+    assert sorted(str(path.relative_to(release)) for path in release.rglob("*")) == before
+
+
+@pytest.mark.parametrize("fault", ["missing_optional", "invalid_native", "wrong_lock"])
+def test_runtime_mod_compiler_rejects_unusable_release(
+    compiler_release: tuple[Path, str, Path], fault: str
+) -> None:
+    release, node, native_package = compiler_release
+    if fault == "missing_optional":
+        shutil.rmtree(native_package)
+    elif fault == "invalid_native":
+        binary = native_package / "bin/esbuild"
+        binary.write_bytes(b"this is not an executable for this platform\n")
+        binary.chmod(0o755)
+    else:
+        lock_path = release / "FHD/frontend/package-lock.json"
+        lock = json.loads(lock_path.read_text())
+        lock["packages"]["node_modules/esbuild"]["version"] = "0.0.0"
+        lock_path.write_text(json.dumps(lock))
+    result = _compiler_probe(release, node)
+    assert result.returncode != 0
+    assert '"runtime_mod_compiler":"ready"' not in result.stdout
+    expected_error = {
+        "missing_optional": "MODULE_NOT_FOUND",
+        "invalid_native": "esbuild",
+        "wrong_lock": "esbuild must match the frontend lock",
+    }[fault]
+    assert expected_error in result.stderr
+
+
+def test_private_mod_compiler_is_retained_and_verified_before_release_promotion() -> None:
+    script = RELEASE_SCRIPT.read_text(encoding="utf-8")
+    install = script.index('npm ci --prefix "$BUILD_ROOT/FHD/frontend"')
+    prepared_probe = script.index('verify_runtime_mod_compiler "$BUILD_ROOT"')
+    promoted_probe = script.index('verify_runtime_mod_compiler "$FINAL_ROOT"')
+    assert "--include=dev --include=optional" in script[install:prepared_probe]
+    assert "--ignore-scripts" in script[install:prepared_probe]
+    assert install < prepared_probe < script.index('chmod -R a-w "$BUILD_ROOT"')
+    assert promoted_probe < script.index("applying database migrations")
+    assert promoted_probe < script.index('ln -s "$FINAL_ROOT" "${CURRENT_LINK}.next"')
+    assert 'RUNTIME_NODE_BIN="$(readlink -f "$RUNTIME_NODE_BIN")"' in script
+    assert '[[ "$RUNTIME_NODE_BIN" == /* && -x "$RUNTIME_NODE_BIN" ]]' in script
+    assert "MODSTORE_NODE_EXECUTABLE=%s\\n" in script
+    assert script.index("MODSTORE_NODE_EXECUTABLE=%s\\n") < script.index(
+        'mv -f "${release_env}.tmp" "$release_env"'
+    )
+    assert "EnvironmentFile=-${release_env}" in script
+
+
+def test_immutable_release_is_exact_sha_atomic_and_rolls_back() -> None:
+    script = RELEASE_SCRIPT.read_text(encoding="utf-8")
+    upgrade_script = UPGRADE_DATABASE_SCRIPT.read_text(encoding="utf-8")
+    pyproject = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+
+    assert "XCMAX_TARGET_SHA must be a full 40-character commit SHA" in script
+    assert 'git -C "$SOURCE_ROOT" archive --format=tar "$TARGET_SHA"' in script
+    assert 'FINAL_ROOT="${RELEASES_DIR}/${TARGET_SHA}"' in script
+    assert 'chmod 0555 "$FINAL_ROOT"' in script
+    assert script.index('chmod 0555 "$FINAL_ROOT"') < script.index(
+        'ln -s "$FINAL_ROOT" "${CURRENT_LINK}.next"'
+    )
+    assert 'mv -Tf "${CURRENT_LINK}.next" "$CURRENT_LINK"' in script
+    assert "exact-SHA local health verification failed" in script
+    assert 'sha256sum "$SOURCE_ARCHIVE"' in script
+    assert 'payload.get("artifact_sha256") == expected_artifact' in script
+    assert (
+        'verify_health_identity "$PUBLIC_HEALTH_URL" "$TARGET_SHA" "$EXPECTED_ARTIFACT_SHA"'
+        in script
+    )
+    assert "rollback" in script
+    assert "reset --hard" not in script
+    assert "/etc/xcmax" in script
+    assert script.index('migrate_env_file "$ENV_FILE"') < script.index(
+        "import fastapi, pytest, pytest_cov, uvicorn, modstore_server.app"
+    )
+    assert 'BUILD_JWT_SECRET="$(read_env_value "$ENV_FILE" MODSTORE_JWT_SECRET)"' in script
+    assert 'BUILD_DATABASE_URL="$(read_env_value "$ENV_FILE" MODSTORE_DATABASE_URL)"' in script
+    assert 'BUILD_DATABASE_URL="$(read_env_value "$ENV_FILE" DATABASE_URL)"' in script
+    assert "MODSTORE_ENV=production" in script
+    assert 'MODSTORE_JWT_SECRET="$BUILD_JWT_SECRET"' in script
+    assert 'MODSTORE_RUNTIME_DIR="$BUILD_ROOT/.runtime-build"' in script
+    assert "MODSTORE_INSECURE_EMPTY_JWT" not in script
+    assert ".[web,knowledge,evolution-metrics,governance]" in script
+    assert '"$BUILD_ROOT/packages/retort_engine"' in script
+    assert '"$BUILD_ROOT/packages/xcagi_common"' in script
+    assert (
+        "retort-engine>=0.4.0,<0.5" in pyproject["project"]["optional-dependencies"]["governance"]
+    )
+    assert "alembic>=1.16,<2" in pyproject["project"]["optional-dependencies"]["web"]
+    assert "pandas>=2.0" in pyproject["project"]["optional-dependencies"]["evolution-metrics"]
+    assert "import fastapi, pytest, pytest_cov, uvicorn, modstore_server.app" in script
+    assert "Environment=MODSTORE_BUS=rabbitmq" not in script
+    assert "npm ci --no-audit --legacy-peer-deps --ignore-scripts" in script
+    assert "node scripts/install-native-bindings.mjs" in script
+    assert script.index("--ignore-scripts") < script.index("npm run build")
+    media = script.index(
+        '"$RUNTIME_NODE_BIN" "$BUILD_ROOT/scripts/dev/materialize_media_assets.mjs" marketing'
+    )
+    assert script.index("npm run build") < media < script.index('chmod -R a-w "$BUILD_ROOT"')
+    assert '|| fail "cannot reconstruct checksum-pinned public site media"' in script
+    assert (
+        'MODSTORE_DATABASE_URL="$BUILD_DATABASE_URL" .venv/bin/python scripts/upgrade_database.py'
+        in script
+    )
+    assert "schema migration verified heads=" in upgrade_script
+    assert script.index("applying database migrations") < script.index(
+        'ln -s "$FINAL_ROOT" "${CURRENT_LINK}.next"'
+    )
+    assert "resolve_java_home" in script
+    assert "/usr/lib/jvm/java-17-*" in script
+    assert 'PAYMENT_JAVA_BIN="${JAVA_HOME}/bin/java"' in script
+    assert "ExecStart=${PAYMENT_JAVA_BIN} -jar" in script
+    assert "verify_payment_identity" in script
+    assert "/actuator/info" in script
+    assert "MODSTORE_RELEASE_ARTIFACT_SHA256" in script
+    assert 'RELEASE_ID="xcagi-${PRODUCT_VERSION}-${TARGET_SHA}"' in script
+    assert '"release_id": release_id' in script
+    assert "XCMAX_RELEASE_SHA=%s" in script
+    assert "XCMAX_PRODUCT_VERSION=%s" in script
+    assert 'RUNTIME_DIR="${MODSTORE_RUNTIME_DIR:-${RELEASE_BASE}/runtime}"' in script
+    assert '[[ "$RUNTIME_DIR" == /* ]]' in script
+    assert 'install -d -m 700 "$RUNTIME_DIR"' in script
+    assert 'CATALOG_DIR="${MODSTORE_CATALOG_DIR:-${RUNTIME_DIR%/}/catalog}"' in script
+    assert "MODSTORE_CATALOG_DIR=%s" in script
+    assert "verify_catalog_runtime_dir modstore.service" in script
+    assert "verify_catalog_runtime_dir modstore-scheduler.service" in script
+    assert script.index(
+        "systemctl stop modstore.service modstore-scheduler.service"
+    ) < script.index('cp -a "$CATALOG_SOURCE/."')
+    assert script.index('cp -a "$CATALOG_SOURCE/."') < script.index(
+        'ln -s "$FINAL_ROOT" "${CURRENT_LINK}.next"'
+    )
+    assert 'modstore_server/market_files" "$CATALOG_STAGE/market_files"' in script
+    assert "inactive catalog differs from live snapshot" in script
+    assert 'rm -rf -- "$CATALOG_STAGE" || log' in script
+    assert script.index(
+        'CATALOG_STAGE=""', script.index('mv "$CATALOG_STAGE" "$CATALOG_DIR"')
+    ) < script.index('python3 - "$CATALOG_DIR/packages.json"')
+    assert "MODSTORE_RUNTIME_DIR=%s" in script
+    assert "MODSTORE_REPO_ROOT=%s" in script
+    assert "XCMAX_MONOREPO_ROOT=%s" in script
+    assert "MODSTORE_CAPABILITY_PROPOSAL_REPO=%s" in script
+    assert 'GITHUB_REPOSITORY_SLUG="${XCMAX_GITHUB_REPOSITORY:-}"' in script
+    assert 'CLI_LAUNCHER_PATH="${XCMAX_CLI_LAUNCHER_PATH:-/usr/local/bin/xcmax-terminal}"' in script
+    assert "install_cli_launcher" in script
+    assert 'exec "${CURRENT_LINK}/${MODSTORE_SUBDIR}/.venv/bin/python"' in script
+    assert "verify_cli_identity" in script
+    assert "xcmax-terminal exact-SHA identity verification failed" in script
+    assert "JAVA_PAYMENT_SERVICE_URL=http://127.0.0.1:8080" in script
+    assert '"$RUNTIME_DIR" "$CATALOG_DIR" "$CURRENT_LINK" "$CURRENT_LINK"' in script
+    assert "verify_customer_value_reconciler" in script
+    assert "customer value reconciler did not prove" in script
+    reconciler_gate = script[
+        script.index("verify_customer_value_reconciler()") : script.index("PREVIOUS_SHA=")
+    ]
+    assert 'assert payload.get("ok") is True' not in reconciler_gate
+    assert 'assert isinstance(payload.get("jobs"), list)' in reconciler_gate
+    assert 'assert job.get("state") == "healthy"' in reconciler_gate
+    assert 'RELEASES_TO_KEEP="${XCMAX_RELEASES_TO_KEEP:-4}"' in script
+    assert 'prune_releases "$CURRENT_ROOT_BEFORE_BUILD" "$RELEASES_DIR/$TARGET_SHA"' in script
+    assert 'prune_releases "$FINAL_ROOT" "$PREVIOUS_ROOT"' in script
+    payment_restart = script.index(
+        "systemctl restart modstore-payment.service",
+        script.index('ln -s "$FINAL_ROOT"'),
+    )
+    python_restart = script.index(
+        "systemctl restart modstore.service modstore-scheduler.service",
+        script.index('ln -s "$FINAL_ROOT"'),
+    )
+    assert payment_restart < python_restart
+    assert script.index(
+        "resolve_java_home", script.index("PAYMENT_SERVICE_PRESENT=0")
+    ) < script.index("mvn -B -q -DskipTests package")
+
+    source_ci = yaml.safe_load((ROOT / ".github/workflows/ci-backend-python.yml").read_text())
+    published_ci = yaml.safe_load(
+        (REPO_ROOT / ".github/workflows/modstore-ci-backend-python.yml").read_text()
+    )
+    source_java_job = source_ci["jobs"]["java-payment-test"]
+    published_java_job = published_ci["jobs"]["java-payment-test"]
+    assert source_java_job["defaults"]["run"]["working-directory"] == "java_payment_service"
+    assert published_java_job["defaults"]["run"]["working-directory"] == (
+        "成都修茈科技有限公司/MODstore_deploy/java_payment_service"
+    )
+    assert any(step.get("run") == "mvn -B test package" for step in source_java_job["steps"])
+
+    payment_config = yaml.safe_load(
+        (ROOT / "java_payment_service/src/main/resources/application.yml").read_text()
+    )
+    assert payment_config["management"]["info"]["env"]["enabled"] is True
+    assert payment_config["info"]["xcmax"]["git-sha"] == "${MODSTORE_GIT_SHA:}"
+    assert payment_config["info"]["xcmax"]["artifact-sha256"] == (
+        "${MODSTORE_RELEASE_ARTIFACT_SHA256:}"
+    )
+
+
+def test_stopped_service_resolves_current_release_catalog(tmp_path: Path) -> None:
+    script = RELEASE_SCRIPT.read_text(encoding="utf-8")
+    start = script.index('ACTIVE_CATALOG_DIR="$(python3 -')
+    start = script.index("<<'PY'\n", start) + len("<<'PY'\n")
+    probe = script[start : script.index("\nPY", start)]
+    fallback = tmp_path / "old-release/catalog_data"
+    persistent = tmp_path / "runtime/catalog"
+    release_env = tmp_path / "modstore-release.env"
+    sha = "a" * 40
+    release_env.write_text(f"MODSTORE_GIT_SHA={sha}\nMODSTORE_CATALOG_DIR={persistent}\n")
+    command = [sys.executable, "-", "0", str(fallback), str(release_env), sha]
+    result = subprocess.run(command, input=probe, text=True, capture_output=True, check=True)
+    assert result.stdout.strip() == str(persistent)
+    command[-1] = "b" * 40
+    stale = subprocess.run(command, input=probe, text=True, capture_output=True, check=True)
+    assert stale.stdout.strip() == str(fallback)
+
+
+@pytest.mark.parametrize("preserve", ["0", "1"])
+def test_release_retention_prunes_only_verified_sha_directories(
+    tmp_path: Path, preserve: str
+) -> None:
+    source_root = tmp_path / "source"
+    release_base = tmp_path / "xcmax"
+    releases = release_base / "releases"
+    runtime = release_base / "runtime"
+    env_dir = tmp_path / "env"
+    public_state = tmp_path / "public"
+    source_root.mkdir()
+    (source_root / ".git").mkdir()
+    releases.mkdir(parents=True)
+
+    shas = [f"{number:040x}" for number in range(1, 7)]
+    for position, sha in enumerate(shas, start=1):
+        release = releases / sha
+        release.mkdir()
+        (release / ".xcmax-release.json").write_text(json.dumps({"git_sha": sha}), encoding="utf-8")
+        os.utime(release, (position, position))
+
+    malformed_sha = "f" * 40
+    malformed = releases / malformed_sha
+    malformed.mkdir()
+    (malformed / ".xcmax-release.json").write_text(
+        json.dumps({"git_sha": "0" * 40}), encoding="utf-8"
+    )
+    os.utime(malformed, (99, 99))
+    unrelated = releases / "manual-backup"
+    unrelated.mkdir()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_flock = fake_bin / "flock"
+    fake_flock.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    fake_flock.chmod(0o755)
+    current_link = release_base / "current"
+    current_link.symlink_to(releases / shas[0])
+
+    result = subprocess.run(
+        ["bash", str(RELEASE_SCRIPT)],
+        capture_output=True,
+        text=True,
+        # Apple Bash 3.2 falls back to cwd for heredoc temporary files when its
+        # system temp directory is denied; keep that fallback inside this test.
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "TMPDIR": str(tmp_path),
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "XCMAX_ALLOW_CUSTOM_RELEASE_BASE": "1",
+            "XCMAX_CURRENT_LINK": str(current_link),
+            "XCMAX_PUBLIC_SITE_STATE_DIR": str(public_state),
+            "XCMAX_RELEASE_BASE": str(release_base),
+            "XCMAX_RELEASE_LOCK": str(tmp_path / "release.lock"),
+            "XCMAX_RELEASE_PRUNE_ONLY": "1",
+            "XCMAX_PRESERVE_RELEASE_HISTORY": preserve,
+            "XCMAX_RELEASES_TO_KEEP": "3",
+            "XCMAX_SOURCE_ROOT": str(source_root),
+            "XCMAX_TARGET_SHA": shas[1],
+            "MODSTORE_ENV_DIR": str(env_dir),
+            "MODSTORE_RUNTIME_DIR": str(runtime),
+        },
+    )
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    remaining = {item.name for item in releases.iterdir()}
+    expected = set(shas) if preserve == "1" else {shas[0], shas[1], shas[-1]}
+    assert remaining.intersection(shas) == expected
+    assert malformed_sha in remaining
+    assert unrelated.name in remaining
+    if preserve == "1":
+        assert "preserving all release history" in result.stdout
+    else:
+        assert "release retention complete kept=3 removed=3 limit=3" in result.stdout
+        assert "skipping unverified release directory" in result.stdout
+
+
+def test_release_retention_rejects_unsafe_limit(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    (source_root / ".git").mkdir()
+    result = subprocess.run(
+        ["bash", str(RELEASE_SCRIPT)],
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "XCMAX_ALLOW_CUSTOM_RELEASE_BASE": "1",
+            "XCMAX_RELEASE_BASE": str(tmp_path / "xcmax"),
+            "XCMAX_RELEASES_TO_KEEP": "1",
+            "XCMAX_SOURCE_ROOT": str(source_root),
+            "XCMAX_TARGET_SHA": "1" * 40,
+        },
+    )
+
+    assert result.returncode != 0
+    assert "XCMAX_RELEASES_TO_KEEP must be an integer greater than or equal to 2" in result.stderr
+
+
+def test_production_workflow_requires_manually_orchestrated_exact_sha() -> None:
+    source = yaml.safe_load((ROOT / ".github/workflows/prod-deploy.yml").read_text())
+    published = yaml.safe_load(
+        (REPO_ROOT / ".github/workflows/modstore-prod-deploy.yml").read_text()
+    )
+
+    for workflow in (source, published):
+        trigger = workflow[True]
+        assert "workflow_run" not in trigger
+        assert trigger["workflow_dispatch"]["inputs"]["git_sha"]["required"] is True
+        assert (
+            trigger["workflow_dispatch"]["inputs"]["preserve_release_history"]["default"] is False
+        )
+        assert trigger["workflow_dispatch"]["inputs"]["security_scan_run_id"]["required"] is True
+        assert (
+            trigger["workflow_dispatch"]["inputs"]["previous_security_scan_run_id"]["required"]
+            is True
+        )
+        deploy = workflow["jobs"]["deploy"]
+        rendered = str(deploy)
+        assert "TARGET_SHA" in rendered
+        assert "REPOSITORY_SLUG" in rendered
+        assert "XCMAX_GITHUB_REPOSITORY" in rendered
+        assert "XCMAX_PRODUCT_VERSION" in rendered
+        assert "xcmax-immutable-release.sh" in rendered
+        assert "export XCMAX_PRESERVE_RELEASE_HISTORY=" in rendered
+        assert "${CONTROLLER_SHA}:ops/dr/$file" in rendered
+        assert "modstore-deployment-correlation" in rendered
+        assert "actions/upload-artifact@v4" in rendered
+        assert "verify_security_scan_pair.py" in rendered
+        assert "actions/download-artifact@v8" in rendered
+        assert "reset --hard" not in rendered
+
+
+def test_receipt_source_attestation_executes_strict_identity_checks(
+    tmp_path: Path,
+) -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/prod-deploy-receipt.yml").read_text())
+    published = yaml.safe_load(
+        (REPO_ROOT / ".github/workflows/modstore-prod-deploy-receipt.yml").read_text()
+    )
+    assert workflow == published
+    rendered = str(workflow)
+    for marker in (
+        "MODSTORE_OPS_INGEST_TOKEN",
+        "/api/ops/self-maintenance/deployment-receipt",
+        ".recorded == true or .idempotent == true",
+        "/api/ops/self-maintenance/evolution-deployment-receipt",
+        'cmp --silent "$source_archive" "$archive"',
+        "FHD/scripts/dev/publish_modstore.py",
+    ):
+        assert marker in rendered
+    script = next(s["run"] for s in workflow["jobs"]["receipt"]["steps"] if s.get("id") == "source")
+    product, controller = "a" * 40, "b" * 40
+    canonical = {"id": 12, "path": ".github/workflows/modstore-prod-deploy.yml"}
+    source = dict(
+        canonical,
+        id=34,
+        workflow_id=12,
+        head_sha=controller,
+        head_branch="main",
+        event="workflow_dispatch",
+        status="completed",
+        conclusion="success",
+        repository={"full_name": "owner/repo"},
+        name=f"Deploy MODstore {product}",
+    )
+    correlation = dict(
+        merge_sha=product,
+        git_sha=product,
+        controller_sha=controller,
+        environment="production",
+        approval_reference="existing approval",
+    )
+    directory = tmp_path / "modstore-deployment-correlation"
+    directory.mkdir()
+    stub = tmp_path / "gh"
+    stub.write_text(
+        '#!/bin/bash\ncase "$2" in\n*/workflows/*) cat "$RUNNER_TEMP/workflow.json";;\n*/runs/*) cat "$RUNNER_TEMP/source.json";;\n*/compare/*) cat "$RUNNER_TEMP/compare.json";;\n*) exit 99;;\nesac\n'
+    )
+    stub.chmod(0o755)
+    (tmp_path / "workflow.json").write_text(json.dumps(canonical))
+    for field, value in [
+        (None, None),
+        ("legacy", None),
+        ("id", 35),
+        ("workflow_id", 13),
+        ("path", "other.yml"),
+        ("head_sha", product),
+        ("head_branch", "other"),
+        ("event", "push"),
+        ("conclusion", "failure"),
+        ("status", "in_progress"),
+        ("repository", {"full_name": "other/repo"}),
+        ("git_sha", controller),
+        ("ancestry", controller),
+        ("controller_sha", "invalid"),
+    ]:
+        run, corr = source.copy(), correlation.copy()
+        comparison = {"status": "ahead", "merge_base_commit": {"sha": product}}
+        if field == "legacy":
+            corr.pop("controller_sha")
+            run["head_sha"] = product
+        elif field == "ancestry":
+            comparison["merge_base_commit"]["sha"] = value
+        elif field in corr:
+            corr[field] = value
+        elif field:
+            run[field] = value
+        for path, data in [
+            (directory / "modstore-deployment-correlation.json", corr),
+            (tmp_path / "source.json", run),
+            (tmp_path / "compare.json", comparison),
+        ]:
+            path.write_text(json.dumps(data))
+        output = tmp_path / "output"
+        output.write_text("")
+        result = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "PATH": f"{tmp_path}:{os.environ['PATH']}",
+                "RUNNER_TEMP": str(tmp_path),
+                "GITHUB_OUTPUT": str(output),
+                "GITHUB_REPOSITORY": "owner/repo",
+                "SOURCE_WORKFLOW_ID": "34",
+            },
+        )
+        assert (result.returncode == 0) == (field in (None, "legacy")), (
+            field,
+            result.stderr,
+        )
+        if result.returncode == 0:
+            assert f"merge_sha={product}\n" in output.read_text()
+
+
+def test_corp_site_deploy_uses_canonical_vhost_and_fails_closed_on_public_smoke() -> None:
+    updater = (ROOT / "scripts/xcmax-site-auto-update.sh").read_text(encoding="utf-8")
+    workflow = (REPO_ROOT / ".github/workflows/corp-site-deploy.yml").read_text(encoding="utf-8")
+
+    canonical_vhost = "/etc/nginx/conf.d/xiu-ci.com.conf"
+    assert canonical_vhost in updater
+    assert canonical_vhost in workflow
+    assert "skip conflicting standalone corp vhost" in workflow
+    for public_url in (
+        "https://xiu-ci.com/",
+        "https://xiu-ci.com/developer.html",
+        "https://xiu-ci.com/market/download",
+        "https://xiu-ci.com/market/",
+    ):
+        assert public_url in workflow
+    assert "developer.html | head -8 | grep -i title || true" not in workflow
+
+
+def test_corp_site_deploy_publishes_and_verifies_world_will_ticker() -> None:
+    updater = (ROOT / "scripts/xcmax-site-auto-update.sh").read_text(encoding="utf-8")
+    workflow = (REPO_ROOT / ".github/workflows/corp-site-deploy.yml").read_text(encoding="utf-8")
+    homepage = (REPO_ROOT / "成都修茈科技有限公司/index.html").read_text(encoding="utf-8")
+    visualization = (REPO_ROOT / "成都修茈科技有限公司/visualization.html").read_text(
+        encoding="utf-8"
+    )
+
+    assert '"$git_site"/world-will-ticker.js' in updater
+    assert '"$git_site"/world-will-ticker.css' in updater
+    assert "'成都修茈科技有限公司/world-will-ticker.js'" in workflow
+    assert "'成都修茈科技有限公司/world-will-ticker.css'" in workflow
+    assert '"${GIT_SITE}/world-will-ticker.js"' in workflow
+    assert '"${GIT_SITE}/world-will-ticker.css"' in workflow
+    assert "https://xiu-ci.com/world-will-ticker.js" in workflow
+    assert "https://xiu-ci.com/world-will-ticker.css" in workflow
+    assert "grep -F -q '/api/public/action-board' /tmp/xc-world-will-ticker.js" in workflow
+    for page in (homepage, visualization):
+        assert 'href="/world-will-ticker.css?v=20260729a"' in page
+        assert 'src="/world-will-ticker.js?v=20260729a"' in page
+
+
+def test_fixed_release_guard_rejects_production_advance(tmp_path: Path) -> None:
+    repo = tmp_path / "source"
+    repo.mkdir()
+
+    def git(*args: str) -> str:
+        return subprocess.check_output(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "-c",
+                "user.name=release-test",
+                "-c",
+                "user.email=release-test@example.invalid",
+                *args,
+            ],
+            text=True,
+        ).strip()
+
+    git("init", "-q")
+
+    def commit(value: str) -> str:
+        (repo / "change").write_text(value)
+        git("add", ".")
+        git("commit", "-qm", value)
+        return git("rev-parse", "HEAD")
+
+    previous = commit("previous")
+    target = commit("target")
+    approvals = repo / "ops/releases"
+    approvals.mkdir(parents=True)
+    (approvals / f"{target}.json").write_text(
+        json.dumps(
+            dict(
+                git_sha=target,
+                expected_production_sha=previous,
+                product_version="1.0.0.6",
+                approval_reference="human",
+                approval_scope="modstore",
+            )
+        )
+    )
+    controller = commit("approved-controller")
+    git("update-ref", "refs/remotes/origin/main", controller)
+    current = tmp_path / "current"
+    current.mkdir()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "curl").write_text('#!/bin/sh\ncat "$CURRENT_LINK/health.json"\n')
+    (fake_bin / "curl").chmod(0o755)
+    script = RELEASE_SCRIPT.read_text()
+    start = script.index("verify_fixed_release_approval() {")
+    guard = script[start : script.index('\nif [[ -n "${XCMAX_RELEASE_CONTROLLER_SHA', start)]
+    for deployed, running, expected in [
+        (previous, previous, 0),
+        (target, target, 0),
+        (controller, controller, 1),
+        (previous, controller, 1),
+    ]:
+        (current / ".xcmax-release.json").write_text(json.dumps({"git_sha": deployed}))
+        (current / "health.json").write_text(json.dumps({"ok": True, "git_sha": running}))
+        result = subprocess.run(
+            [
+                "bash",
+                "-ec",
+                'fail() { echo "$*" >&2; return 1; };\n'
+                + guard
+                + "\nverify_fixed_release_approval",
+            ],
+            env={
+                **os.environ,
+                "SOURCE_ROOT": str(repo),
+                "TARGET_SHA": target,
+                "PRODUCT_VERSION": "1.0.0.6",
+                "CURRENT_LINK": str(current),
+                "HEALTH_URL": "http://test.invalid/api/health",
+                "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"],
+                "XCMAX_RELEASE_CONTROLLER_SHA": controller,
+            },
+            capture_output=True,
+            text=True,
+        )
+        assert (result.returncode == 0) == (expected == 0), result.stderr

@@ -1,0 +1,83 @@
+/**
+ * 为裸 fetch('/api/...') 合并「原版模式」头，使未走 api 封装的请求仍与业务显示策略一致。
+ * 数据库读写口令已下线，本补丁不再附带任何 DB token。
+ */
+import { getActiveExtensionModHeaders, getApiBase, getClientModsUiOffHeader } from '@/utils/apiBase'
+
+declare global {
+  interface Window {
+    __XCAGI_FHD_FETCH_PATCHED?: boolean
+  }
+}
+
+function resolveUrl(input: RequestInfo | URL): string {
+  if (typeof input === 'string') return input
+  if (input instanceof URL) return input.href
+  if (typeof Request !== 'undefined' && input instanceof Request) return input.url
+  return ''
+}
+
+function configuredApiOrigin(): string {
+  if (typeof window === 'undefined') return ''
+  const base = String(getApiBase() || '').trim()
+  if (!base || !/^https?:\/\//i.test(base)) return ''
+  try {
+    return new URL(base).origin
+  } catch {
+    return ''
+  }
+}
+
+function shouldPatchRequestHeaders(rawUrl: string): boolean {
+  const url = String(rawUrl || '').trim()
+  if (!url) return false
+  if (typeof window === 'undefined') return true
+  if (!/^https?:\/\//i.test(url)) return true
+  try {
+    const target = new URL(url)
+    if (target.origin === window.location.origin) return true
+    const cfg = configuredApiOrigin()
+    if (cfg && target.origin === cfg) return true
+    return false
+  } catch {
+    return false
+  }
+}
+
+export function installFetchDbReadToken(): void {
+  if (typeof window === 'undefined' || window.__XCAGI_FHD_FETCH_PATCHED) return
+  window.__XCAGI_FHD_FETCH_PATCHED = true
+
+  const native = window.fetch.bind(window)
+
+  window.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = resolveUrl(input)
+    if (!url) return native(input, init)
+    if (!shouldPatchRequestHeaders(url)) return native(input, init)
+
+    const modsOff = getClientModsUiOffHeader()
+    const activeMod = getActiveExtensionModHeaders(url)
+    const merged = { ...modsOff, ...activeMod }
+    if (!Object.keys(merged).length) return native(input, init)
+
+    if (typeof input === 'string' || input instanceof URL) {
+      const headers = new Headers(init?.headers ?? undefined)
+      for (const [k, v] of Object.entries(merged)) {
+        if (v) headers.set(k, v)
+      }
+      return native(input, { ...init, headers })
+    }
+
+    if (typeof Request !== 'undefined' && input instanceof Request) {
+      const headers = new Headers(input.headers)
+      for (const [k, v] of Object.entries(merged)) {
+        if (v) headers.set(k, v)
+      }
+      return native(new Request(input, { headers }), init)
+    }
+
+    return native(input, init)
+  }
+}
+
+installFetchDbReadToken()

@@ -1,0 +1,242 @@
+"""时间轨 workflow 图 + runtime 状态（FHD 侧：本地读图，状态必须来自 MODstore）。"""
+
+from __future__ import annotations
+
+import json
+import logging
+from pathlib import Path
+from typing import Any
+
+from app.utils.operational_errors import RECOVERABLE_ERRORS
+
+logger = logging.getLogger(__name__)
+
+_GRAPH_REL = Path("config/time_rail_workflow_graph.json")
+STATUS_CONTRACT_VERSION = "time_rail_runtime_status/v2"
+
+
+class TimeRailStatusUnavailableError(RuntimeError):
+    """MODstore 时间轨 runtime 不可达或未返回有效数据。"""
+
+
+class TimeRailAppService:
+    def _fhd_root(self) -> Path:
+        return Path(__file__).resolve().parents[2]
+
+    def graph_path(self) -> Path:
+        return self._fhd_root() / _GRAPH_REL
+
+    def load_graph(self) -> dict[str, Any]:
+        path = self.graph_path()
+        if not path.is_file():
+            raise FileNotFoundError(f"time_rail workflow graph missing: {path}")
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(doc, dict):
+            raise ValueError("time_rail workflow graph must be a JSON object")
+        return doc
+
+    def graph_payload(self) -> dict[str, Any]:
+        doc = self.load_graph()
+        return {
+            "ok": True,
+            "version": doc.get("version"),
+            "schema": doc.get("schema"),
+            "center_id": doc.get("center_id"),
+            "phase_colors": doc.get("phase_colors") or {},
+            "compact_ids": doc.get("compact_ids") or [],
+            "xrail_edge_keys": doc.get("xrail_edge_keys") or [],
+            "nodes": doc.get("nodes") or [],
+            "edges": doc.get("edges") or [],
+            "source": doc.get("source"),
+            "path": str(self.graph_path()),
+        }
+
+    def _degraded_runtime_status(self, reason: str) -> dict[str, Any]:
+        """MODstore 不可达时仍返回全节点缺证快照，避免前端失去覆盖视图。"""
+        try:
+            graph = self.load_graph()
+            graph_nodes = {
+                str(n.get("id")): {
+                    "label": str(n.get("label") or ""),
+                    "kind": str(n.get("kind") or ""),
+                    "phase": str(n.get("phase") or ""),
+                }
+                for n in (graph.get("nodes") or [])
+                if n.get("id")
+            }
+        except (OSError, ValueError):
+            graph = {}
+            graph_nodes = {}
+        nodes: dict[str, Any] = {}
+        for nid, meta in graph_nodes.items():
+            nodes[nid] = {
+                "node_id": nid,
+                "label": meta.get("label", ""),
+                "kind": meta.get("kind", ""),
+                "phase": meta.get("phase", ""),
+                "last_run": None,
+                "ok": None,
+                "guard_active": False,
+                "source": "fhd-degraded",
+                "detail": {"reason": reason},
+                "observed": False,
+                "observable": True,
+                "proof_status": "missing_evidence",
+                "evidence": [],
+                "evidence_count": 0,
+                "missing_evidence": [reason],
+            }
+        total = len(nodes)
+        return {
+            "contract_version": STATUS_CONTRACT_VERSION,
+            "version": graph.get("version"),
+            "graph_schema": graph.get("schema"),
+            "graph_path": str(self.graph_path()),
+            "nodes": nodes,
+            "degraded": True,
+            "reason": reason,
+            "source": "fhd-degraded",
+            "refresh_after_seconds": 15,
+            "coverage": {
+                "total_nodes": total,
+                "status_nodes": total,
+                "observable_nodes": total,
+                "observed_nodes": 0,
+                "proved_nodes": 0,
+                "runtime_evidence_nodes": 0,
+                "state_classified_nodes": total,
+                "missing_evidence_nodes": total,
+                "status_coverage_pct": 100.0 if total else 0.0,
+                "observable_coverage_pct": 100.0 if total else 0.0,
+                "observed_coverage_pct": 0.0,
+                "proved_coverage_pct": 0.0,
+                "runtime_evidence_coverage_pct": 0.0,
+                "state_classified_coverage_pct": 100.0 if total else 0.0,
+            },
+            "missing_evidence": [
+                {
+                    "node_id": nid,
+                    "label": row.get("label", ""),
+                    "phase": row.get("phase", ""),
+                    "kind": row.get("kind", ""),
+                    "reason": reason,
+                }
+                for nid, row in nodes.items()
+            ],
+            "maintenance_backlog": [
+                {
+                    "kind": "time_rail_modstore_unavailable",
+                    "priority": "P0",
+                    "node_id": nid,
+                    "title": f"恢复 MODstore runtime 状态源: {row.get('label') or nid}",
+                    "suggested_owner": "daily-orchestrator",
+                    "status": "open",
+                    "reason": reason,
+                }
+                for nid, row in nodes.items()
+            ],
+        }
+
+    async def runtime_status(self, *, node_id: str | None = None) -> dict[str, Any]:
+        query = f"node_id={node_id}" if node_id else ""
+        try:
+            from app.application.modstore_local_client import modstore_digest_base_url, modstore_get
+
+            payload = await modstore_get(
+                "/api/admin/production-line/time-rail/status",
+                query=query,
+                timeout=8.0,
+                base_url=modstore_digest_base_url(),
+            )
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if isinstance(data, dict) and isinstance(data.get("nodes"), dict):
+                return data
+            logger.warning("MODstore time-rail status 响应无效: %r", payload)
+            return self._degraded_runtime_status(f"MODstore time-rail status 响应无效: {payload!r}")
+        except RECOVERABLE_ERRORS as exc:
+            logger.warning("MODstore time-rail status 不可达，返回 degraded: %s", exc)
+            return self._degraded_runtime_status(f"MODstore time-rail status 不可达: {exc}")
+
+    def _desktop_maintenance_fallback_enabled(self) -> bool:
+        try:
+            from app.utils.deployment import is_desktop_mode
+
+            return bool(is_desktop_mode())
+        except RECOVERABLE_ERRORS:
+            return False
+
+    def _maintenance_sync_unavailable(self, reason: str, *, limit: int) -> dict[str, Any]:
+        if not self._desktop_maintenance_fallback_enabled():
+            return {"ok": False, "error": reason}
+
+        degraded = self._degraded_runtime_status(reason)
+        missing = degraded.get("missing_evidence")
+        missing_items = missing if isinstance(missing, list) else []
+        total_missing = len(missing_items)
+        request_limit = max(1, int(limit))
+        queued_items = missing_items[:request_limit]
+        logger.warning("MODstore time-rail maintenance sync 不可用，桌面本地降级: %s", reason)
+        return {
+            "ok": True,
+            "degraded": True,
+            "source": "fhd-degraded",
+            "reason": reason,
+            "added": len(queued_items),
+            "skipped": 0,
+            "total_missing": total_missing,
+            "limit": request_limit,
+            "items": queued_items,
+            "message": "MODstore time-rail maintenance sync unavailable; queued local desktop fallback items",
+        }
+
+    async def maintenance_sync(self, *, limit: int = 32) -> dict[str, Any]:
+        request_limit = max(1, int(limit))
+        try:
+            from app.application.modstore_local_client import (
+                modstore_digest_base_url,
+                modstore_post,
+            )
+
+            payload = await modstore_post(
+                f"/api/admin/production-line/time-rail/maintenance/sync?limit={request_limit}",
+                timeout=20.0,
+                base_url=modstore_digest_base_url(),
+            )
+            if not isinstance(payload, dict):
+                return self._maintenance_sync_unavailable(
+                    "MODstore time-rail maintenance sync 响应无效",
+                    limit=request_limit,
+                )
+            if payload.get("ok") is False:
+                return self._maintenance_sync_unavailable(
+                    str(
+                        payload.get("error")
+                        or payload.get("message")
+                        or payload.get("detail")
+                        or "MODstore time-rail maintenance sync failed",
+                    ),
+                    limit=request_limit,
+                )
+            data = payload.get("data")
+            if isinstance(data, dict):
+                return data
+            return {"ok": True, "data": data}
+        except RECOVERABLE_ERRORS as exc:
+            logger.warning("MODstore time-rail maintenance sync 失败，返回 fallback: %s", exc)
+            return self._maintenance_sync_unavailable(
+                f"MODstore time-rail maintenance sync 不可达: {exc}",
+                limit=request_limit,
+            )
+        except ValueError as exc:
+            logger.warning("MODstore time-rail maintenance sync 参数错误: %s", exc)
+            return {"ok": False, "error": f"maintenance sync 参数错误: {exc}"}
+
+
+_service: TimeRailAppService | None = None
+
+
+def get_time_rail_app_service() -> TimeRailAppService:
+    global _service
+    if _service is None:
+        _service = TimeRailAppService()
+    return _service

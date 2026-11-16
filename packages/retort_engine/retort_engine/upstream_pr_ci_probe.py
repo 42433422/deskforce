@@ -1,0 +1,313 @@
+from __future__ import annotations
+
+import json
+import shutil
+import subprocess
+import time
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any, cast
+
+GitHubFetcher = Callable[[str], dict[str, Any]]
+
+DEFAULT_UPSTREAM_PR_TARGETS: tuple[dict[str, Any], ...] = (
+    {"repo": "The-PR-Agent/pr-agent", "pr_number": 2479, "language_family": "python"},
+    {"repo": "go-gorm/gorm", "pr_number": 7799, "language_family": "go"},
+    {"repo": "angular/angular", "pr_number": 69538, "language_family": "typescript"},
+    {"repo": "tokio-rs/tokio", "pr_number": 8229, "language_family": "rust"},
+    {"repo": "psf/requests", "pr_number": 7536, "language_family": "python"},
+)
+
+BLOCKING_CHECK_CONCLUSIONS = {"failure", "cancelled", "timed_out", "action_required"}
+ACCEPTED_CHECK_CONCLUSIONS = {"success", "neutral", "skipped"}
+
+
+def build_upstream_pr_ci_probe(
+    project: str | Path,
+    *,
+    repo: str = "",
+    pr_number: int = 0,
+    targets: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+    output: str | Path = "",
+    fetcher: GitHubFetcher | None = None,
+) -> dict[str, Any]:
+    root = Path(project).expanduser().resolve()
+    started = time.monotonic()
+    fetch = fetcher or _gh_api
+    selected_targets = _targets(repo=repo, pr_number=pr_number, targets=targets)
+    probes = [_probe_target(target, fetch=fetch) for target in selected_targets]
+    ready_probes = [probe for probe in probes if probe["ready"]]
+    primary = probes[0] if probes else _empty_probe()
+    successful_check_count = sum(
+        int(probe["summary"]["successful_check_run_count"]) for probe in probes
+    )
+    check_count = sum(int(probe["summary"]["check_run_count"]) for probe in probes)
+    failed_check_count = sum(
+        int(probe["summary"]["failed_check_run_count"]) for probe in probes
+    )
+    blocking_check_count = sum(
+        int(probe["summary"]["blocking_check_run_count"]) for probe in probes
+    )
+    accepted_check_count = sum(
+        int(probe["summary"]["accepted_check_run_count"]) for probe in probes
+    )
+    distinct_repos = {
+        probe["summary"]["repo"] for probe in probes if probe["summary"].get("repo")
+    }
+    language_families = {
+        str(probe["summary"].get("language_family") or "unknown")
+        for probe in probes
+        if probe["summary"].get("language_family")
+    }
+    all_check_runs_successful = bool(probes) and len(ready_probes) == len(probes)
+    summary = {
+        **primary["summary"],
+        "target_count": len(probes),
+        "ready_target_count": len(ready_probes),
+        "distinct_repo_count": len(distinct_repos),
+        "target_repositories": sorted(distinct_repos),
+        "target_language_families": sorted(language_families),
+        "language_family_count": len(language_families),
+        "total_check_run_count": check_count,
+        "total_successful_check_run_count": successful_check_count,
+        "total_accepted_check_run_count": accepted_check_count,
+        "total_failed_check_run_count": failed_check_count,
+        "total_blocking_check_run_count": blocking_check_count,
+        "all_target_prs_merged": bool(probes)
+        and all(probe["summary"]["merged"] is True for probe in probes),
+        "all_target_check_runs_successful": all_check_runs_successful,
+        "all_target_check_runs_non_blocking": bool(probes)
+        and blocking_check_count == 0
+        and accepted_check_count == check_count
+        and check_count > 0,
+        "all_targets_real_remote_api": fetcher is None,
+        "multi_repo_ci_generalization": len(distinct_repos) >= 3
+        and len(ready_probes) >= 3
+        and all_check_runs_successful,
+        "cross_language_ci_generalization": len(language_families) >= 3
+        and len(ready_probes) >= 3
+        and all_check_runs_successful,
+        "duration_sec": round(time.monotonic() - started, 3),
+    }
+    ready = (
+        (
+            summary["multi_repo_ci_generalization"]
+            and summary["cross_language_ci_generalization"]
+        )
+        if len(probes) >= 3
+        else primary["ready"]
+    )
+    result = {
+        "status": "ready" if ready else "needs_upstream_pr_ci_evidence",
+        "project": str(root),
+        "summary": summary,
+        "pull_request": primary["pull_request"],
+        "pull_requests": [probe["pull_request"] for probe in probes],
+        "check_runs": primary["check_runs"],
+        "target_check_runs": [
+            {
+                "repo": probe["summary"]["repo"],
+                "pr_number": probe["summary"]["pr_number"],
+                "check_runs": probe["check_runs"],
+            }
+            for probe in probes
+        ],
+        "probes": probes,
+        "evidence": {
+            "style": "readonly_real_upstream_merged_pr_and_ci_probe",
+            "transport": "gh_api" if fetcher is None else "injected_fetcher",
+            "acceptance": "three_public_merged_prs_with_all_check_runs_successful",
+            "default_targets": DEFAULT_UPSTREAM_PR_TARGETS,
+            "language_family_gate": "at_least_three_language_families_with_non_blocking_check_runs",
+        },
+    }
+    if output:
+        output_path = Path(output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+    return result
+
+
+def _probe_target(target: dict[str, Any], *, fetch: GitHubFetcher) -> dict[str, Any]:
+    repo = str(target["repo"])
+    pr_number = int(target["pr_number"])
+    language_family = str(
+        target.get("language_family") or _language_family_for_repo(repo)
+    )
+    pr = fetch(f"repos/{repo}/pulls/{pr_number}")
+    merge_sha = str(pr.get("merge_commit_sha") or "")
+    checks = cast(
+        dict[str, Any],
+        fetch(f"repos/{repo}/commits/{merge_sha}/check-runs?per_page=100")
+        if merge_sha
+        else {},
+    )
+    runs = [run for run in checks.get("check_runs") or [] if isinstance(run, dict)]
+    successful = [
+        run
+        for run in runs
+        if run.get("status") == "completed" and run.get("conclusion") == "success"
+    ]
+    accepted = [
+        run
+        for run in runs
+        if run.get("status") == "completed"
+        and run.get("conclusion") in ACCEPTED_CHECK_CONCLUSIONS
+    ]
+    failed = [
+        run
+        for run in runs
+        if run.get("conclusion") not in {*ACCEPTED_CHECK_CONCLUSIONS, None}
+    ]
+    blocking = [
+        run for run in runs if run.get("conclusion") in BLOCKING_CHECK_CONCLUSIONS
+    ]
+    summary = {
+        "repo": repo,
+        "pr_number": pr_number,
+        "language_family": language_family,
+        "pr_url": pr.get("html_url", ""),
+        "merged": pr.get("merged") is True,
+        "merged_at": pr.get("merged_at", ""),
+        "merge_commit_sha": merge_sha,
+        "check_run_count": len(runs),
+        "successful_check_run_count": len(successful),
+        "accepted_check_run_count": len(accepted),
+        "failed_check_run_count": len(failed),
+        "blocking_check_run_count": len(blocking),
+        "all_check_runs_successful": bool(runs)
+        and len(accepted) == len(runs)
+        and bool(successful)
+        and not blocking,
+        "all_check_runs_non_blocking": bool(runs) and not blocking,
+        "real_remote_api": fetch is _gh_api,
+    }
+    ready = (
+        summary["merged"]
+        and bool(merge_sha)
+        and summary["check_run_count"] > 0
+        and summary["all_check_runs_successful"]
+    )
+    return {
+        "status": "ready" if ready else "needs_upstream_pr_ci_evidence",
+        "ready": ready,
+        "summary": summary,
+        "pull_request": pr,
+        "check_runs": [
+            {
+                "name": str(run.get("name") or ""),
+                "status": str(run.get("status") or ""),
+                "conclusion": str(run.get("conclusion") or ""),
+                "html_url": str(run.get("html_url") or ""),
+            }
+            for run in runs
+        ],
+    }
+
+
+def _targets(
+    *,
+    repo: str,
+    pr_number: int,
+    targets: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None,
+) -> list[dict[str, Any]]:
+    if targets is not None:
+        return [
+            {
+                "repo": str(item["repo"]),
+                "pr_number": int(item["pr_number"]),
+                "language_family": str(
+                    item.get("language_family")
+                    or _language_family_for_repo(str(item["repo"]))
+                ),
+            }
+            for item in targets
+        ]
+    if repo or pr_number:
+        selected_repo = repo or DEFAULT_UPSTREAM_PR_TARGETS[0]["repo"]
+        return [
+            {
+                "repo": selected_repo,
+                "pr_number": int(
+                    pr_number or DEFAULT_UPSTREAM_PR_TARGETS[0]["pr_number"]
+                ),
+                "language_family": _language_family_for_repo(str(selected_repo)),
+            }
+        ]
+    return [dict(item) for item in DEFAULT_UPSTREAM_PR_TARGETS]
+
+
+def _empty_probe() -> dict[str, Any]:
+    return {
+        "ready": False,
+        "summary": {
+            "repo": "",
+            "pr_number": 0,
+            "language_family": "",
+            "pr_url": "",
+            "merged": False,
+            "merged_at": "",
+            "merge_commit_sha": "",
+            "check_run_count": 0,
+            "successful_check_run_count": 0,
+            "accepted_check_run_count": 0,
+            "failed_check_run_count": 0,
+            "blocking_check_run_count": 0,
+            "all_check_runs_successful": False,
+            "all_check_runs_non_blocking": False,
+            "real_remote_api": False,
+        },
+        "pull_request": {},
+        "check_runs": [],
+    }
+
+
+def _gh_api(path: str) -> dict[str, Any]:
+    completed = subprocess.run(
+        [_gh_executable(), "api", path],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if completed.returncode != 0:
+        return {"error": completed.stderr[-500:], "path": path}
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return {
+            "error": "invalid_json",
+            "path": path,
+            "stdout_tail": completed.stdout[-500:],
+        }
+    return payload if isinstance(payload, dict) else {"items": payload}
+
+
+def _gh_executable() -> str:
+    found = shutil.which("gh")
+    if found:
+        return found
+    for candidate in (
+        "/opt/homebrew/bin/gh",
+        "/usr/local/bin/gh",
+        "/usr/bin/gh",
+    ):
+        if Path(candidate).is_file():
+            return candidate
+    return "gh"
+
+
+def _language_family_for_repo(repo: str) -> str:
+    lowered = repo.lower()
+    if any(
+        marker in lowered for marker in ("angular", "playwright", "vite", "next.js")
+    ):
+        return "typescript"
+    if any(marker in lowered for marker in ("tokio", "serde", "rust", "clippy")):
+        return "rust"
+    if any(marker in lowered for marker in ("gorm", "goreleaser", "cli/cli", "go-")):
+        return "go"
+    return "python"

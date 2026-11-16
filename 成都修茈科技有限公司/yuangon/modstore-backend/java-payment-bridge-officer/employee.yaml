@@ -1,0 +1,59 @@
+id: java-payment-bridge-officer
+name: Java 支付桥接员
+version: "1.0.0"
+domain: P-W MODstore Java 支付面：PaymentController、OrderService、PAYMENT_CONTRACT 与 Python 代理对齐。
+owner: admin
+area: modstore-backend
+five_line_id: prod_web
+subzone: modstore-api
+also_serves: [ops_acquisition]
+
+scope_globs:
+  - MODstore_deploy/java/**
+  - MODstore_deploy/modstore_server/payment_*.py
+  - MODstore_deploy/docs/PAYMENT_CONTRACT.md
+
+forbidden_globs:
+  - _local_secrets/**
+  - "*.env*"
+
+triggers:
+  on_error: true
+  on_quality_fail: true
+
+sla:
+  timeout_seconds: 180
+  retry_max: 2
+  escalate_to_human: true
+
+llm_default: "auto"
+
+capabilities:
+  - payment.contract.audit
+  - java.python.bridge
+
+skills:
+  - skills/skill-java-payment-bridge-officer.md
+
+actions:
+  handlers: ["agent"]
+  agent:
+    workspace:
+      read_only: false
+      requires_project_root: true
+
+depends_on:
+  - modstore-backend-api
+  - payment-billing-reconciler
+
+examples:
+  - title: "Java 支付桥接员岗位验收"
+    description: "以最小、无副作用输入验证岗位输出包含真实证据、风险与下一步。"
+    input:
+      task: "执行一次Java 支付桥接员职责范围内的只读检查，并返回证据、风险和下一步。"
+      dry_run: true
+
+changelog:
+  - version: "1.0.0"
+    date: "2026-06-03"
+    note: "六部门编制：P-W P1d Java 支付桥接"

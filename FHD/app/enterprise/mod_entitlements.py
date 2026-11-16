@@ -1,0 +1,513 @@
+"""企业 Mod 权益：宿主桥接始终可用，客户 Mod 仅对绑定市场账号可见。"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import time
+import weakref
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
+from typing import Any
+
+from app.enterprise.market_entitlement_client import (
+    _market_user_id_from_access_token,
+    fetch_entitled_client_mod_ids_for_market_user,
+    fetch_entitled_client_mod_ids_from_market,
+    parse_mod_ids_from_market_payload,
+)
+from app.mod_sdk.industry_mod_aliases import is_retired_runtime_mod_id
+from app.mod_sdk.platform_shell import PROTECTED_CLIENT_MOD_IDS
+from app.mod_sdk.product_skus import bundled_mod_ids_for_sku, resolve_product_sku
+from app.utils.operational_errors import RECOVERABLE_ERRORS
+
+logger = logging.getLogger(__name__)
+RECOVERABLE_IMPORT_ERRORS = (ImportError, AttributeError, *RECOVERABLE_ERRORS)
+
+# 进程内缓存：登录成功后由 legacy_auth 写入；登出清空
+_cached_market_user_id: int | None = None
+_cached_market_username: str = ""
+_cached_entitled_client_mod_ids: set[str] | None = None
+_cached_account_kind: str = "enterprise"
+_cached_market_is_admin: bool = False
+_entitlement_sync_at_by_session: dict[str, float] = {}
+_reloaded_entitlement_ids_by_session: dict[str, frozenset[str]] = {}
+_session_sync_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+
+
+@dataclass(frozen=True)
+class _EntitlementState:
+    user_id: int | None = None
+    username: str = ""
+    mod_ids: frozenset[str] = frozenset()
+    account_kind: str = "enterprise"
+    is_admin: bool = False
+
+
+_request_entitlements: ContextVar[_EntitlementState | None] = ContextVar(
+    "request_entitlements", default=None
+)
+
+
+@contextmanager
+def request_entitlement_scope():
+    """Start each HTTP request without inheriting another account's rights."""
+    token = _request_entitlements.set(_EntitlementState())
+    try:
+        yield
+    finally:
+        _request_entitlements.reset(token)
+
+
+def _current_entitlements() -> _EntitlementState:
+    scoped = _request_entitlements.get()
+    if scoped is not None:
+        return scoped
+    # Preserve non-request startup/desktop compatibility. HTTP never falls back.
+    return _EntitlementState(
+        _cached_market_user_id,
+        _cached_market_username,
+        frozenset(_cached_entitled_client_mod_ids or ()),
+        _cached_account_kind,
+        _cached_market_is_admin,
+    )
+
+
+def _entitlement_sync_ttl_seconds() -> float:
+    try:
+        return max(0.0, float(os.getenv("XCAGI_ENTITLEMENT_SYNC_TTL_SECONDS", "300")))
+    except ValueError:
+        return 300.0
+
+
+def is_client_mod_id(mod_id: str) -> bool:
+    mid = (mod_id or "").strip()
+    return mid in PROTECTED_CLIENT_MOD_IDS
+
+
+def host_mod_ids_for_enterprise() -> frozenset[str]:
+    return frozenset(bundled_mod_ids_for_sku("enterprise"))
+
+
+def enterprise_mod_filter_active() -> bool:
+    return resolve_product_sku() == "enterprise"
+
+
+def get_cached_entitled_client_mod_ids() -> set[str] | None:
+    """None 表示非企业版或未登录绑定；set 表示允许加载/展示的客户 Mod id。"""
+    if not enterprise_mod_filter_active():
+        return None
+    return set(_current_entitlements().mod_ids)
+
+
+def get_cached_market_identity() -> tuple[int | None, str]:
+    state = _current_entitlements()
+    return state.user_id, state.username
+
+
+def clear_session_entitlements() -> None:
+    global _cached_market_user_id, _cached_market_username, _cached_entitled_client_mod_ids
+    global _cached_account_kind, _cached_market_is_admin
+    if _request_entitlements.get() is not None:
+        _request_entitlements.set(_EntitlementState())
+        return
+    _cached_market_user_id = None
+    _cached_market_username = ""
+    _cached_entitled_client_mod_ids = None
+    _cached_account_kind = "enterprise"
+    _cached_market_is_admin = False
+    _entitlement_sync_at_by_session.clear()
+    _reloaded_entitlement_ids_by_session.clear()
+
+
+def set_session_entitlements(
+    *,
+    market_user_id: int | None,
+    market_username: str,
+    entitled_client_mod_ids: set[str],
+    account_kind: str = "enterprise",
+    market_is_admin: bool = False,
+) -> None:
+    global _cached_market_user_id, _cached_market_username, _cached_entitled_client_mod_ids
+    global _cached_account_kind, _cached_market_is_admin
+    if _request_entitlements.get() is not None:
+        _request_entitlements.set(
+            _EntitlementState(
+                market_user_id,
+                (market_username or "").strip(),
+                frozenset(entitled_client_mod_ids),
+                (account_kind or "enterprise").strip() or "enterprise",
+                bool(market_is_admin),
+            )
+        )
+        return
+    _cached_market_user_id = market_user_id
+    _cached_market_username = (market_username or "").strip()
+    _cached_entitled_client_mod_ids = set(entitled_client_mod_ids)
+    _cached_account_kind = (account_kind or "enterprise").strip() or "enterprise"
+    _cached_market_is_admin = bool(market_is_admin)
+
+
+def _session_row_db_context():
+    from app.db import session as session_module
+
+    get_host_db = getattr(session_module, "get_host_db", None)
+    get_db = getattr(session_module, "get_db", None)
+    if callable(get_host_db) and (
+        hasattr(get_host_db, "mock_calls")
+        or getattr(get_host_db, "__module__", "") != "app.db.session"
+    ):
+        return get_host_db()
+    if callable(get_db) and (
+        hasattr(get_db, "mock_calls") or getattr(get_db, "__module__", "") != "app.db.session"
+    ):
+        return get_db()
+    if callable(get_host_db):
+        return get_host_db()
+    return get_db()
+
+
+def is_admin_account_session() -> bool:
+    state = _current_entitlements()
+    return state.account_kind == "admin" and state.is_admin
+
+
+def is_mod_visible_for_enterprise(mod_id: str) -> bool:
+    """企业版下是否允许暴露/加载该 Mod。"""
+    mid = (mod_id or "").strip()
+    if not mid:
+        return False
+    if not enterprise_mod_filter_active():
+        return True
+    if not is_client_mod_id(mid):
+        return True
+    if is_retired_runtime_mod_id(mid):
+        return False
+    # 开放引导行业包(coating-industry / attendance-industry 等随产品分发的中性行业 Mod)
+    # 属于 onboarding 开放目录，企业版下始终可见，不与"已购客户 Mod 权益"挂钩。
+    try:
+        from app.mod_sdk.industry_seed import open_industry_seed_mod_ids
+
+        if mid in set(open_industry_seed_mod_ids()):
+            return True
+    except RECOVERABLE_ERRORS:
+        logger.debug("open onboarding industry visibility check skipped", exc_info=True)
+    if is_admin_account_session():
+        return True
+    try:
+        from app.mod_sdk.client_primary_erp import client_primary_mod_on_disk_visible
+
+        if client_primary_mod_on_disk_visible(mid):
+            return True
+    except RECOVERABLE_ERRORS:
+        logger.debug("client primary mod disk visibility check skipped", exc_info=True)
+    entitled = get_cached_entitled_client_mod_ids()
+    if entitled is None:
+        return False
+    if mid in entitled:
+        return True
+    try:
+        from app.mod_sdk.industry_mod_aliases import canonical_mod_id
+
+        canonical = canonical_mod_id(mid)
+        if canonical and canonical == mid and canonical in {canonical_mod_id(x) for x in entitled}:
+            return True
+    except RECOVERABLE_ERRORS:
+        logger.debug("enterprise entitlement alias check skipped", exc_info=True)
+    return False
+
+
+def filter_mod_rows_for_enterprise(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not enterprise_mod_filter_active():
+        return rows
+    return [r for r in rows if is_mod_visible_for_enterprise(str(r.get("id") or ""))]
+
+
+def filter_mod_id_list_for_enterprise(mod_ids: list[str]) -> list[str]:
+    if not enterprise_mod_filter_active():
+        return mod_ids
+    return [m for m in mod_ids if is_mod_visible_for_enterprise(m)]
+
+
+def _parse_mod_ids_from_market_payload(payload: Any) -> set[str]:
+    return parse_mod_ids_from_market_payload(payload, is_client_mod_id=is_client_mod_id)
+
+
+async def refresh_session_entitlements_from_market(
+    *,
+    market_token: str,
+    market_user_id: int | None = None,
+    market_username: str = "",
+    session_id: str = "",
+) -> set[str]:
+    account_kind = "enterprise"
+    market_is_admin = False
+    imp_uid: int | None = None
+    sid = (session_id or "").strip()
+    if sid:
+        try:
+            from app.application.session_account_meta import load_session_account_meta
+
+            meta = load_session_account_meta(sid) or {}
+            account_kind = str(meta.get("account_kind") or "enterprise")
+            market_is_admin = bool(meta.get("market_is_admin"))
+            if market_user_id is None and meta.get("market_user_id") is not None:
+                market_user_id = int(meta["market_user_id"])
+            imp = meta.get("impersonating_market_user_id")
+            if imp is not None:
+                imp_uid = int(imp)
+        except RECOVERABLE_ERRORS:
+            pass
+
+    if market_user_id is None:
+        market_user_id = _market_user_id_from_access_token(market_token)
+
+    if account_kind == "admin" and market_is_admin and imp_uid is not None:
+        client_ids = await fetch_entitled_client_mod_ids_for_market_user(market_token, imp_uid)
+    elif account_kind == "admin" and market_is_admin:
+        client_ids = set(PROTECTED_CLIENT_MOD_IDS)
+    else:
+        client_ids = await fetch_entitled_client_mod_ids_from_market(market_token)
+
+    client_ids = _augment_entitled_for_username(market_username, client_ids)
+
+    set_session_entitlements(
+        market_user_id=market_user_id,
+        market_username=market_username,
+        entitled_client_mod_ids=client_ids,
+        account_kind=account_kind,
+        market_is_admin=market_is_admin,
+    )
+    return client_ids
+
+
+def persist_entitlements_to_session_row(session_id: str, client_ids: set[str]) -> None:
+    """写入 sessions 表，便于重启后仍知 market 身份（客户 Mod 列表仍须重新拉取或缓存 JSON）。"""
+    sid = (session_id or "").strip()
+    if not sid:
+        return
+    try:
+        from app.db.models.user import Session as UserSession
+
+        with _session_row_db_context() as db:
+            row = db.query(UserSession).filter(UserSession.session_id == sid).first()
+            if row is None:
+                return
+            identity = _current_entitlements().user_id
+            if identity is not None:
+                row.market_user_id = identity
+            row.entitled_mod_ids_json = json.dumps(sorted(client_ids), ensure_ascii=False)
+            db.commit()
+    except RECOVERABLE_ERRORS:
+        logger.exception("persist_entitlements_to_session_row failed")
+
+
+def restore_entitlements_from_session_row(session_id: str) -> bool:
+    sid = (session_id or "").strip()
+    if not sid or not enterprise_mod_filter_active():
+        return False
+    try:
+        from app.db.models.user import Session as UserSession
+        from app.utils.time import utc_now_naive
+
+        with _session_row_db_context() as db:
+            row = (
+                db.query(UserSession)
+                .filter(
+                    UserSession.session_id == sid,
+                    UserSession.expires_at > utc_now_naive(),
+                )
+                .first()
+            )
+            if row is None:
+                clear_session_entitlements()
+                return False
+            mid = getattr(row, "market_user_id", None)
+            raw = getattr(row, "entitled_mod_ids_json", None) or "[]"
+            ids = {str(x) for x in json.loads(raw) if str(x).strip()}
+            account_kind = str(getattr(row, "account_kind", None) or "enterprise")
+            market_is_admin = bool(getattr(row, "market_is_admin", False))
+            set_session_entitlements(
+                market_user_id=int(mid) if mid is not None else None,
+                market_username=str(getattr(row, "impersonating_username", None) or ""),
+                entitled_client_mod_ids=ids,
+                account_kind=account_kind,
+                market_is_admin=market_is_admin,
+            )
+            return True
+    except RECOVERABLE_ERRORS:
+        logger.exception("restore_entitlements_from_session_row failed")
+        return False
+
+
+def _session_username_for_entitlements(session_id: str) -> str:
+    sid = (session_id or "").strip()
+    if not sid:
+        return ""
+    try:
+        from app.application.session_account_meta import load_session_account_meta
+
+        meta = load_session_account_meta(sid) or {}
+        imp = str(meta.get("impersonating_username") or "").strip()
+        if imp:
+            return imp
+    except RECOVERABLE_ERRORS:
+        pass
+    try:
+        from app.domain.shared_services.session_service import SessionService
+
+        info = SessionService().validate_session(sid)
+        username: str | None = None
+        if info is None:
+            pass
+        elif isinstance(info, dict):
+            username = info.get("username")
+        else:
+            username = getattr(info, "username", None)
+        if username:
+            return str(username).strip()
+    except RECOVERABLE_ERRORS:
+        pass
+    return ""
+
+
+def _augment_entitled_for_username(username: str, current: set[str] | None) -> set[str]:
+    from app.enterprise.account_mod_binding import (
+        augment_entitled_client_mod_ids_for_username,
+    )
+
+    return augment_entitled_client_mod_ids_for_username(username, current)
+
+
+async def sync_entitlements_for_session(session_id: str, *, force: bool = False) -> set[str]:
+    """企业版：优先用修茈市场 token 刷新 user_mods 权益；失败则回退 session 行缓存。"""
+    sid = (session_id or "").strip()
+    if not sid or not enterprise_mod_filter_active():
+        return set()
+    lock = _session_sync_locks.get(sid)
+    if lock is None:
+        lock = _session_sync_locks[sid] = asyncio.Lock()
+    async with lock:
+        return await _sync_entitlements_for_session(sid, force=force)
+
+
+async def _sync_entitlements_for_session(session_id: str, *, force: bool = False) -> set[str]:
+    if not enterprise_mod_filter_active():
+        return set()
+    sid = (session_id or "").strip()
+    if not sid:
+        return set()
+    from app.db.bootstrap.guarded import enabled
+
+    if enabled():
+        # Existing-only serving does not refresh market/account grants or reload
+        # Mods. Read this session's durable grants, not another account's cache.
+        if not restore_entitlements_from_session_row(sid):
+            clear_session_entitlements()
+            return set()
+        return set(get_cached_entitled_client_mod_ids() or set())
+    cached_now = get_cached_entitled_client_mod_ids()
+    last_sync = _entitlement_sync_at_by_session.get(sid, 0.0)
+    if (
+        not force
+        and cached_now is not None
+        and last_sync > 0
+        and time.monotonic() - last_sync < _entitlement_sync_ttl_seconds()
+    ):
+        # The TTL belongs to this session; the process cache may belong to the
+        # last account that made a request. Reload this session before reuse.
+        if not restore_entitlements_from_session_row(sid):
+            clear_session_entitlements()
+            return set()
+        return set(get_cached_entitled_client_mod_ids() or set())
+    try:
+        from app.fastapi_routes.market_account import resolve_valid_market_access_token
+
+        tok = await resolve_valid_market_access_token(sid)
+        local_username = _session_username_for_entitlements(sid)
+        if tok:
+            client_ids = await refresh_session_entitlements_from_market(
+                market_token=tok,
+                market_username=local_username,
+                session_id=sid,
+            )
+            client_ids = _augment_entitled_for_username(local_username, client_ids)
+            set_session_entitlements(
+                market_user_id=_current_entitlements().user_id,
+                market_username=local_username or _current_entitlements().username,
+                entitled_client_mod_ids=client_ids,
+                account_kind=_current_entitlements().account_kind,
+                market_is_admin=_current_entitlements().is_admin,
+            )
+            persist_entitlements_to_session_row(sid, client_ids)
+            entitlement_fingerprint = frozenset(client_ids)
+            if _reloaded_entitlement_ids_by_session.get(sid) != entitlement_fingerprint:
+                await reload_enterprise_mods_after_login()
+                _reloaded_entitlement_ids_by_session[sid] = entitlement_fingerprint
+            _entitlement_sync_at_by_session[sid] = time.monotonic()
+            return client_ids
+        if not restore_entitlements_from_session_row(sid):
+            clear_session_entitlements()
+            return set()
+        cached = _augment_entitled_for_username(
+            local_username, get_cached_entitled_client_mod_ids() or set()
+        )
+        if cached:
+            set_session_entitlements(
+                market_user_id=_current_entitlements().user_id,
+                market_username=local_username or _current_entitlements().username,
+                entitled_client_mod_ids=cached,
+                account_kind=_current_entitlements().account_kind,
+                market_is_admin=_current_entitlements().is_admin,
+            )
+        _entitlement_sync_at_by_session[sid] = time.monotonic()
+        return cached
+    except RECOVERABLE_ERRORS:
+        logger.exception("sync_entitlements_for_session failed")
+        if not restore_entitlements_from_session_row(sid):
+            clear_session_entitlements()
+            return set()
+        local_username = _session_username_for_entitlements(sid)
+        cached = _augment_entitled_for_username(
+            local_username, get_cached_entitled_client_mod_ids() or set()
+        )
+        _entitlement_sync_at_by_session[sid] = time.monotonic()
+        return cached
+
+
+async def reload_enterprise_mods_after_login() -> None:
+    """登录后按 entitlement 重新加载 Mod（避免启动时加载了全部客户 Mod）。"""
+    if not enterprise_mod_filter_active():
+        return
+    try:
+        from app.fastapi_app import get_fastapi_app
+        from app.infrastructure.mods.mod_manager import (
+            get_mod_manager,
+            load_mod_routes,
+            mount_entitled_client_mod_api_routes,
+        )
+
+        mm = get_mod_manager()
+        mm.load_all_mods()
+        app = get_fastapi_app()
+        load_mod_routes(app, mm)
+        mount_entitled_client_mod_api_routes(app)
+    except RECOVERABLE_ERRORS:
+        logger.exception("reload_enterprise_mods_after_login failed")
+
+
+async def sync_entitlements_from_request(request) -> None:
+    """已登录会话在拉 Mod/引导 catalog 前同步市场权益。"""
+    if not enterprise_mod_filter_active():
+        return
+    try:
+        from app.infrastructure.auth.dependencies import session_id_from_request
+
+        sid = session_id_from_request(request)
+        if sid:
+            await sync_entitlements_for_session(sid)
+    except RECOVERABLE_ERRORS:
+        logger.exception("sync_entitlements_from_request failed")

@@ -1,0 +1,121 @@
+from __future__ import annotations
+
+from datetime import datetime
+from typing import TYPE_CHECKING, Optional
+
+from sqlalchemy import JSON, BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.db.db_base import Base
+
+if TYPE_CHECKING:
+    from app.db.models.ai import AIConversationSession
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    username: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    password: Mapped[str] = mapped_column(
+        "password", String, nullable=False, comment="hashed password (PBKDF2 or legacy SHA256)"
+    )
+    display_name: Mapped[str] = mapped_column(String, default="")
+    email: Mapped[str] = mapped_column(String, default="")
+    role: Mapped[str] = mapped_column(String, default="user")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_by: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("users.id"), nullable=True
+    )
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    last_login: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    wx_openid: Mapped[Optional[str]] = mapped_column(String(64), unique=True, index=True)
+    wx_unionid: Mapped[Optional[str]] = mapped_column(String(64), index=True)
+    wx_avatar_url: Mapped[Optional[str]] = mapped_column(Text)
+    mp_phone: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    mp_nickname: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    totp_secret: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    mfa_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    tenant_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    # 修茈市场用户是管理端客户资料的稳定主键。username 允许客户改名，不能作为跨库关联键。
+    market_user_id: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True, unique=True, index=True
+    )
+
+    # 用户等级与行业（管理端可编辑，复用 industryPresets 行业 id）
+    tier: Mapped[str] = mapped_column(
+        String(32),
+        default="personal",
+        nullable=False,
+        comment="用户等级: personal|enterprise|admin",
+    )
+    industry_id: Mapped[str] = mapped_column(
+        String(32), default="通用", nullable=False, comment="行业 id，引用 industryPresets"
+    )
+    # 用户已开通的行业 id 列表（admin 分配；SSOT，前端只读展示）
+    entitled_industries: Mapped[Optional[list]] = mapped_column(
+        JSON().with_variant(JSONB, "postgresql"), nullable=True, default=list
+    )
+    # 账号等级（普通/Pro/Max/Ultra）：注册时由 budget_range 自动派生；仅 tier=enterprise 有意义，否则 NULL
+    account_tier: Mapped[Optional[str]] = mapped_column(
+        String(32), nullable=True, comment="账号等级: normal|pro|max|ultra（仅 enterprise）"
+    )
+    # 注册/联系表单填写的预算区间（account_tier 的派生来源）
+    budget_range: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    # 安全：登录失败计数与账户锁定
+    failed_login_attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    locked_until: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # 邮箱是否已验证（本地账号；自助验证需 SMTP 配置）
+    email_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    created_user: Mapped[Optional[User]] = relationship(
+        "User", remote_side=[id], backref="created_users", foreign_keys=[created_by]
+    )
+    sessions: Mapped[list[Session]] = relationship(
+        "Session", back_populates="user", cascade="all, delete-orphan"
+    )
+    ai_conversation_sessions: Mapped[list[AIConversationSession]] = relationship(
+        "AIConversationSession", back_populates="user", cascade="all, delete-orphan"
+    )
+
+
+class Session(Base):
+    __tablename__ = "sessions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    user_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    market_access_token: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    market_refresh_token: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    market_user_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    entitled_mod_ids_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    account_kind: Mapped[Optional[str]] = mapped_column(
+        String(32), nullable=True, default="enterprise"
+    )
+    company_brand: Mapped[Optional[str]] = mapped_column(String(256), nullable=True, default="")
+    market_is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    market_is_enterprise: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # 修茈市场会员等级（登录时从市场 /api/payment/my-plan 同步）：free|vip|vip_plus|svip1..8
+    market_membership_tier: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    impersonating_market_user_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    impersonating_username: Mapped[Optional[str]] = mapped_column(
+        String(128), nullable=True, default=""
+    )
+    tenant_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+
+    user: Mapped[User] = relationship("User", back_populates="sessions")
+
+
+class WebRefreshTokenUse(Base):
+    """Consumed web-refresh identifiers in the shared host database."""
+
+    __tablename__ = "web_refresh_token_uses"
+
+    jti: Mapped[str] = mapped_column(String(64), primary_key=True)
+    expires_at: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)

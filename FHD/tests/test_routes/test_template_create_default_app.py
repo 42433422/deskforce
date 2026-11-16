@@ -1,0 +1,358 @@
+"""Default factory, real sessions, agent execution and SQLite template readback."""
+
+from __future__ import annotations
+
+import json
+from datetime import UTC, datetime, timedelta
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
+
+pytestmark = pytest.mark.release_gate
+
+
+@pytest.fixture
+def template_app(tmp_path, monkeypatch):
+    import app.db as database
+    import app.db.init_db as init_db
+    import app.db.session as db_session
+    import app.fastapi_app.factory as factory
+    from app.application.agent_orchestrator import InMemoryAgentRunRepository
+    from app.config import TestingConfig
+    from app.db.db_base import Base
+    from app.db.models.user import Session, User
+    from app.infrastructure.tenant_scope import tenant_scope
+
+    for key, value in {
+        "XCAGI_DESKTOP_FAST_START": "0",
+        "XCAGI_REGISTER_LEGACY_ROUTES": "0",
+        "XCAGI_SKIP_LEGACY_COMPAT_ROUTES": "0",
+        "XCAGI_DATA_DIR": str(tmp_path),
+        "XCAGI_DESKTOP_DATA_DIR": str(tmp_path),
+        "FHD_ALLOW_X_USER_ID_HEADER": "0",
+        "XCAGI_TENANT_ALLOW_LEGACY_NULL_VISIBLE": "0",
+        "MODEL_USAGE_LEDGER_PATH": str(tmp_path / "usage.json"),
+        "MODEL_USAGE_WALLET_BACKEND": "audit",
+    }.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("MODEL_USAGE_WALLET_REQUIRED", raising=False)
+    db_path = tmp_path / "products.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+    engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
+    sessions = sessionmaker(bind=engine)
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr(database, "HostSessionLocal", sessions)
+    monkeypatch.setattr(database, "_get_engine", lambda: engine)
+    monkeypatch.setattr(db_session, "SessionLocal", sessions)
+    init_db.init_template_tables(str(db_path))
+    with sessions.begin() as db:
+        for uid, tid in ((7, 11), (8, 22), (9, None)):
+            db.add(User(id=uid, username=f"label-user-{uid}", password="unused", tenant_id=tid))
+            db.add(
+                Session(
+                    session_id=f"label-session-{uid}",
+                    user_id=uid,
+                    expires_at=datetime.now(UTC).replace(tzinfo=None) + timedelta(hours=1),
+                    account_kind="enterprise",
+                )
+            )
+    repo = InMemoryAgentRunRepository()
+    monkeypatch.setattr(
+        "app.application.agent_orchestrator.orchestrator.get_agent_run_repository", lambda: repo
+    )
+    # Keep real core routes; exclude unrelated Mod/lifespan workers.
+    monkeypatch.setattr(
+        "app.fastapi_app.mod_startup.bootstrap_mod_extensions_sync", lambda *_args, **_kw: None
+    )
+    monkeypatch.setattr(
+        "app.fastapi_app.mod_startup.schedule_background_mod_load", lambda _app: None
+    )
+    monkeypatch.setattr(factory, "_app_singleton", None)
+    app = factory.create_fastapi_app(TestingConfig, enable_cors=False)
+    client = TestClient(app)
+    client.cookies.set("csrf_token", "label-test-csrf")
+    client.headers["X-CSRF-Token"] = "label-test-csrf"
+    try:
+        with tenant_scope(None):
+            yield client, engine, repo
+    finally:
+        client.close()
+        engine.dispose()
+
+
+def _label_payload():
+    return {
+        "name": "验收产品标签",
+        "template_type": "标签",
+        "category": "label",
+        "source": "generated",
+        "fields": [
+            {
+                "id": "editor-field-1",
+                "label": "产品名称",
+                "value": "",
+                "type": "dynamic",
+                "position": {"left": 50, "top": 90, "width": 150, "height": 40},
+            }
+        ],
+        "preview_data": {"grid": None, "image_size": {"width": 900, "height": 600}, "image": None},
+    }
+
+
+def _template_count(engine):
+    with engine.connect() as db:
+        return db.execute(text("SELECT count(*) FROM templates")).scalar_one()
+
+
+def test_default_factory_registers_template_create_and_delete(template_app):
+    client, _engine, _repo = template_app
+    paths = client.app.openapi()["paths"]
+    assert "post" in paths["/api/templates/create"]
+    assert "post" not in paths.get("/api/templates/update", {})
+    assert "post" in paths["/api/templates/delete"]
+
+
+def test_default_factory_registers_template_upload_and_analyze(template_app):
+    """G7 回归：默认应用必须挂载 upload/analyze（此前仅 env 门禁 legacy_gap 可达）。"""
+    client, _engine, _repo = template_app
+    paths = client.app.openapi()["paths"]
+    assert "post" in paths.get("/api/templates/upload", {}), paths.get("/api/templates/upload")
+    assert "post" in paths.get("/api/templates/analyze", {}), paths.get("/api/templates/analyze")
+    assert "get" in paths.get("/api/templates/progress/{task_id}", {})
+
+
+def test_upload_rejects_anonymous_without_ingest(template_app):
+    client, _engine, _repo = template_app
+    response = client.post(
+        "/api/templates/upload",
+        files={
+            "file": (
+                "t.xlsx",
+                b"not-a-real-xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+        data={"template_name": "回归模板"},
+    )
+    assert response.status_code == 401, response.text
+
+
+@pytest.mark.parametrize("session_id, expected", [(None, 401), ("label-session-9", 403)])
+def test_create_rejects_anonymous_or_missing_tenant_without_writes(
+    template_app, session_id, expected
+):
+    client, engine, _repo = template_app
+    headers = {"X-User-ID": "7", "X-Tenant-ID": "11"}
+    if session_id:
+        headers["X-Session-ID"] = session_id
+    response = client.post(
+        "/api/templates/create",
+        headers=headers,
+        json={**_label_payload(), "user_id": 7, "tenant_id": 11},
+    )
+    assert response.status_code == expected, response.text
+    assert _template_count(engine) == 0
+
+
+@pytest.mark.parametrize("method", ["POST", "DELETE"])
+@pytest.mark.parametrize("session_id, expected", [(None, 401), ("label-session-9", 403)])
+def test_delete_requires_real_login_and_tenant(template_app, method, session_id, expected):
+    client, _engine, _repo = template_app
+    headers = {"X-User-ID": "7", "X-Tenant-ID": "11"}
+    if session_id:
+        headers["X-Session-ID"] = session_id
+    response = client.request(method, "/api/templates/delete", headers=headers, json={"id": "db:1"})
+    assert response.status_code == expected, response.text
+
+
+@pytest.mark.parametrize("method", ["POST", "DELETE"])
+def test_delete_soft_deletes_only_owned_rows_with_agent_confirmation(
+    template_app, monkeypatch, method
+):
+    client, engine, repo = template_app
+    monkeypatch.setenv("XCAGI_TENANT_ALLOW_LEGACY_NULL_VISIBLE", "1")
+    with engine.begin() as db:
+        for tid in (11, 22, None):
+            db.execute(
+                text(
+                    "INSERT INTO templates (id, template_key, template_name, tenant_id, is_active) "
+                    "VALUES (:id, :key, 'synthetic', :tid, 1)"
+                ),
+                {"id": {11: 1, 22: 2, None: 3}[tid], "key": f"test-{tid}", "tid": tid},
+            )
+    headers = {"X-Session-ID": "label-session-7", "X-User-ID": "8", "X-Tenant-ID": "22"}
+    for template_id in ("db:2", "db:3", "db:999"):
+        response = client.request(
+            method, "/api/templates/delete", headers=headers, json={"id": template_id}
+        )
+        assert response.status_code == 404, response.text
+        assert response.json()["success"] is False
+    for _repeat in range(2):
+        response = client.request(
+            method,
+            "/api/templates/delete",
+            headers=headers,
+            json={"id": "db:1", "tenant_id": 22, "user_id": 8},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["success"] is True
+    run = repo.get(response.json()["run_id"])
+    assert run.user_id == "7" and run.status == "completed"
+    assert run.tool_calls[0].permission == "tool.document_template.delete"
+    assert {"step.waiting_user", "step.approved", "tool.completed"} <= {
+        event.event_type for event in run.events
+    }
+    with engine.connect() as db:
+        assert db.execute(text("SELECT is_active FROM templates ORDER BY id")).scalars().all() == [
+            0,
+            1,
+            1,
+        ]
+
+
+def test_default_delete_refuses_builtin_without_reporting_success(
+    template_app, tmp_path, monkeypatch
+):
+    client, _engine, _repo = template_app
+    builtin = tmp_path / "resources/templates/standard.xlsx"
+    builtin.parent.mkdir(parents=True)
+    builtin.write_bytes(b"synthetic standard form")
+    monkeypatch.setattr(
+        "app.fastapi_routes.domains.system.system_routes.get_base_dir", lambda: str(tmp_path)
+    )
+    response = client.post(
+        "/api/templates/delete",
+        headers={"X-Session-ID": "label-session-7"},
+        json={"id": "fs:standard.xlsx"},
+    )
+    assert response.status_code == 403, response.text
+    assert response.json()["success"] is False
+    assert builtin.read_bytes() == b"synthetic standard form"
+
+
+@pytest.mark.parametrize(
+    "folder, suffix", [("templates", ".xlsx"), ("document_templates", ".docx")]
+)
+def test_db_delete_does_not_resurrect_as_scanned_file(template_app, tmp_path, folder, suffix):
+    client, engine, _repo = template_app
+    own = tmp_path / "tenants/11" / folder / f"synthetic{suffix}"
+    other = tmp_path / "tenants/22" / folder / own.name
+    for path in (own, other):
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"synthetic retained bytes")
+    with engine.begin() as db:
+        db.execute(
+            text(
+                "INSERT INTO templates (id, template_key, template_name, template_type, "
+                "original_file_path, tenant_id, is_active) "
+                "VALUES (1, 'regression-file', 'synthetic', 'Excel', :path, 11, 1)"
+            ),
+            {"path": str(own)},
+        )
+    headers = {"X-Session-ID": "label-session-7"}
+    assert any(
+        t["id"] == "db:1" for t in client.get("/api/templates", headers=headers).json()["templates"]
+    )
+    response = client.post("/api/templates/delete", headers=headers, json={"id": "db:1"})
+    assert response.status_code == 200, response.text
+    rows = client.get("/api/templates", headers=headers).json()["templates"]
+    assert all(t.get("path") != str(own) for t in rows)
+    for template_id in ("db:1", f"fs:{own.name}"):
+        assert (
+            client.get(f"/api/templates/detail/{template_id}", headers=headers).status_code == 404
+        )
+    other_rows = client.get("/api/templates", headers={"X-Session-ID": "label-session-8"}).json()[
+        "templates"
+    ]
+    assert any(t.get("path") == str(other) for t in other_rows)
+    assert own.read_bytes() == other.read_bytes() == b"synthetic retained bytes"
+
+
+def test_default_fs_delete_commits_removal_without_destroying_bytes(template_app, tmp_path):
+    client, _engine, _repo = template_app
+    target = tmp_path / "tenants/11/templates/synthetic-private.xlsx"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"synthetic retained bytes")
+    headers = {"X-Session-ID": "label-session-7"}
+    template_id = f"fs:{target.name}"
+    before = client.get("/api/templates", headers=headers).json()["templates"]
+    assert any(t["id"] == template_id for t in before)
+    for _repeat in range(2):
+        response = client.post("/api/templates/delete", headers=headers, json={"id": template_id})
+        assert response.status_code == 200, response.text
+        assert response.json()["success"] is True
+        assert response.json()["deleted"]["soft_deleted"] is True
+    after = client.get("/api/templates", headers=headers).json()["templates"]
+    assert all(t.get("path") != str(target) for t in after)
+    assert client.get(f"/api/templates/detail/{template_id}", headers=headers).status_code == 404
+    assert target.read_bytes() == b"synthetic retained bytes"
+
+
+def test_label_create_readback_uses_authenticated_owner_and_tenant(template_app, tmp_path):
+    from pypdf import PdfReader
+
+    from app.application.label_job_service import LabelJobService
+    from app.db.models.product import Product
+
+    client, engine, repo = template_app
+    body = {**_label_payload(), "user_id": 8, "userId": 8, "tenant_id": 22}
+    headers = {"X-Session-ID": "label-session-7", "X-User-ID": "8", "X-Tenant-ID": "22"}
+    response = client.post("/api/templates/create", headers=headers, json=body)
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["success"] is True, payload
+    run = repo.get(payload["run_id"])
+    assert run.user_id == "7"
+    assert run.status == "completed"
+    assert run.tool_calls[0].permission == "tool.document_template.create"
+    assert {"step.waiting_user", "step.approved", "tool.completed"} <= {
+        event.event_type for event in run.events
+    }
+    template_id = payload["template"]["id"]
+    with engine.connect() as db:
+        stored = db.execute(text("SELECT tenant_id, analyzed_data FROM templates")).one()
+        assert stored.tenant_id == 11
+        assert json.loads(stored.analyzed_data)["preview_data"] == body["preview_data"]
+        assert (
+            db.execute(
+                text("SELECT count(*) FROM template_usage_log WHERE action='create'")
+            ).scalar_one()
+            == 1
+        )
+    rows = client.get("/api/templates", headers=headers).json()["templates"]
+    row = next(row for row in rows if row["id"] == template_id)
+    detail = client.get(f"/api/templates/{template_id}", headers=headers)
+    assert detail.status_code == 200, detail.text
+    for result in (payload["template"], row, detail.json()["template"]):
+        for key in ("category", "fields", "preview_data"):
+            assert result[key] == body[key]
+    other_headers = {"X-Session-ID": "label-session-8"}
+    assert client.get(f"/api/templates/{template_id}", headers=other_headers).status_code == 404
+    assert all(
+        row["id"] != template_id
+        for row in client.get("/api/templates", headers=other_headers).json()["templates"]
+    )
+    with engine.begin() as db:
+        db.execute(
+            Product.__table__.insert().values(id=31, tenant_id=11, name="标签验收产品", is_active=1)
+        )
+    service = LabelJobService(tmp_path / "label_jobs")
+    job = service.generate(
+        (11, 7),
+        {
+            "product_id": 31,
+            "template_id": template_id,
+            "copies": 1,
+            "paper_width_mm": 90,
+            "paper_height_mm": 60,
+        },
+    )
+    assert job["status"] == "generated"
+    pdf = PdfReader(service.file((11, 7), job["id"]))
+    assert len(pdf.pages) == 1
+    assert "标签验收产品" in pdf.pages[0].extract_text()
+    _, saved_job = service._read((11, 7), job["id"])
+    assert saved_job["layout"]["fields"][0]["left"] == 50
+    assert saved_job["layout"]["fields"][0]["top"] == 90

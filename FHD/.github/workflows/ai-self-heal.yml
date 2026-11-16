@@ -1,0 +1,99 @@
+# CI SSOT: generated from FHD/.github/workflows/ai-self-heal.yml
+# 编辑源：FHD/.github/workflows/ai-self-heal.yml（根仓 .github/workflows/ai-self-heal.yml 为同步副本）
+name: AI Self-Heal
+
+on:
+  workflow_run:
+    # Match display names in one inline list; the publisher path-prefixes sequence items.
+    workflows: ["CI/CD Pipeline", "CI - Backend Python", "Source Governance", "Smoke Tests", "Employee Smoke Gate", "MODstore tests", "cvm-autonomy-watcher", "Deploy MODstore Production", "fhd-deploy", "Release gate CI", "Capacity staging monthly", "desktop-macos-smoke", "ci-mobile-flutter", "ci-mobile-ios", "Deploy corp site (xiu-ci.com)"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "失败 workflow run id（手动触发用）"
+        required: false
+        default: ""
+      workflow_name:
+        description: "失败 workflow 名称"
+        required: false
+        default: ""
+      branch:
+        description: "失败 workflow 所在分支"
+        required: false
+        default: ""
+      head_repo:
+        description: "失败 workflow 的 head 仓库（fork 保护）"
+        required: false
+        default: ""
+
+# Keep the latest failed source run; isolate manual, deploy and monitoring runs.
+concurrency:
+  group: >-
+    ai-self-heal-${{ (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'failure' && !contains(fromJSON('["cvm-autonomy-watcher", "Deploy MODstore Production", "fhd-deploy", "Capacity staging monthly", "Deploy corp site (xiu-ci.com)"]'), github.event.workflow_run.name)) && format('src-{0}-{1}', github.event.workflow_run.name, github.event.workflow_run.head_branch) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+  issues: write
+
+jobs:
+  self-heal:
+    # 仅当 workflow_run 失败时触发；workflow_dispatch 手动触发不受此条件限制
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'failure' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+      XCAGI_LLM_API_KEY: ${{ secrets.XCAGI_LLM_API_KEY }}
+      XCAGI_LLM_BASE_URL: ${{ secrets.XCAGI_LLM_BASE_URL }}
+      XCAGI_LLM_MODEL: ${{ secrets.XCAGI_LLM_MODEL }}
+      # Durable GitHub-side circuit breaker. Repository variables may tighten
+      # these bounds without changing code; missing/invalid values fail to defaults.
+      AI_SELF_HEAL_MAX_OPEN_INCIDENTS: ${{ vars.AI_SELF_HEAL_MAX_OPEN_INCIDENTS || '20' }}
+      AI_SELF_HEAL_MAX_OPEN_PER_WORKFLOW: ${{ vars.AI_SELF_HEAL_MAX_OPEN_PER_WORKFLOW || '5' }}
+      AI_SELF_HEAL_MAX_RECENT_INCIDENTS: ${{ vars.AI_SELF_HEAL_MAX_RECENT_INCIDENTS || '20' }}
+      AI_SELF_HEAL_INCIDENT_BUDGET_HOURS: ${{ vars.AI_SELF_HEAL_INCIDENT_BUDGET_HOURS || '24' }}
+      # Approval ledger callback（fail-open client needs both）
+      FHD_API_BASE_URL: https://xiu-ci.com/fhd-api
+      AUTONOMY_WEBHOOK_TOKEN: ${{ secrets.MODSTORE_OPS_INGEST_TOKEN }}
+      MODSTORE_OPS_INGEST_TOKEN: ${{ secrets.MODSTORE_OPS_INGEST_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: FHD/scripts/ci/requirements-self-heal.txt
+
+      - name: Install dependencies
+        working-directory: FHD
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r scripts/ci/requirements-self-heal.txt
+
+      - name: Run ai-self-heal (workflow_run trigger)
+        if: ${{ github.event_name == 'workflow_run' }}
+        working-directory: FHD
+        env:
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+        run: |
+          python scripts/ci/ai_self_heal.py \
+            --workflow "${{ github.event.workflow_run.name }}" \
+            --branch "${{ github.event.workflow_run.head_branch }}" \
+            --head-repo "${{ github.event.workflow_run.head_repository.full_name }}"
+
+      - name: Run ai-self-heal (manual dispatch)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        working-directory: FHD
+        run: |
+          python scripts/ci/ai_self_heal.py \
+            --run-id ${{ inputs.run_id }} \
+            --workflow "${{ inputs.workflow_name }}" \
+            --branch "${{ inputs.branch }}" \
+            --head-repo "${{ inputs.head_repo }}"

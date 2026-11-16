@@ -1,0 +1,365 @@
+<template>
+  <div class="agent-task-runtime">
+    <div class="agent-task-facts">
+      <span>{{ $t('chat.runCount', { count: payload.runCount || 1 }) }}</span>
+      <span>{{ $t('chat.toolCount', { count: toolCalls.length }) }}</span>
+      <span>{{ $t('chat.attemptCount', { count: payload.attempt || 1 }) }}</span>
+      <span v-if="payload.execution"
+        >调度 {{ payload.execution.state }} · 执行 {{ payload.execution.execution_count }} 次 · 恢复
+        {{ payload.execution.recovery_count }} 次</span
+      >
+    </div>
+    <div v-if="payload.workspaceId || payload.workspacePath" class="agent-task-workspace">
+      <strong>{{ $t('chat.taskWorkspace') }}</strong>
+      <span>{{ payload.workspaceId || payload.workspacePath }}</span>
+      <small>{{ payload.workspaceIsolation || 'business_workspace' }}</small>
+    </div>
+    <ol v-if="steps.length" class="agent-task-steps">
+      <li v-for="step in steps" :key="step.step_id">
+        <span>{{ step.description || `${step.tool_id}.${step.action}` }}</span>
+        <em :class="`agent-step-status--${step.status || 'pending'}`">{{ stepStatus(step.status) }}</em>
+      </li>
+    </ol>
+    <details v-if="toolCalls.length" class="agent-tool-sessions">
+      <summary>{{ $t('chat.toolSessions') }}</summary>
+      <div v-for="tool in toolCalls" :key="tool.call_id" class="agent-tool-session">
+        <span>{{ tool.tool_id }}.{{ tool.action }}</span>
+        <small
+          >{{ tool.status }}<template v-if="tool.duration_ms"> · {{ tool.duration_ms }}ms</template></small
+        >
+      </div>
+    </details>
+    <div v-if="Number(payload.artifactCount || 0)" class="agent-task-evidence">
+      {{ $t('chat.evidenceCount', { count: payload.artifactCount }) }}
+    </div>
+    <div class="agent-task-evidence">
+      结果证据：{{ payload.eventCount || 0 }} 条事件 · {{ payload.completedToolCount || 0 }} 次已完成工具调用 ·
+      {{ payload.artifactCount || 0 }} 个产物
+    </div>
+    <div v-if="resultSummary" class="agent-result-summary">
+      <strong>业务结果</strong>
+      <p>{{ resultSummary }}</p>
+    </div>
+    <div v-if="downloadableArtifacts.length" class="agent-artifact-downloads">
+      <button
+        v-for="artifact in downloadableArtifacts"
+        :key="artifact.artifact_id"
+        class="btn btn-primary btn-sm"
+        :disabled="Boolean(downloadingId)"
+        @click="downloadArtifact(artifact)"
+      >
+        {{ downloadingId === artifact.artifact_id ? '正在下载…' : `下载 ${artifact.name || '报表文件'}` }}
+      </button>
+      <p v-if="downloadError" role="alert">{{ downloadError }}</p>
+    </div>
+    <details v-if="hasResultEvidence" class="agent-result-evidence">
+      <summary>技术明细（高级）</summary>
+      <pre v-if="finalOutputText">{{ finalOutputText }}</pre>
+      <ul v-if="artifacts.length">
+        <li v-for="artifact in artifacts" :key="artifact.artifact_id">
+          {{ artifact.name || artifact.artifact_type || artifact.artifact_id }}
+          <small v-if="artifact.uri">{{ artifact.uri }}</small>
+        </li>
+      </ul>
+    </details>
+    <AgentClarificationForm v-if="clarification && runId" :run-id="runId" :question="clarification" />
+    <p v-if="controlState?.pending || controlState?.error || controlState?.message" role="status" aria-live="polite" class="task-control-status">
+      {{ controlState?.pending ? `正在${controlLabels[controlState.pending]}…` : controlState?.error || controlState?.message }}
+      <button v-if="controlState?.error" type="button" class="btn btn-secondary btn-sm" :disabled="!!controlState.pending" @click="$emit('refresh')">重新核对状态</button>
+    </p>
+    <div class="task-actions">
+      <button class="btn btn-primary btn-sm" @click="$emit('open')">
+        {{ $t('chat.openTask') }}
+      </button>
+      <button v-if="can('approve')" class="btn btn-success btn-sm" :disabled="!!controlState?.pending || !!controlState?.needsVerification" @click="$emit('approve')">审批并执行</button>
+      <button v-if="isRetryable" class="btn btn-primary btn-sm" :disabled="!!controlState?.pending || !!controlState?.needsVerification" @click="$emit('retry')">
+        {{ $t('chat.retryTask') }}
+      </button>
+      <button v-if="isPausable" class="btn btn-secondary btn-sm" :disabled="!!controlState?.pending || !!controlState?.needsVerification" @click="$emit('pause')">
+        {{ $t('chat.pauseTask') }}
+      </button>
+      <button v-if="task.status === 'paused'" class="btn btn-primary btn-sm" :disabled="!!controlState?.pending || !!controlState?.needsVerification" @click="$emit('resume')">
+        {{ $t('chat.resumeTask') }}
+      </button>
+      <button v-if="isCancellable" class="btn btn-secondary btn-sm" :disabled="!!controlState?.pending || !!controlState?.needsVerification" @click="$emit('cancel')">
+        {{ $t('chat.cancel') }}
+      </button>
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { computed, ref } from 'vue'
+import AgentClarificationForm, { type ClarificationQuestion } from './AgentClarificationForm.vue'
+import { activeRunIdOfTask } from '@/utils/agentTaskWorkspaceModel'
+import type { AgentArtifact, AgentRunStep, AgentToolCall } from '@/api/agentRuns'
+import agentRunsApi from '@/api/agentRuns'
+import { downloadBlob } from '@/utils'
+import type { TaskControlState } from '@/composables/useAgentTaskWorkspace'
+import type { TaskItem } from '@/composables/useChatPersistence'
+
+type AgentTaskPayload = {
+  runCount?: number
+  attempt?: number
+  workspaceId?: string
+  workspacePath?: string
+  workspaceIsolation?: string
+  steps?: AgentRunStep[]
+  toolCalls?: AgentToolCall[]
+  artifactCount?: number
+  eventCount?: number
+  completedToolCount?: number
+  capabilities?: Record<string, boolean>
+  rawRunStatus?: string
+  finalOutput?: Record<string, unknown>
+  artifacts?: AgentArtifact[]
+  execution?: {
+    state: string
+    execution_count: number
+    recovery_count: number
+  }
+}
+
+const props = defineProps<{ task: TaskItem; controlState?: TaskControlState }>()
+defineEmits<{ refresh: []; open: []; approve: []; retry: []; pause: []; resume: []; cancel: [] }>()
+
+const controlLabels = { pause: '暂停', resume: '恢复', cancel: '取消', retry: '重试', approve: '审批' }
+const runId = computed(() => activeRunIdOfTask(props.task))
+const clarification = computed(() => {
+  if (!steps.value.some((step) => step.tool_id === 'clarify' && step.status === 'waiting_user')) return null
+  return payload.value.finalOutput?.clarification as ClarificationQuestion | undefined
+})
+const payload = computed(() => (props.task.payload ?? {}) as AgentTaskPayload)
+const steps = computed(() => (Array.isArray(payload.value.steps) ? payload.value.steps : []))
+const toolCalls = computed(() => (Array.isArray(payload.value.toolCalls) ? payload.value.toolCalls : []))
+const artifacts = computed(() => (Array.isArray(payload.value.artifacts) ? payload.value.artifacts : []))
+const downloadingId = ref('')
+const downloadError = ref('')
+const downloadableArtifacts = computed(() =>
+  artifacts.value.filter(
+    (artifact) =>
+      runId.value &&
+      artifact.artifact_type === 'file' &&
+      artifact.uri === `/api/agent/runs/${encodeURIComponent(runId.value)}/artifacts/${encodeURIComponent(artifact.artifact_id)}`,
+  ),
+)
+async function downloadArtifact(artifact: AgentArtifact): Promise<void> {
+  if (downloadingId.value || !downloadableArtifacts.value.includes(artifact)) return
+  downloadingId.value = artifact.artifact_id
+  downloadError.value = ''
+  try {
+    const response = await agentRunsApi.downloadArtifact(runId.value, artifact.artifact_id)
+    downloadBlob(await response.blob(), artifact.name || '报表.xlsx')
+  } catch {
+    downloadError.value = '下载失败，请重试；如果文件已失效，请重新导出。'
+  } finally {
+    downloadingId.value = ''
+  }
+}
+const resultSummary = computed(() => {
+  const output = payload.value.finalOutput
+  if (!output || typeof output !== 'object') return ''
+  const businessResult =
+    output.business_result && typeof output.business_result === 'object' ? (output.business_result as Record<string, unknown>) : null
+  const projectedSummary = businessResult?.summary
+  if (typeof projectedSummary === 'string' && projectedSummary.trim()) {
+    const facts = businessResult?.facts && typeof businessResult.facts === 'object' ? (businessResult.facts as Record<string, unknown>) : {}
+    const factLabels: Record<string, string> = {
+      customer_id: '客户 ID',
+      product_id: '产品 ID',
+      material_id: '原材料 ID',
+      order_id: '订单 ID',
+      record_id: '记录 ID',
+      request_no: '请求单号',
+      order_number: '业务单号',
+      doc_name: '文档',
+      created: '新增',
+      updated: '更新',
+      count: '数量',
+      total: '合计',
+    }
+    const renderedFacts = Object.entries(facts)
+      .filter(([, value]) => value !== '' && value !== null && value !== undefined)
+      .map(([key, value]) => `${factLabels[key] || key}：${String(value)}`)
+    return [projectedSummary.trim(), ...renderedFacts].join('；').slice(0, 800)
+  }
+  const chatPayload = output.chat_payload
+  const chatRecord = chatPayload && typeof chatPayload === 'object' ? (chatPayload as Record<string, unknown>) : null
+  const candidates = [chatRecord?.response, chatRecord?.message, output.response, output.message]
+  const summary = candidates.find((value) => typeof value === 'string' && value.trim())
+  if (typeof summary === 'string') return summary.trim().slice(0, 800)
+  const nodeOutputs = output.node_outputs && typeof output.node_outputs === 'object' ? Object.values(output.node_outputs) : []
+  const lastOutput = [...nodeOutputs].reverse().find((value) => value && typeof value === 'object') as Record<string, unknown> | undefined
+  if (!lastOutput) return ''
+  const nodeMessage = [lastOutput.message, lastOutput.summary].find((value) => typeof value === 'string' && value.trim())
+  if (typeof nodeMessage === 'string') return nodeMessage.trim().slice(0, 800)
+  const idEntry = Object.entries(lastOutput).find(
+    ([key, value]) => /(?:^id$|_id$|_number$)/.test(key) && ['string', 'number'].includes(typeof value),
+  )
+  return lastOutput.success === true ? `业务操作执行成功${idEntry ? `；${idEntry[0]}：${String(idEntry[1])}` : ''}` : ''
+})
+const finalOutputText = computed(() => {
+  const output = payload.value.finalOutput
+  if (!output || !Object.keys(output).length) return ''
+  const rendered = JSON.stringify(output, null, 2)
+  return rendered.length > 4000 ? `${rendered.slice(0, 4000)}\n…` : rendered
+})
+const hasResultEvidence = computed(() => Boolean(finalOutputText.value || artifacts.value.length))
+function can(action: string): boolean {
+  if (action === 'approve' && clarification.value) return false
+  if (payload.value.capabilities && action in payload.value.capabilities) {
+    return Boolean(payload.value.capabilities[action])
+  }
+  const rawStatus = String(payload.value.rawRunStatus || props.task.status)
+  if (action === 'approve') return rawStatus === 'waiting_user'
+  if (action === 'pause') return ['queued', 'running', 'waiting_user'].includes(rawStatus)
+  if (action === 'resume') return rawStatus === 'paused'
+  if (action === 'cancel') return ['queued', 'running', 'blocked', 'paused', 'waiting_user'].includes(rawStatus)
+  if (action === 'retry') return ['failed', 'cancelled', 'blocked'].includes(rawStatus)
+  return action === 'evidence'
+}
+const isRetryable = computed(() => can('retry'))
+const isPausable = computed(() => can('pause'))
+const isCancellable = computed(() => can('cancel'))
+
+function stepStatus(status: string | undefined): string {
+  const labels: Record<string, string> = {
+    pending: '待执行',
+    running: '执行中',
+    retrying: '重试中',
+    waiting_user: '等待确认',
+    completed: '已完成',
+    failed: '失败',
+    skipped: '已跳过',
+  }
+  return labels[String(status || '')] || '待执行'
+}
+</script>
+
+<style scoped>
+.agent-task-runtime {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 9px;
+  border: 1px solid #e2e8f0;
+  border-radius: 7px;
+  background: #f8fafc;
+}
+.agent-task-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 11px;
+  color: #475569;
+}
+.agent-task-facts span {
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: #e2e8f0;
+}
+.agent-task-workspace {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 8px;
+  font-size: 11px;
+  color: #334155;
+  word-break: break-all;
+}
+.agent-task-workspace small {
+  grid-column: 2;
+  color: #64748b;
+}
+.agent-task-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.agent-task-steps li,
+.agent-tool-session {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  color: #334155;
+}
+.agent-task-steps em {
+  flex: none;
+  font-style: normal;
+  color: #64748b;
+}
+.agent-step-status--completed {
+  color: #15803d !important;
+}
+.agent-step-status--running,
+.agent-step-status--retrying {
+  color: #1d4ed8 !important;
+}
+.agent-step-status--waiting_user {
+  color: #b45309 !important;
+}
+.agent-step-status--failed {
+  color: #b91c1c !important;
+}
+.agent-tool-sessions summary {
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+  color: #334155;
+}
+.agent-tool-session {
+  padding-top: 5px;
+}
+.agent-tool-session small,
+.agent-task-evidence {
+  color: #64748b;
+  font-size: 11px;
+}
+.agent-result-summary {
+  padding: 7px 8px;
+  border-radius: 6px;
+  background: #ecfdf5;
+  color: #14532d;
+  font-size: 11px;
+}
+.agent-result-summary p {
+  margin: 3px 0 0;
+  line-height: 1.45;
+}
+.agent-result-evidence summary {
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+  color: #334155;
+}
+.agent-result-evidence pre {
+  max-height: 220px;
+  margin: 6px 0 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 10px;
+  color: #334155;
+}
+.agent-result-evidence ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  font-size: 10px;
+  color: #334155;
+}
+.agent-result-evidence small {
+  display: block;
+  word-break: break-all;
+  color: #64748b;
+}
+.task-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+</style>

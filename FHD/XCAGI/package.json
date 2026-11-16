@@ -1,0 +1,15 @@
+{
+  "name": "xcagi-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "兼容入口：前端测试与 lint 统一委派到 ../frontend",
+  "scripts": {
+    "test": "npm --prefix ../frontend run test --",
+    "test:coverage": "npm --prefix ../frontend run test:coverage --",
+    "test:e2e": "npm --prefix ../frontend run test:e2e --",
+    "lint": "npm --prefix ../frontend run lint --"
+  },
+  "engines": {
+    "node": "^22.18.0 || >=24.11.0"
+  }
+}

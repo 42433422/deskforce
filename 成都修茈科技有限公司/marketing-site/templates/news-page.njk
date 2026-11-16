@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>新闻资讯 | XCAGI</title>
+  <meta name="description" content="XCAGI 产品动态与企业业务自动化行业观察。" />
+  <meta property="og:site_name" content="XCAGI" />
+  <meta property="og:title" content="新闻资讯 | XCAGI" />
+  <meta property="og:description" content="XCAGI 产品动态与企业业务自动化行业观察。" />
+  <meta property="og:type" content="website" />
+  <meta property="og:url" content="https://xiu-ci.com/news.html" />
+  <meta property="og:image" content="https://xiu-ci.com/assets/brand-logo.jpg" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <link rel="canonical" href="https://xiu-ci.com/news.html" />
+  <link rel="icon" href="/assets/xiu-ci-logo.png" type="image/png" />
+  <link rel="stylesheet" href="./styles.css?v={{ cssQuery }}" />
+</head>
+<body>
+{% set activeNav = 'news' %}
+{% include "partials/header.njk" %}
+<main>
+  <section class="page-hero">
+    <div class="container page-hero-inner">
+      <div>
+        <span class="eyebrow">News</span>
+        <h1>新闻资讯</h1>
+        <p>记录修茈科技的产品动态、公司公告与对 AI 自动化、Agent 与职场协作的行业观察。</p>
+      </div>
+      <div class="page-hero-side">
+        <p>资讯列表在构建时从数据文件生成，便于统一维护与审阅；更新流程见站内编辑说明。</p>
+      </div>
+    </div>
+  </section>
+  <section class="section">
+    <div class="container">
+      <div class="grid grid-3">
+        {% for item in newsItems %}
+        <article class="news-card reveal" {% if loop.index0 > 0 %}data-delay="{{ (loop.index0 % 3) * 80 }}"{% endif %}>
+          <span class="news-label">{{ item.category }}</span>
+          <h3>{{ item.title }}</h3>
+          <p>{{ item.summary }}</p>
+          {% if item.date %}
+          <p class="footer-meta">{{ item.date }}</p>
+          {% endif %}
+        </article>
+        {% endfor %}
+      </div>
+    </div>
+  </section>
+</main>
+{% include "partials/footer.njk" %}
+<button id="back-to-top" class="back-to-top" aria-label="回到顶部"></button>
+<script src="./main.js?v={{ cssQuery }}"></script>
+{% include "partials/corp-butler.njk" %}
+</body>
+</html>

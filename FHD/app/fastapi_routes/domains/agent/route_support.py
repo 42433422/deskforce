@@ -1,0 +1,245 @@
+"""Shared public response and ownership helpers for Agent API routers."""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, cast
+
+from fastapi.responses import JSONResponse
+
+from app.application.agent_orchestrator import AgentOrchestrator
+from app.application.agent_orchestrator.approval_grant import issue_approval_grant
+from app.application.agent_orchestrator.task_dispatcher import notify_agent_task_dispatcher
+from app.application.agent_orchestrator.task_execution_repository import (
+    get_task_execution_repository,
+)
+from app.application.agent_orchestrator.task_models import tenant_id_of_run
+from app.application.agent_orchestrator.unified_task import task_capabilities
+from app.infrastructure.auth.agent_principal import AgentPrincipal
+from app.utils.json_safe import json_safe
+
+logger = logging.getLogger(__name__)
+
+PUBLIC_AGENT_ERROR = "Agent 执行失败，详细信息已记录"
+PUBLIC_AGENT_SERVICE_ERROR = "Agent 服务暂时不可用，请稍后重试"
+PUBLIC_APPROVAL_ERROR = "approval_grant 无效、过期或与当前步骤不匹配"
+_INTERNAL_ERROR_KEYS = frozenset({"error", "exception", "stack_trace", "traceback"})
+
+
+def without_runtime_identity(raw: dict[str, Any]) -> dict[str, Any]:
+    """Discard caller identity fields before resolving any server principal."""
+    context = dict(raw)
+    for key in (
+        "workspace_root",
+        "node_outputs",
+        "tenant_id",
+        "user_id",
+        "actor_id",
+        "local_user_id",
+        "authenticated_local_user_id",
+        "_mod_authorization",
+        "_actor_authorization",
+        "_bulk_preview_scope",
+        "_bulk_preview_scopes",
+        "mutation_policy",
+        "mod_id",
+        "active_mod_id",
+        "authenticated_username",
+        "authenticated_display_name",
+        "_dataset_access_context_trusted",
+        "dataset_access_context",
+    ):
+        context.pop(key, None)
+    return context
+
+
+def authenticated_runtime_context(raw: dict[str, Any], principal: AgentPrincipal) -> dict[str, Any]:
+    from app.infrastructure.workspace import workspace_root
+
+    context = without_runtime_identity(raw)
+    context["workspace_root"] = str(workspace_root())
+    context.update(user_id=principal.user_id, actor_id=principal.user_id)
+    if principal.tenant_id:
+        context["tenant_id"] = principal.tenant_id
+    if principal.mod_authorization:
+        context["_mod_authorization"] = dict(principal.mod_authorization)
+        context["mod_id"] = str(principal.mod_authorization["mod_id"])
+    if principal.actor_authorization:
+        context["_actor_authorization"] = dict(principal.actor_authorization)
+    return context
+
+
+def request_runtime_context(request: Any, raw: dict[str, Any] | None = None) -> dict[str, Any]:
+    from app.infrastructure.auth.agent_principal import require_agent_principal
+
+    return authenticated_runtime_context(
+        dict(raw or {}), require_agent_principal(request, x_user_id=None)
+    )
+
+
+def success(data: Any, **extra: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {"success": True, "data": json_safe(data)}
+    payload.update(extra)
+    return payload
+
+
+def redact_internal_errors(value: Any) -> Any:
+    """Remove persisted exception details before crossing the public API boundary."""
+    if isinstance(value, dict):
+        return {
+            key: (
+                PUBLIC_AGENT_ERROR
+                if str(key).lower() in _INTERNAL_ERROR_KEYS and child
+                else redact_internal_errors(child)
+            )
+            for key, child in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_internal_errors(item) for item in value]
+    if isinstance(value, tuple):
+        return [redact_internal_errors(item) for item in value]
+    return value
+
+
+def public_run_dict(run: Any) -> dict[str, Any]:
+    # to_dict shares metadata with the stored run: redact only the recursive copy.
+    data = cast("dict[str, Any]", redact_internal_errors(run.to_dict()))
+    if isinstance(data.get("metadata"), dict):
+        data["metadata"].pop("_tool_approval_grants", None)
+    return data
+
+
+def public_event_dict(event: Any) -> dict[str, Any]:
+    return cast("dict[str, Any]", redact_internal_errors(event.to_dict()))
+
+
+def internal_error_response(operation: str) -> JSONResponse:
+    logger.exception("%s failed", operation)
+    return JSONResponse(
+        {"success": False, "message": PUBLIC_AGENT_SERVICE_ERROR},
+        status_code=500,
+    )
+
+
+def run_response(run: Any, *, principal: AgentPrincipal) -> dict[str, Any]:
+    approval = issue_approval_grant(run, principal_id=principal.user_id)
+    extra: dict[str, Any] = {"capabilities": task_capabilities(run)}
+    if approval:
+        extra["approval"] = approval
+    execution = get_task_execution_repository().get(run.run_id)
+    if execution is not None:
+        extra["execution"] = execution.to_dict()
+    return success(public_run_dict(run), **extra)
+
+
+def run_reference_response(run: Any) -> dict[str, Any]:
+    task_context = run.metadata.get("task_context")
+    task_id = str(task_context.get("task_id") or "") if isinstance(task_context, dict) else ""
+    return success({"run_id": str(run.run_id), "status": str(run.status), "task_id": task_id})
+
+
+def owned_run(
+    orchestrator: AgentOrchestrator,
+    run_id: str,
+    principal: AgentPrincipal,
+) -> tuple[Any | None, JSONResponse | None]:
+    run = orchestrator.get_run(run_id)
+    if run is None:
+        return None, JSONResponse(
+            {"success": False, "message": "agent run 不存在"}, status_code=404
+        )
+    if not run_owned_by(run, principal):
+        return None, JSONResponse(
+            {"success": False, "message": "无权访问该 agent run"}, status_code=403
+        )
+    return run, None
+
+
+def run_owned_by(run: Any, principal: AgentPrincipal) -> bool:
+    runtime_context = run.metadata.get("runtime_context") or {}
+    binding = runtime_context.get("_mod_authorization") or {}
+    requested_binding = principal.mod_authorization or {}
+    run_mod = str(binding.get("mod_id") or "")
+    requested_mod = str(requested_binding.get("mod_id") or "")
+    # Legacy unbound runs still require the authenticated owner and tenant.
+    # Platform administration is not a grant to access customer task data.
+    same_mod = (not run_mod) or run_mod == requested_mod
+    return (
+        same_mod
+        and run.user_id == principal.user_id
+        and tenant_id_of_run(run) == principal.tenant_id
+    )
+
+
+def task_scope_matches(
+    orchestrator: AgentOrchestrator, task: Any, principal: AgentPrincipal
+) -> bool:
+    if task.user_id != principal.user_id or task.tenant_id != principal.tenant_id:
+        return False
+    runs = [
+        run
+        for run in orchestrator.list_task_runs(user_id=task.user_id, task_id=task.task_id)
+        if tenant_id_of_run(run) == task.tenant_id
+    ]
+    if not runs:
+        # Legacy tasks without execution records have no authenticated Mod binding.
+        # 任务在上方已通过「用户 + 租户」归属校验；不应仅因请求头携带 active-mod
+        # 就把用户**自己**的历史任务隐藏（前端 window.fetch 补丁总会注入该头，
+        # 故该分支等于让这类任务永久不可见）。此处不再据 mod 绑定额外过滤。
+        return True
+    return all(run_owned_by(run, principal) for run in runs)
+
+
+def scoped_tasks(
+    orchestrator: AgentOrchestrator,
+    *,
+    principal: AgentPrincipal,
+    limit: int,
+    include_archived: bool = False,
+) -> list[Any]:
+    result: list[Any] = []
+    offset = 0
+    while len(result) < limit:
+        page = orchestrator.list_tasks(
+            user_id=principal.user_id,
+            tenant_id=principal.tenant_id,
+            limit=100,
+            offset=offset,
+            include_archived=include_archived,
+        )
+        result.extend(task for task in page if task_scope_matches(orchestrator, task, principal))
+        if len(page) < 100:
+            break
+        offset += len(page)
+    return result[:limit]
+
+
+def enqueue_run(run: Any, *, requested_by: str) -> None:
+    get_task_execution_repository().enqueue(run, requested_by=requested_by)
+    notify_agent_task_dispatcher()
+
+
+def sync_execution_terminal_state(run: Any) -> None:
+    state = {
+        "paused": "paused",
+        "blocked": "blocked",
+        "completed": "completed",
+        "failed": "failed",
+        "cancelled": "cancelled",
+    }.get(str(run.status or ""))
+    if state:
+        get_task_execution_repository().transition(run.run_id, state)
+
+
+__all__ = [
+    "PUBLIC_APPROVAL_ERROR",
+    "enqueue_run",
+    "internal_error_response",
+    "owned_run",
+    "public_event_dict",
+    "public_run_dict",
+    "run_reference_response",
+    "run_response",
+    "success",
+    "sync_execution_terminal_state",
+]

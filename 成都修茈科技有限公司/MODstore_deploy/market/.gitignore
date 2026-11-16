@@ -1,0 +1,35 @@
+# 构建产物目录（保留占位；内容不入库）
+dist/*
+!dist/.gitkeep
+
+# 历史 dist 压缩包（本地调试残留）
+dist*.tar
+dist*.tgz
+dist*.tar.gz
+dist*.zip
+market-dist-upload.tgz
+
+# 覆盖率产物（统一输出到 coverage/，临时调试目录一并忽略）
+coverage/
+coverage_output.txt
+cov*.txt
+strict-*.txt
+
+# 本地调试残留的临时覆盖率目录（vitest 脚本/IDE 触发）
+.tmp-*-cov/
+.tmp-coverage-json/
+coverage-current/
+coverage-detail/
+coverage-ramp-json/
+
+# 本地运行输出
+out.txt
+err.txt
+test-results.json
+test-*.wav
+voice-e2e-result.png
+
+# Exact generated media aliases; sources and checksums live in config/media-aliases.json.
+/public/ai-butler-female-avatar-v1.png
+/public/ai-butler-male-avatar-v1.jpg
+/public/brand-xc-logo.jpg

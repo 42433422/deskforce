@@ -1,0 +1,20 @@
+# CI SSOT: generated from FHD/.github/workflows/publish-macos-download-center.yml — DO NOT edit here.
+# Edit that source, then run: python scripts/dev/publish_ci_workflows_to_root.py
+# Legacy single-run metadata replay cannot certify a frozen native ARM/x64 pair.
+name: Publish macOS Download Center Metadata (disabled)
+on:
+  workflow_dispatch:
+permissions: {contents: read}
+
+defaults:
+  run:
+    working-directory: FHD
+
+jobs:
+  blocked:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require immutable dual-architecture promotion
+        run: |
+          echo '::error::Use Fix macOS update feed with both native candidate run IDs. It defaults to offline verification; publication requires exact-SHA owner approval, protected checks and two-day security clearance.'
+          exit 1

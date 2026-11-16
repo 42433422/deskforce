@@ -1,0 +1,1617 @@
+# CI SSOT: generated from FHD/.github/workflows/release-desktop.yml — DO NOT edit here.
+# Edit that source, then run: python scripts/dev/publish_ci_workflows_to_root.py
+name: Release Desktop
+run-name: "Release Desktop ${{ inputs.release_sha }}${{ inputs.windows_installer_only && ' · Windows 安装包交付（稳定 OTA 保持关闭）' || (inputs.verify_only && ' · 校验模式（不推进对外发布指针）' || '') }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version"
+        required: true
+        default: "1.0.0.7"
+        type: choice
+        options:
+          - "1.0.0.7"
+          - "1.0.0.6"
+          - "1.0.0.5"
+          - "1.0.0.4"
+          - "1.0.0.2"
+          - "1.0.0.1"
+      verify_only:
+        description: "Verify already-published public artifacts without rebuilding or uploading"
+        required: true
+        default: false
+        type: boolean
+      windows_installer_only:
+        description: "Windows installer delivery: auto-sign if configured, otherwise explicitly unsigned; no stable feed publication"
+        required: false
+        default: true
+        type: boolean
+      candidate_only:
+        description: "Keep the Windows installer as a private acceptance candidate; do not publish the download pointer"
+        required: false
+        default: true
+        type: boolean
+      candidate_run_id:
+        description: "Existing frozen installer run ID; publish its exact artifact without rebuilding"
+        required: false
+        type: string
+      acceptance_run_id:
+        description: "Successful Clean/Upgrade/Gui/Recovery/Rollback run ID for the frozen installer"
+        required: false
+        type: string
+      frontend_run_id:
+        description: "Run ID of the orchestrator's build-frontend job producing the shared xcagi-vue-dist artifact"
+        required: false
+        type: string
+      release_sha:
+        description: "Immutable 40-character source SHA shared by Windows, macOS, feeds, and manifests"
+        required: true
+        type: string
+      notice_publication_json:
+        description: "Nonsecret three-field publication record from the official verifier; Windows new builds only"
+        required: false
+        type: string
+      notice_publication_origin:
+        description: "Verified FHD HTTPS origin serving the source login legal paths; required with notice_publication_json"
+        required: false
+        type: string
+      notice_publication_base_path:
+        description: "Explicit FHD mount prefix, e.g. /admin; empty preserves root paths"
+        required: false
+        default: ""
+        type: string
+      security_scan_run_id:
+        description: "Most recent zero-finding security scan run ID"
+        required: false
+        type: string
+      previous_security_scan_run_id:
+        description: "Compatibility input; pass the current scan run ID for the single-scan policy"
+        required: false
+        type: string
+  # Tag (FHD/v*) entry is centralized in fhd-release-orchestrator.yml, which gates on
+  # verify-version-anchors and then dispatches this workflow. Removing the direct tag
+  # trigger here eliminates the double-run on tag push.
+
+permissions:
+  contents: write
+  # 跨 run 下载 xcagi-vue-dist artifact（run-id + download-artifact@v4）必需 actions: read
+  actions: read
+
+defaults:
+  run:
+    working-directory: FHD
+
+env:
+  XCAGI_BUILD_SHA: ${{ inputs.release_sha }}
+
+jobs:
+  notice-publication-policy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - name: Validate notice material lane
+        env:
+          FHD_NOTICE_PUBLICATION_JSON: ${{ inputs.notice_publication_json }}
+          NOTICE_PUBLICATION_ORIGIN: ${{ inputs.notice_publication_origin }}
+          NOTICE_PUBLICATION_BASE_PATH: ${{ inputs.notice_publication_base_path }}
+          WINDOWS_ONLY: ${{ inputs.windows_installer_only }}
+          VERIFY_ONLY: ${{ inputs.verify_only }}
+          CANDIDATE_RUN: ${{ inputs.candidate_run_id }}
+        run: |
+          if [ "$VERIFY_ONLY" = true ] && [ -n "$CANDIDATE_RUN" ]; then
+            echo '::error::verify_only validates the public release and cannot also select an immutable candidate.'
+            exit 1
+          fi
+          if [ "$WINDOWS_ONLY" = true ] && [ "$VERIFY_ONLY" != true ] && [ -z "$CANDIDATE_RUN" ] && { [ -z "$FHD_NOTICE_PUBLICATION_JSON" ] || [ -z "$NOTICE_PUBLICATION_ORIGIN" ]; }; then
+            echo '::error::A new Windows installer requires a verified publication record and its FHD origin before building.'
+            exit 1
+          fi
+          if [ -n "$FHD_NOTICE_PUBLICATION_JSON" ] && { [ "$WINDOWS_ONLY" != true ] || [ "$VERIFY_ONLY" = true ] || [ -n "$CANDIDATE_RUN" ]; }; then
+            echo '::error::Notice material is supported only for a new Windows installer build; immutable candidates and verify-only runs cannot accept appended material.'
+            exit 1
+          fi
+          if { [ -n "$FHD_NOTICE_PUBLICATION_JSON" ] && [ -z "$NOTICE_PUBLICATION_ORIGIN" ]; } || { [ -z "$FHD_NOTICE_PUBLICATION_JSON" ] && [ -n "$NOTICE_PUBLICATION_ORIGIN" ]; }; then
+            echo '::error::Notice publication JSON and its verified FHD origin must be supplied together.'
+            exit 1
+          fi
+          if [ -n "$NOTICE_PUBLICATION_BASE_PATH" ] && [ -z "$FHD_NOTICE_PUBLICATION_JSON" ]; then
+            echo '::error::A notice deployment prefix requires the publication JSON and origin.'
+            exit 1
+          fi
+
+  windows-installer-delivery:
+    needs: [notice-publication-policy]
+    if: ${{ inputs.windows_installer_only == true && inputs.verify_only != true && inputs.candidate_run_id == '' }}
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+      ES_USERNAME: ${{ secrets.ES_USERNAME }}
+      ES_PASSWORD: ${{ secrets.ES_PASSWORD }}
+      CREDENTIAL_ID: ${{ secrets.CREDENTIAL_ID }}
+      ES_TOTP_SECRET: ${{ secrets.ES_TOTP_SECRET }}
+      XCAGI_WINDOWS_PUBLISHER_NAME: ${{ vars.XCAGI_WINDOWS_PUBLISHER_NAME }}
+      XCAGI_WINDOWS_SIGNING_PROVIDER: sslcom
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha }}
+      - name: Validate identity and resolve signing mode
+        id: signing
+        shell: pwsh
+        run: |
+          if ($env:XCAGI_BUILD_SHA -notmatch '^[0-9a-fA-F]{40}$') { throw 'Full release SHA required' }
+          if ((git rev-parse HEAD).Trim() -ne $env:XCAGI_BUILD_SHA) { throw 'Checkout SHA mismatch' }
+          if ('${{ github.ref }}' -ne 'refs/heads/main' -or '${{ github.sha }}' -ne $env:XCAGI_BUILD_SHA) { throw 'Candidate must bind to the selected main SHA' }
+          . scripts/package/product-version.ps1
+          if ((Resolve-ProductVersion) -ne '${{ inputs.version }}') { throw 'Product version mismatch' }
+          $names = @('ES_USERNAME', 'ES_PASSWORD', 'CREDENTIAL_ID', 'ES_TOTP_SECRET', 'XCAGI_WINDOWS_PUBLISHER_NAME')
+          $present = @($names | Where-Object { [Environment]::GetEnvironmentVariable($_) })
+          if ($present.Count -ne 0 -and $present.Count -ne $names.Count) {
+            throw 'Partial signing configuration: complete or remove it; never silently downgrade a configured signer.'
+          }
+          $required = if ($present.Count -eq $names.Count) { '1' } else { '0' }
+          "required=$required" >> $env:GITHUB_OUTPUT
+          "XCAGI_REQUIRE_WINDOWS_SIGNING=$required" >> $env:GITHUB_ENV
+          if ($required -eq '0') { Write-Warning 'Delivering explicitly unsigned installer; stable feeds are untouched.' }
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            FHD/frontend/package-lock.json
+            FHD/desktop/package-lock.json
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: "8.0.x"
+      - name: Validate published notice material
+        if: ${{ inputs.notice_publication_json != '' }}
+        shell: pwsh
+        env:
+          FHD_NOTICE_PUBLICATION_JSON: ${{ inputs.notice_publication_json }}
+          NOTICE_PUBLICATION_ORIGIN: ${{ inputs.notice_publication_origin }}
+          NOTICE_PUBLICATION_BASE_PATH: ${{ inputs.notice_publication_base_path }}
+        run: |
+          python -m pip install 'python-dotenv>=1.2.2'
+          if ($LASTEXITCODE -ne 0) { throw 'Notice verifier dependency installation failed' }
+          npm --prefix frontend ci --ignore-scripts --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { throw 'Notice browser dependencies failed' }
+          $noticeDir = Join-Path $env:RUNNER_TEMP 'notice-publication'
+          New-Item -ItemType Directory -Path $noticeDir -Force | Out-Null
+          $noticeFile = Join-Path $noticeDir 'record.json'
+          python scripts/deploy/elt_notice_publication.py --record-env FHD_NOTICE_PUBLICATION_JSON --origin $env:NOTICE_PUBLICATION_ORIGIN "--base-path=$env:NOTICE_PUBLICATION_BASE_PATH" --browser-channel msedge --record-file $noticeFile
+          if ($LASTEXITCODE -ne 0) { throw 'Publication fact or deployed policy verification failed; no material staged' }
+          $digest = (Get-FileHash -LiteralPath $noticeFile -Algorithm SHA256).Hash.ToLowerInvariant()
+          "XCAGI_NOTICE_PUBLICATION_FILE=$noticeFile" >> $env:GITHUB_ENV
+          "XCAGI_NOTICE_PUBLICATION_SHA256=$digest" >> $env:GITHUB_ENV
+          "XCAGI_NOTICE_PUBLICATION_ORIGIN=$env:NOTICE_PUBLICATION_ORIGIN" >> $env:GITHUB_ENV
+          "XCAGI_NOTICE_PUBLICATION_BASE_PATH=$env:NOTICE_PUBLICATION_BASE_PATH" >> $env:GITHUB_ENV
+      - name: Install SSL.com CodeSignTool when configured
+        if: steps.signing.outputs.required == '1'
+        uses: SSLcom/esigner-codesign@cf5f6c1d38ad10f47e3ed9aca873f429b1a8d85b
+        with:
+          command: --version
+          environment_name: PROD
+          signing_method: v2
+      - name: Build exact-SHA Windows installer
+        shell: pwsh
+        env:
+          DELIVERY_VERSION: ${{ inputs.version }}
+        run: |
+          dotnet run --project tools/XcagiInstaller.Tests/XcagiInstaller.Tests.csproj -c Release
+          if ($LASTEXITCODE -ne 0) { throw 'Windows installer process regression failed' }
+          scripts/package/test-windows-signature-policy.ps1
+          scripts/package/build-installer.ps1 -Version $env:DELIVERY_VERSION -ProductSku enterprise
+      - name: Verify resources, install, start, and uninstall
+        shell: pwsh
+        env:
+          DELIVERY_VERSION: ${{ inputs.version }}
+        run: |
+          $allowUnsigned = $env:XCAGI_REQUIRE_WINDOWS_SIGNING -eq '0'
+          scripts/package/pre-release-security.ps1 -Phase post -Version $env:DELIVERY_VERSION -ProductSku enterprise -AllowUnsigned:$allowUnsigned
+          $installer = "release/xcagi-v$env:DELIVERY_VERSION/enterprise/XCAGI-Enterprise-Setup-$env:DELIVERY_VERSION-x64.exe"
+          scripts/package/verify-windows-installed-runtime.ps1 -InstallerPath $installer -ExpectedPublisher $env:XCAGI_WINDOWS_PUBLISHER_NAME -ExpectedBuildSha $env:XCAGI_BUILD_SHA -ExpectedProductVersion $env:DELIVERY_VERSION -AllowUnsigned:$allowUnsigned
+      - name: Prepare truthful delivery receipt
+        shell: pwsh
+        env:
+          DELIVERY_VERSION: ${{ inputs.version }}
+        run: |
+          $installer = "release/xcagi-v$env:DELIVERY_VERSION/enterprise/XCAGI-Enterprise-Setup-$env:DELIVERY_VERSION-x64.exe"
+          $signature = Get-AuthenticodeSignature -LiteralPath $installer
+          $state = if ($signature.Status -eq 'Valid') { 'signed' } elseif ($signature.Status -eq 'NotSigned') { 'unsigned' } else { throw "Invalid signature: $($signature.Status)" }
+          New-Item -ItemType Directory -Path delivery -Force | Out-Null
+          $filename = "XCAGI-Enterprise-Setup-$env:DELIVERY_VERSION-x64-$state.exe"
+          Copy-Item $installer "delivery/$filename"
+          $hash = (Get-FileHash "delivery/$filename" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $filename" | Set-Content "delivery/$filename.sha256" -Encoding utf8
+          $buildInfo = Get-Content -Raw -Encoding UTF8 "release/xcagi-v$env:DELIVERY_VERSION/enterprise/win-unpacked/resources/build-info.json" | ConvertFrom-Json
+          $noticeMaterial = $buildInfo.notice_publication
+          if ($noticeMaterial) {
+            if ($noticeMaterial.sha256 -ne $env:XCAGI_NOTICE_PUBLICATION_SHA256 -or $noticeMaterial.source_sha -ne $env:XCAGI_BUILD_SHA) { throw 'Notice material provenance mismatch' }
+            Copy-Item -LiteralPath $env:XCAGI_NOTICE_PUBLICATION_FILE -Destination delivery/notice-publication.json
+          }
+          @{
+            version = $env:DELIVERY_VERSION; git_sha = $env:XCAGI_BUILD_SHA
+            signature_status = $state; authenticode_status = [string]$signature.Status
+            filename = $filename; sha256 = $hash; size = (Get-Item "delivery/$filename").Length
+            delivery_mode = 'manual_installer'; stable_auto_update = $false
+            runner_install_smoke = 'passed'; customer_machine_acceptance = 'not_verified'
+            notice_publication = $noticeMaterial
+            notice_publication_installed_probe = $(if ($noticeMaterial) { 'passed' } else { 'not_run' })
+            warning = $(if ($state -eq 'unsigned') { '未签名安装包，Windows 可能显示未知发布者或安全提示；不进入稳定自动更新。' } else { '' })
+          } | ConvertTo-Json | Set-Content delivery/delivery-receipt.json -Encoding utf8
+          Get-Content delivery/delivery-receipt.json >> $env:GITHUB_STEP_SUMMARY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xcagi-windows-installer-${{ inputs.release_sha }}
+          path: |
+            FHD/delivery/XCAGI-Enterprise-Setup-${{ inputs.version }}-x64-*.exe
+            FHD/delivery/XCAGI-Enterprise-Setup-${{ inputs.version }}-x64-*.exe.sha256
+            FHD/delivery/delivery-receipt.json
+            FHD/delivery/notice-publication.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: State that the stable release pointer was not advanced
+        if: always()
+        shell: pwsh
+        run: |
+          $n = "本次走 Windows 安装包交付通道（windows_installer_only=true）：稳定发布链全部跳过，Windows stable OTA 未推进；临时下载指针由后续作业独立发布。"
+          Write-Host "::warning::$n"; "### 未执行正式发布链`n$n" | Add-Content $env:GITHUB_STEP_SUMMARY
+
+  publish-interim-windows-pointer:
+    # 仅晋级已通过五模式验收的原候选；不重建、不写稳定更新元数据。
+    # 未签名包须有业主风险接受；签名包须由前置 Windows 验收证明签名有效。
+    needs: [windows-installer-delivery, notice-publication-policy]
+    if: >-
+      always() &&
+      needs.notice-publication-policy.result == 'success' &&
+      inputs.windows_installer_only == true &&
+      inputs.verify_only != true &&
+      inputs.candidate_only != true &&
+      needs.windows-installer-delivery.result == 'skipped' && inputs.candidate_run_id != '' && inputs.acceptance_run_id != ''
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    env:
+      DESKTOP_SSH_KEY: ${{ secrets.SERVER_SSH_KEY || secrets.FHD_PUSH_SSH_KEY }}
+      DELIVERY_VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha }}
+          fetch-depth: 0
+      - name: Verify frozen mainline source and original run provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          CANDIDATE_RUN: ${{ inputs.candidate_run_id }}
+          ACCEPTANCE_RUN: ${{ inputs.acceptance_run_id }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_SHA" =~ ^[a-f0-9]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$RELEASE_SHA" origin/main
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CANDIDATE_RUN}" \
+            | jq -e --arg sha "$RELEASE_SHA" '.conclusion == "success" and .head_sha == $sha and .head_branch == "main" and .path == ".github/workflows/fhd-release-desktop.yml"' >/dev/null
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${ACCEPTANCE_RUN}" \
+            | jq -e '.conclusion == "success" and .head_branch == "main" and .path == ".github/workflows/fhd-windows-candidate-acceptance.yml"' >/dev/null
+      - uses: actions/download-artifact@v8
+        with:
+          name: xcagi-windows-installer-${{ inputs.release_sha }}
+          path: ${{ runner.temp }}/delivery
+          run-id: ${{ inputs.candidate_run_id || github.run_id }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v8
+        if: ${{ inputs.candidate_run_id != '' }}
+        with:
+          pattern: windows-candidate-evidence-*-${{ inputs.release_sha }}
+          path: ${{ runner.temp }}/acceptance
+          run-id: ${{ inputs.acceptance_run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify all five frozen candidate acceptance modes
+        if: ${{ inputs.candidate_run_id != '' }}
+        run: |
+          set -euo pipefail
+          receipt="${RUNNER_TEMP}/delivery/delivery-receipt.json"
+          for mode in Clean Upgrade Gui Recovery Rollback; do
+            evidence="${RUNNER_TEMP}/acceptance/windows-candidate-evidence-${mode}-${{ inputs.release_sha }}/acceptance.json"
+            test -f "$evidence"
+            jq -e --arg mode "$mode" --arg sha "${{ inputs.release_sha }}" \
+              --arg hash "$(jq -r .sha256 "$receipt")" '
+              .mode == $mode and .result == ({Clean:"passed", Upgrade:"passed", Gui:"gui_regression_passed", Recovery:"gui_recovery_regression_passed", Rollback:"rollback_passed"}[$mode]) and .candidate_sha == $sha
+              and .candidate_sha256 == $hash and (.checks | length) > 0
+              and all(.checks[]; .passed == true)' "$evidence" >/dev/null
+          done
+      - name: Assert truthful Windows delivery receipt
+        run: |
+          set -euo pipefail
+          receipt="${RUNNER_TEMP}/delivery/delivery-receipt.json"
+          test -f "$receipt"
+          jq -e --arg v "$DELIVERY_VERSION" --arg sha "${{ inputs.release_sha }}" '
+            .version == $v
+            and ((.git_sha | ascii_downcase) == ($sha | ascii_downcase))
+            and .delivery_mode == "manual_installer"
+            and .runner_install_smoke == "passed"
+            and .stable_auto_update == false
+            and ((.signature_status == "signed" and .authenticode_status == "Valid")
+              or (.signature_status == "unsigned" and .authenticode_status == "NotSigned"))
+          ' "$receipt" >/dev/null
+          echo "Truthful installer receipt verified; customer_machine_acceptance stays not_verified."
+      - name: Verify immutable candidate notice material
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+        run: |
+          python3 FHD/scripts/package/notice_publication_material.py verify-candidate \
+            --receipt "${RUNNER_TEMP}/delivery/delivery-receipt.json" \
+            --record "${RUNNER_TEMP}/delivery/notice-publication.json" \
+            --source-sha "$RELEASE_SHA"
+      - name: Generate bounded interim download pointer
+        run: |
+          set -euo pipefail
+          version="${DELIVERY_VERSION}"
+          receipt="${RUNNER_TEMP}/delivery/delivery-receipt.json"
+          signature_status="$(jq -r '.signature_status' "$receipt")"
+          filename="$(jq -r '.filename' "$receipt")"
+          artifact="${RUNNER_TEMP}/delivery/${filename}"
+          test -f "${artifact}"
+          test -f "${artifact}.sha256"
+          artifact_sha="$(sha256sum "${artifact}" | cut -d' ' -f1)"
+          receipt_sha="$(jq -er '.sha256' "$receipt")"
+          sidecar_sha="$(cut -d' ' -f1 "${artifact}.sha256")"
+          test "$artifact_sha" = "$receipt_sha" && test "$artifact_sha" = "$sidecar_sha"
+          release_sha="${{ inputs.release_sha }}"
+          args=(
+            --version "$version"
+            --git-sha "${{ inputs.release_sha }}"
+            --artifact "$artifact"
+            --artifact-url "https://xiu-ci.com/xcagi-v${version}/enterprise/${release_sha,,}/${artifact_sha}/${filename}"
+            --release-metadata-source FHD/config/download_release.json
+            --signature-status "$signature_status"
+            --output "${RUNNER_TEMP}/download-windows-hotfix.json"
+          )
+          if [ "$signature_status" = unsigned ]; then
+            args+=(--risk-acceptance FHD/config/windows_signing_acceptance.json)
+          fi
+          python3 FHD/scripts/package/generate-windows-hotfix-pointer.py \
+            "${args[@]}"
+          jq -e --arg signature "$signature_status" '
+            .download_allowed == true
+            and .channel == "enterprise-interim"
+            and .signature_status == $signature
+            and .stable_auto_update == false
+            and (if $signature == "unsigned" then .risk_acceptance.expires_at != null else .risk_acceptance == null end)
+          ' "${RUNNER_TEMP}/download-windows-hotfix.json" >/dev/null
+      - name: Publish installer and pointer to the public download page
+        run: |
+          set -euo pipefail
+          if [ -z "${DESKTOP_SSH_KEY:-}" ]; then
+            echo "::error::Publishing the Windows interim download requires SERVER_SSH_KEY or FHD_PUSH_SSH_KEY."
+            exit 1
+          fi
+          version="${DELIVERY_VERSION}"
+          filename="$(jq -r '.filename' "${RUNNER_TEMP}/delivery/delivery-receipt.json")"
+          artifact="${RUNNER_TEMP}/delivery/${filename}"
+          sha_file="${artifact}.sha256"
+          pointer="${RUNNER_TEMP}/download-windows-hotfix.json"
+          local_sha="$(sha256sum "${artifact}" | awk '{print $1}')"
+          release_sha="${{ inputs.release_sha }}"
+          url="https://xiu-ci.com/xcagi-v${version}/enterprise/${release_sha,,}/${local_sha}/${filename}"
+          official_dir="/var/www/xcagi-v${version}/enterprise/${release_sha,,}/${local_sha}"
+          staging_dir="/var/www/.xcagi-interim-staging/${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+          pointer_target="/var/www/update/releases/stable/enterprise/download-windows-hotfix.json"
+
+          HOST="${{ vars.FHD_PUSH_HOST || '119.27.178.147' }}"
+          mkdir -p ~/.ssh
+          printf '%s\n' "${DESKTOP_SSH_KEY}" > ~/.ssh/id_ci
+          chmod 600 ~/.ssh/id_ci
+          ssh-keyscan -H "${HOST}" >> ~/.ssh/known_hosts 2>/dev/null || true
+          SSH_OPTS=(-i "$HOME/.ssh/id_ci" -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
+
+          ssh "${SSH_OPTS[@]}" "root@${HOST}" "mkdir -p '${official_dir}' '${staging_dir}' && chmod 0700 '${staging_dir}'"
+          # Snapshot exact old bytes before a slow upload; a concurrent publisher invalidates this CAS.
+          pointer_guard="${staging_dir}/pointer-guard.py"
+          pointer_archive="/var/www/update/releases/rollback/interim-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          scp "${SSH_OPTS[@]}" "成都修茈科技有限公司/MODstore_deploy/scripts/sync_site_download_release.py" "root@${HOST}:${pointer_guard}"
+          ssh "${SSH_OPTS[@]}" "root@${HOST}" \
+            "python3 '${pointer_guard}' --snapshot --pointer-target '${pointer_target}' --archive-dir '${pointer_archive}'"
+          uploaded=0
+          for attempt in 1 2 3; do
+            if scp "${SSH_OPTS[@]}" "$artifact" "$sha_file" "root@${HOST}:${staging_dir}/"; then
+              uploaded=1
+              break
+            fi
+            echo "interim installer upload attempt ${attempt} failed"
+            sleep 10
+          done
+          test "$uploaded" = 1
+          ssh "${SSH_OPTS[@]}" "root@${HOST}" "bash -s" -- \
+            "$official_dir" "$staging_dir" "$filename" "$local_sha" <<'REMOTE_INTERIM'
+          set -euo pipefail
+          official_dir="$1"; staging_dir="$2"; filename="$3"; expected_sha="$4"
+          test "$(stat -c %d "$official_dir")" = "$(stat -c %d "$staging_dir")"
+          staged_sha="$(sha256sum "$staging_dir/$filename" | cut -d' ' -f1)"
+          sidecar_sha="$(cut -d' ' -f1 "$staging_dir/$filename.sha256")"
+          test "$staged_sha" = "$expected_sha"
+          test "$sidecar_sha" = "$expected_sha"
+          if [ -e "$official_dir/$filename" ]; then
+            test ! -L "$official_dir/$filename"
+            existing_sha="$(sha256sum "$official_dir/$filename" | cut -d' ' -f1)"
+            test "$existing_sha" = "$expected_sha"
+          else
+            mv -n "$staging_dir/$filename" "$official_dir/$filename"
+          fi
+          mv -f "$staging_dir/$filename.sha256" "$official_dir/$filename.sha256"
+          chmod 0644 "$official_dir/$filename" "$official_dir/$filename.sha256"
+          rm -f -- "$staging_dir/$filename"
+          REMOTE_INTERIM
+
+          # 公开可下载性用真实 HTTP + 远端 SHA256 双验证，不接受“上传即成功”的假设。
+          curl --http1.1 -fsSI --max-time 60 "$url" >/dev/null
+          public_sha="$(curl --http1.1 -fsSL --max-time 900 "$url" | sha256sum | cut -d' ' -f1)"
+          if [ "$public_sha" != "$local_sha" ]; then
+            echo "::error::Public installer SHA256 mismatch: public=$public_sha local=$local_sha"
+            exit 1
+          fi
+          remote_sha="$(ssh "${SSH_OPTS[@]}" "root@${HOST}" \
+            "sha256sum '${official_dir}/${filename}' | cut -d' ' -f1")"
+          if [ "$remote_sha" != "$local_sha" ]; then
+            echo "::error::Published installer SHA256 mismatch: remote=$remote_sha local=$local_sha"
+            exit 1
+          fi
+
+          pointer_tmp="${staging_dir}/incoming.json"
+          scp "${SSH_OPTS[@]}" "$pointer" "root@${HOST}:${pointer_tmp}"
+          ssh "${SSH_OPTS[@]}" "root@${HOST}" \
+            "python3 '${pointer_guard}' --promote-source '${pointer_tmp}' --pointer-target '${pointer_target}' --archive-dir '${pointer_archive}'"
+          if ! curl --http1.1 -fsS --max-time 60 "https://xiu-ci.com/download-windows-hotfix.json?release-run=${GITHUB_RUN_ID}" \
+              -o "${RUNNER_TEMP}/public-hotfix.json" || ! cmp "$pointer" "${RUNNER_TEMP}/public-hotfix.json"; then
+            # Restore only our own replacement, never a later publication; retain the archive and old EXE.
+            ssh "${SSH_OPTS[@]}" "root@${HOST}" \
+              "python3 '${pointer_guard}' --restore --pointer-target '${pointer_target}' --archive-dir '${pointer_archive}'" \
+              || echo "::error::Pointer changed again; automatic rollback refused, reconcile from archived bytes."
+            exit 1
+          fi
+          ssh "${SSH_OPTS[@]}" "root@${HOST}" "rm -f '${pointer_tmp}' '${pointer_guard}' && rmdir '${staging_dir}'"
+          echo "Windows interim download is publicly available; the Windows stable update feed was not touched."
+
+  release-preflight:
+    needs: [notice-publication-policy]
+    if: ${{ inputs.verify_only != true && inputs.windows_installer_only != true && inputs.candidate_only != true }}
+    runs-on: ubuntu-latest
+    # Security evidence lives at repository root; do not inherit FHD working directory.
+    defaults:
+      run:
+        working-directory: .
+    env:
+      ES_USERNAME: ${{ secrets.ES_USERNAME }}
+      ES_PASSWORD: ${{ secrets.ES_PASSWORD }}
+      CREDENTIAL_ID: ${{ secrets.CREDENTIAL_ID }}
+      ES_TOTP_SECRET: ${{ secrets.ES_TOTP_SECRET }}
+      CSC_LINK: ${{ secrets.CSC_LINK }}
+      CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+      APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+      APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+      APP_STORE_CONNECT_API_PRIVATE_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_PRIVATE_KEY_BASE64 }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      IOS_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+      XCAGI_UPDATE_ED25519_PRIVATE_KEY: ${{ secrets.XCAGI_UPDATE_ED25519_PRIVATE_KEY }}
+      SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+      FHD_PUSH_SSH_KEY: ${{ secrets.FHD_PUSH_SSH_KEY }}
+      XCAGI_WINDOWS_PUBLISHER_NAME: ${{ vars.XCAGI_WINDOWS_PUBLISHER_NAME }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Reject a test-only version from the stable publication lane
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          python - <<'PY_POLICY'
+          import json, os
+          from pathlib import Path
+          release = json.loads(Path("FHD/config/download_release.json").read_text())["windows_interim_release"]
+          if release.get("test_only") and release["version"] == os.environ["REQUESTED_VERSION"]:
+              raise SystemExit("Test-only release: use the Windows candidate/manual-download lane; stable OTA is closed.")
+          PY_POLICY
+      - name: Download normalized security evidence
+        uses: actions/download-artifact@v8
+        with:
+          name: xcagi-security-release-reports
+          path: security-reports/current
+          run-id: ${{ inputs.security_scan_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Download compatibility security evidence
+        uses: actions/download-artifact@v8
+        with:
+          name: xcagi-security-release-reports
+          path: security-reports/previous
+          run-id: ${{ inputs.previous_security_scan_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Enforce fresh exact-SHA zero-critical/high security scan
+        run: >-
+          python FHD/scripts/security/verify_security_scan_pair.py
+          --previous-dir security-reports/previous
+          --current-dir security-reports/current
+          --release-sha "${XCAGI_BUILD_SHA}"
+      - name: Fail closed before either platform builds
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in \
+            ES_USERNAME ES_PASSWORD CREDENTIAL_ID ES_TOTP_SECRET \
+            CSC_LINK CSC_KEY_PASSWORD \
+            APP_STORE_CONNECT_API_KEY_ID APP_STORE_CONNECT_API_ISSUER_ID \
+            APP_STORE_CONNECT_API_PRIVATE_KEY_BASE64 \
+            XCAGI_UPDATE_ED25519_PRIVATE_KEY XCAGI_WINDOWS_PUBLISHER_NAME
+          do
+            if [ -z "${!name:-}" ]; then missing+=("$name"); fi
+          done
+          if [ -z "${APPLE_TEAM_ID:-}" ] && [ -z "${IOS_TEAM_ID:-}" ]; then
+            missing+=("APPLE_TEAM_ID|IOS_TEAM_ID")
+          fi
+          if [ -z "${SERVER_SSH_KEY:-}" ] && [ -z "${FHD_PUSH_SSH_KEY:-}" ]; then
+            missing+=("SERVER_SSH_KEY|FHD_PUSH_SSH_KEY")
+          fi
+          if [ "${#missing[@]}" -gt 0 ]; then
+            printf '::error::Stable desktop release preflight is missing: %s\n' "${missing[*]}"
+            exit 1
+          fi
+          if ! printf '%s' "${XCAGI_BUILD_SHA}" | grep -Eq '^[0-9a-fA-F]{40}$'; then
+            echo "::error::release_sha must be a full 40-character Git SHA."
+            exit 1
+          fi
+          echo "Stable desktop release preflight passed for Windows + macOS."
+
+  windows:
+    needs: [release-preflight]
+    if: ${{ inputs.verify_only != true }}
+    runs-on: windows-latest
+    env:
+      XCAGI_REQUIRE_WINDOWS_SIGNING: "1"
+      XCAGI_WINDOWS_SIGNING_PROVIDER: sslcom
+      XCAGI_WINDOWS_PUBLISHER_NAME: ${{ vars.XCAGI_WINDOWS_PUBLISHER_NAME }}
+      XCAGI_ARTIFACT_URL_PREFIX: https://xiu-ci.com/releases/builds/${{ inputs.version }}/${{ inputs.release_sha }}/enterprise
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha }}
+      - name: Lock Windows checkout to release SHA
+        shell: pwsh
+        run: |
+          $actual = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          $expected = $env:XCAGI_BUILD_SHA.Trim().ToLowerInvariant()
+          if ($actual -ne $expected) { throw "Checkout drift: actual=$actual expected=$expected" }
+      - name: Download shared vue-dist (single frontend build)
+        uses: actions/download-artifact@v8
+        with:
+          name: xcagi-vue-dist
+          path: FHD/templates/vue-dist
+          run-id: ${{ inputs.frontend_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Assert shared vue-dist present (fail closed)
+        shell: pwsh
+        run: |
+          # defaults.run.working-directory=FHD：相对路径相对 FHD/
+          if (-not (Test-Path "templates/vue-dist/index.html")) {
+            Write-Error "::error::Shared vue-dist missing from artifact (frontend_run_id=${{ inputs.frontend_run_id }}). Refusing to build a frontend-less desktop."
+            exit 1
+          }
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: |
+            FHD/frontend/package-lock.json
+            FHD/desktop/package-lock.json
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: "8.0.x"
+      - name: Install SSL.com CodeSignTool
+        uses: SSLcom/esigner-codesign@cf5f6c1d38ad10f47e3ed9aca873f429b1a8d85b # v1.3.2
+        with:
+          command: --version
+          environment_name: PROD
+          signing_method: v2
+      - name: Build Windows enterprise installer
+        shell: pwsh
+        env:
+          ES_USERNAME: ${{ secrets.ES_USERNAME }}
+          ES_PASSWORD: ${{ secrets.ES_PASSWORD }}
+          CREDENTIAL_ID: ${{ secrets.CREDENTIAL_ID }}
+          ES_TOTP_SECRET: ${{ secrets.ES_TOTP_SECRET }}
+        run: |
+          $raw = "${{ github.event.inputs.version || github.ref_name }}"
+          $raw = $raw -replace '^FHD/', ''
+          $v = $raw.TrimStart('v','V')
+          dotnet run --project tools/XcagiInstaller.Tests/XcagiInstaller.Tests.csproj -c Release
+          if ($LASTEXITCODE -ne 0) { throw 'Windows installer process regression failed' }
+          scripts/package/build-installer.ps1 -Version $v -ProductSku enterprise -SkipFrontend
+      - name: Verify Windows enterprise installer
+        shell: pwsh
+        run: |
+          $raw = "${{ github.event.inputs.version || github.ref_name }}"
+          $raw = $raw -replace '^FHD/', ''
+          $v = $raw.TrimStart('v','V')
+          scripts/package/pre-release-security.ps1 -Phase post -Version $v -ProductSku enterprise
+      - name: Assert critical resources packaged (enterprise)
+        shell: pwsh
+        run: |
+          $raw = "${{ github.event.inputs.version || github.ref_name }}"
+          $raw = $raw -replace '^FHD/', ''
+          $v = $raw.TrimStart('v','V')
+          $sku = "enterprise"
+          $dir = "release/xcagi-v$v/$sku/win-unpacked/resources"
+          foreach ($p in @(
+            "backend/xcagi-backend.exe",
+            "product-sku.json",
+            "backend/_internal/mods"
+          )) {
+            if (-not (Test-Path "$dir/$p")) {
+              Write-Error "::error::Missing critical resource for ${sku}: $p (expected at $dir/$p)"
+              exit 1
+            }
+            Write-Host "OK $sku resource: $p"
+          }
+          # GUI-subsystem exe: pwsh `&` 不会等待窗口程序返回，$LASTEXITCODE 不可靠。
+          # 用 Start-Process -Wait -PassThru 取真实退出码，否则探针在 healthy exe 下也会被误判失败。
+          $probe = Start-Process -FilePath "$dir/backend/xcagi-backend.exe" `
+            -ArgumentList "--verify-frozen-critical-runtime" -Wait -PassThru -NoNewWindow
+          Write-Host "Frozen critical runtime probe exit code: $($probe.ExitCode)"
+          if ($probe.ExitCode -ne 0) {
+            Write-Error "::error::Frozen Windows backend critical office/voice runtime probe failed (exit=$($probe.ExitCode))."
+            exit 1
+          }
+      - name: Install, launch, smoke, and uninstall signed Windows package
+        shell: pwsh
+        run: |
+          $raw = "${{ github.event.inputs.version || github.ref_name }}"
+          $raw = $raw -replace '^FHD/', ''
+          $v = $raw.TrimStart('v','V')
+          $installer = "release/xcagi-v$v/enterprise/XCAGI-Enterprise-Setup-$v-x64.exe"
+          scripts/package/verify-windows-installed-runtime.ps1 `
+            -InstallerPath $installer `
+            -ExpectedPublisher $env:XCAGI_WINDOWS_PUBLISHER_NAME `
+            -ExpectedBuildSha "${{ inputs.release_sha }}" `
+            -ExpectedProductVersion $v `
+            -ReadyTimeoutSeconds 240
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xcagi-desktop-windows-enterprise
+          path: |
+            FHD/release/xcagi-v*/enterprise/*.exe
+            FHD/release/xcagi-v*/enterprise/*.exe.blockmap
+            FHD/release/xcagi-v*/enterprise/*.zip
+            FHD/release/xcagi-v*/enterprise/*.zip.blockmap
+            FHD/release/xcagi-v*/enterprise/latest*.yml
+
+  macos:
+    needs: [release-preflight]
+    if: ${{ inputs.verify_only != true }}
+    runs-on: macos-latest
+    env:
+      APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+      APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+      APP_STORE_CONNECT_API_PRIVATE_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_PRIVATE_KEY_BASE64 }}
+      # Prefer ASC API key notarization. Do NOT set APPLE_ID here without
+      # APPLE_APP_SPECIFIC_PASSWORD — electron-builder will fail mid-sign.
+      IOS_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID || secrets.IOS_TEAM_ID }}
+      XCAGI_UPDATE_ED25519_PRIVATE_KEY: ${{ secrets.XCAGI_UPDATE_ED25519_PRIVATE_KEY }}
+      CSC_LINK: ${{ secrets.CSC_LINK }}
+      CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+      XCAGI_ARTIFACT_URL_PREFIX: https://xiu-ci.com/releases/builds/${{ inputs.version }}/${{ inputs.release_sha }}/enterprise
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha }}
+      - name: Lock macOS checkout to release SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD | tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "${XCAGI_BUILD_SHA}" | tr '[:upper:]' '[:lower:]')"
+      - name: Download shared vue-dist (single frontend build)
+        uses: actions/download-artifact@v8
+        with:
+          name: xcagi-vue-dist
+          path: FHD/templates/vue-dist
+          run-id: ${{ inputs.frontend_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Assert shared vue-dist present (fail closed)
+        shell: bash
+        run: |
+          test -f templates/vue-dist/index.html || {
+            echo "::error::Shared vue-dist missing from artifact (frontend_run_id=${{ inputs.frontend_run_id }}). Refusing to build a frontend-less desktop."
+            exit 1
+          }
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: |
+            FHD/frontend/package-lock.json
+            FHD/desktop/package-lock.json
+      - name: Import Developer ID certificate (CSC_LINK p12)
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x scripts/package/import_mac_developer_id_p12.sh
+          scripts/package/import_mac_developer_id_p12.sh
+      - name: Build macOS enterprise installer
+        shell: bash
+        env:
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          SKIP_FRONTEND: "1"
+        run: |
+          set -euo pipefail
+          if [ -z "${CSC_NAME:-}" ]; then
+            CSC_NAME="$(security find-identity -v -p codesigning | grep 'Developer ID Application' | head -1 | sed -n 's/.*"\(.*\)"/\1/p' || true)"
+          fi
+          # electron-builder rejects names that still include the certificate type prefix
+          CSC_NAME="${CSC_NAME#Developer ID Application: }"
+          CSC_NAME="${CSC_NAME#Developer ID Application:}"
+          if [ -z "${CSC_NAME}" ]; then
+            echo "::error::Developer ID Application certificate missing after CSC_LINK import"
+            security find-identity -v -p codesigning || true
+            exit 1
+          fi
+          export CSC_NAME
+          echo "Using CSC_NAME=${CSC_NAME}"
+          v="${{ github.event.inputs.version || github.ref_name }}"
+          v="${v#FHD/}"
+          v="${v#v}"
+          v="${v#V}"
+          PYTHON=python3 scripts/package/build-installer.sh "$v" enterprise
+      - name: Notarize and staple macOS enterprise DMG
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="${{ github.event.inputs.version || github.ref_name }}"
+          v="${v#FHD/}"
+          v="${v#v}"
+          v="${v#V}"
+          toolchain_version="$(printf '%s' "${v}" | cut -d. -f1-3)"
+          dmg="$(find "release/xcagi-v${v}/enterprise" -name '*.dmg' -print -quit)"
+          test -n "${dmg}"
+          chmod +x scripts/package/finalize-macos-dmg.sh
+          scripts/package/finalize-macos-dmg.sh "${dmg}" "${v}" "${toolchain_version}"
+      - name: Verify macOS codesign (enterprise)
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="${{ github.event.inputs.version || github.ref_name }}"
+          v="${v#FHD/}"
+          v="${v#v}"
+          v="${v#V}"
+          dmg="$(find "release/xcagi-v${v}/enterprise" -name '*.dmg' -print -quit)"
+          test -n "${dmg}"
+          bash scripts/package/verify-macos-release-dmg.sh "${dmg}" "${v}" "${XCAGI_BUILD_SHA}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xcagi-desktop-macos-enterprise
+          path: |
+            FHD/release/xcagi-v*/enterprise/*.dmg
+            FHD/release/xcagi-v*/enterprise/*.dmg.blockmap
+            FHD/release/xcagi-v*/enterprise/*.zip
+            FHD/release/xcagi-v*/enterprise/*.zip.blockmap
+            FHD/release/xcagi-v*/enterprise/latest*.yml
+
+  generate-manifest:
+    needs: [release-preflight, windows, macos]
+    if: >-
+      always() &&
+      inputs.verify_only != true &&
+      needs.release-preflight.result == 'success' &&
+      needs.windows.result == 'success' &&
+      needs.macos.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha }}
+      - name: Lock manifest checkout to release SHA
+        run: test "$(git rev-parse HEAD)" = "${XCAGI_BUILD_SHA}"
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: xcagi-desktop-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/artifacts
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Reconstruct release directory from artifacts
+        run: |
+          set -euo pipefail
+          raw="${{ github.event.inputs.version || github.ref_name }}"
+          raw="${raw#FHD/}"
+          raw="${raw#v}"
+          raw="${raw#V}"
+          version="${raw:-1.0.0.1}"
+          mkdir -p "release/xcagi-v${version}"
+          BASE="${RUNNER_TEMP}/artifacts"
+          sku=enterprise
+          src_dir="$(find "$BASE" -type d -path "*/xcagi-v${version}/$sku" -print -quit || true)"
+          if [ -z "$src_dir" ]; then src_dir="$BASE"; fi
+          if [ -d "$src_dir" ]; then
+            mkdir -p "release/xcagi-v${version}/$sku"
+            find "$src_dir" -maxdepth 1 -type f \
+              \( -name '*.exe' -o -name '*.exe.blockmap' \
+                 -o -name '*.dmg' -o -name '*.dmg.blockmap' \
+                 -o -name '*.zip' -o -name '*.zip.blockmap' \
+                 -o -name 'latest*.yml' \) \
+              -exec cp -v {} "release/xcagi-v${version}/$sku/" \;
+          fi
+          ls -la "release/xcagi-v${version}/enterprise"
+      - name: Block the desktop release without Windows and macOS installer evidence
+        run: python scripts/dev/check_release_scope_evidence.py --artifact-dir release --source-sha "${XCAGI_BUILD_SHA}"
+      - name: Install metadata signing dependency
+        run: python -m pip install --quiet cryptography
+      - name: Sign reconstructed update metadata
+        env:
+          XCAGI_UPDATE_ED25519_PRIVATE_KEY: ${{ secrets.XCAGI_UPDATE_ED25519_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${XCAGI_UPDATE_ED25519_PRIVATE_KEY:-}" ]; then
+            echo "::error::XCAGI_UPDATE_ED25519_PRIVATE_KEY is required before publishing reconstructed update metadata."
+            exit 1
+          fi
+          raw="${{ github.event.inputs.version || github.ref_name }}"
+          raw="${raw#FHD/}"
+          raw="${raw#v}"
+          raw="${raw#V}"
+          version="${raw:-1.0.0.1}"
+          for metadata in "release/xcagi-v${version}/enterprise"/latest*.yml; do
+            test -f "$metadata"
+            python scripts/dev/sign_update_metadata.py "$metadata"
+          done
+      - name: Generate manifest.json + download-release.json
+        working-directory: FHD
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          raw="${{ github.event.inputs.version || github.ref_name }}"
+          raw="${raw#FHD/}"
+          raw="${raw#v}"
+          raw="${raw#V}"
+          version="${raw:-1.0.0.1}"
+          release_id="xcagi-${version}-${XCAGI_BUILD_SHA,,}"
+          immutable_base="https://xiu-ci.com/releases/builds/${version}/${XCAGI_BUILD_SHA,,}"
+          android_version="$(jq -er '.android_version' config/download_release.json)"
+          android_git_sha="$(jq -er '.android_git_sha' config/download_release.json)"
+          # 主线闭环：把本发布关闭的工单（issue）写进 manifest，
+          # 供市场端验收判定结果回写到原工单。
+          prev_feed_sha="$(jq -er '.git_sha // empty' config/download_release.json || true)"
+          linked_issues=""
+          if [ -n "${prev_feed_sha:-}" ]; then
+            linked_issues="$(python scripts/dev/extract_release_linked_issues.py \
+              --from "$prev_feed_sha" --to "${XCAGI_BUILD_SHA}" \
+              --repo "${GITHUB_REPOSITORY}" --format csv || true)"
+          fi
+          python scripts/package/generate-download-manifest.py \
+            --version "$version" \
+            --release-dir release \
+            --release-subdir "xcagi-v${version}" \
+            --git-sha "${XCAGI_BUILD_SHA}" \
+            --release-id "$release_id" \
+            --build-workflow-run-id "${GITHUB_RUN_ID}" \
+            --frontend-workflow-run-id "${{ inputs.frontend_run_id }}" \
+            --linked-issues "$linked_issues" \
+            --auto-update-base "$immutable_base" \
+            --official-download-base "$immutable_base" \
+            --android-version "$android_version" \
+            --android-git-sha "$android_git_sha" \
+            --release-metadata-source config/download_release.json \
+            --output "${RUNNER_TEMP}/manifest.json" \
+            --download-release-output "${RUNNER_TEMP}/download-release.json"
+      - name: Upload manifest artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcagi-download-manifest
+          path: |
+            ${{ runner.temp }}/manifest.json
+            ${{ runner.temp }}/download-release.json
+      - name: Progress linked work orders to released (mainline merged/released)
+        # 主线闭环：本次发布合并的工单沿状态机真实推进 merged → released，
+        # 让验收回执在 verifying 窗口判定关闭/重开。失败不阻断发布。
+        continue-on-error: true
+        env:
+          XCAGI_MARKET_BASE_URL: ${{ vars.XCAGI_MARKET_BASE_URL }}
+          MARKET_ADMIN_TOKEN: ${{ secrets.MARKET_ADMIN_TOKEN }}
+        run: |
+          if [ -z "${MARKET_ADMIN_TOKEN:-}" ]; then
+            echo "::warning::SKIP work-order progress: MARKET_ADMIN_TOKEN not configured"
+            exit 0
+          fi
+          python scripts/dev/record_release_work_order_states.py \
+            --release-config "${RUNNER_TEMP}/download-release.json" --apply || true
+      - name: Publish unified Windows + macOS release to CVM
+        timeout-minutes: 45
+        working-directory: .
+        env:
+          DESKTOP_SSH_KEY: ${{ secrets.SERVER_SSH_KEY || secrets.FHD_PUSH_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DESKTOP_SSH_KEY:-}" ]; then
+            echo "::error::Stable release requires SERVER_SSH_KEY or FHD_PUSH_SSH_KEY."
+            exit 1
+          fi
+          HOST="${{ vars.FHD_PUSH_HOST || '119.27.178.147' }}"
+          mkdir -p ~/.ssh
+          printf '%s\n' "${DESKTOP_SSH_KEY}" > ~/.ssh/id_ci
+          chmod 600 ~/.ssh/id_ci
+          ssh-keyscan -H "${HOST}" >> ~/.ssh/known_hosts 2>/dev/null || true
+          SSH_OPTS=(-i "$HOME/.ssh/id_ci" -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
+          raw="${{ github.event.inputs.version || github.ref_name }}"
+          raw="${raw#FHD/}"; raw="${raw#v}"; raw="${raw#V}"
+          version="${raw:-1.0.0.1}"
+          release_sha="${XCAGI_BUILD_SHA,,}"
+          sku=enterprise
+          src_dir="${GITHUB_WORKSPACE}/FHD/release/xcagi-v${version}/${sku}"
+          test -d "$src_dir"
+          find "$src_dir" -maxdepth 1 -type f -name '*.exe' -print -quit | grep -q .
+          find "$src_dir" -maxdepth 1 -type f -name '*.dmg' -print -quit | grep -q .
+          test -f "$src_dir/latest.yml"
+          test -f "$src_dir/latest-mac.yml"
+          test -f "${RUNNER_TEMP}/manifest.json"
+          test -f "${RUNNER_TEMP}/download-release.json"
+
+          publish_payload() {
+            local dest="$1"
+            ssh "${SSH_OPTS[@]}" "root@${HOST}" "mkdir -p '$dest'"
+            timeout 2400 rsync -avz --delay-updates --timeout=120 \
+              --include='*.exe' \
+              --include='*.exe.blockmap' \
+              --include='*.dmg' \
+              --include='*.dmg.blockmap' \
+              --include='*.zip' \
+              --include='*.zip.blockmap' \
+              --include='latest*.yml' \
+              --exclude='*' \
+              -e "ssh ${SSH_OPTS[*]}" "$src_dir/" "root@${HOST}:$dest/"
+          }
+
+          publish_json_atomically() {
+            local source="$1"
+            local target="$2"
+            local remote_tmp="${target}.tmp.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+            scp "${SSH_OPTS[@]}" "$source" "root@${HOST}:$remote_tmp"
+            ssh "${SSH_OPTS[@]}" "root@${HOST}" \
+              "chmod 0644 '$remote_tmp' && mv -f '$remote_tmp' '$target'"
+          }
+
+          publish_stable_metadata_atomically() {
+            local source="$1"
+            local target="$2"
+            local remote_tmp="${target}.tmp.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+            scp "${SSH_OPTS[@]}" "$source" "root@${HOST}:$remote_tmp"
+            ssh "${SSH_OPTS[@]}" "root@${HOST}" \
+              "chmod 0644 '$remote_tmp' && mv -f '$remote_tmp' '$target'"
+          }
+
+          rollback_root="/var/www/update/releases/rollback/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          official_root="/var/www/xcagi-v${version}"
+          stable_root="/var/www/update/releases/stable"
+          ssh "${SSH_OPTS[@]}" "root@${HOST}" "bash -s" -- \
+            "$rollback_root" "$official_root" "$stable_root" <<'REMOTE_BACKUP'
+          set -euo pipefail
+          backup_root="$1"
+          official_root="$2"
+          stable_root="$3"
+          mkdir -p "$backup_root/files"
+          : > "$backup_root/missing"
+          for target in \
+            "$stable_root/enterprise/latest.yml" \
+            "$stable_root/enterprise/latest-mac.yml" \
+            "$stable_root/manifest.json" \
+            "$official_root/enterprise/latest.yml" \
+            "$official_root/enterprise/latest-mac.yml" \
+            "$official_root/manifest.json" \
+            "$official_root/download-release.json" \
+            "/root/成都修茈科技有限公司/download-release.json" \
+            "/root/成都修茈科技有限公司/MODstore_deploy/market/public/download-release.json" \
+            "/root/成都修茈科技有限公司/MODstore_deploy/market/dist/download-release.json" \
+            "/root/成都修茈科技有限公司/corp-butler/download-release.json"
+          do
+            if [ -f "$target" ]; then
+              mkdir -p "$backup_root/files$(dirname "$target")"
+              cp -p "$target" "$backup_root/files$target"
+            else
+              printf '%s\n' "$target" >> "$backup_root/missing"
+            fi
+          done
+          REMOTE_BACKUP
+
+          rollback_public_pointers() {
+            ssh "${SSH_OPTS[@]}" "root@${HOST}" "bash -s" -- "$rollback_root" <<'REMOTE_ROLLBACK'
+          set -euo pipefail
+          backup_root="$1"
+          [ -d "$backup_root/files" ] || exit 0
+          while IFS= read -r -d '' saved; do
+            target="${saved#${backup_root}/files}"
+            mkdir -p "$(dirname "$target")"
+            tmp="${target}.rollback.$$"
+            cp -p "$saved" "$tmp"
+            mv -f "$tmp" "$target"
+          done < <(find "$backup_root/files" -type f -print0)
+          while IFS= read -r target; do
+            [ -n "$target" ] && rm -f -- "$target"
+          done < "$backup_root/missing"
+          REMOTE_ROLLBACK
+          }
+          trap rollback_public_pointers ERR
+
+          # Preserve every same-version build under its full source SHA. Stable
+          # metadata only moves after the complete two-platform payload exists.
+          immutable_root="/var/www/update/releases/builds/${version}/${release_sha}"
+          publish_payload "${immutable_root}/${sku}"
+          publish_json_atomically "${RUNNER_TEMP}/manifest.json" "${immutable_root}/manifest.json"
+          publish_json_atomically "${RUNNER_TEMP}/download-release.json" "${immutable_root}/download-release.json"
+
+          # Compatibility mirror for existing download URLs. It is never used as
+          # the rollback identity because it may be replaced by a later SHA.
+          publish_payload "${official_root}/${sku}"
+          publish_json_atomically "${RUNNER_TEMP}/manifest.json" "${official_root}/manifest.json"
+          publish_json_atomically "${RUNNER_TEMP}/download-release.json" "${official_root}/download-release.json"
+
+          ssh "${SSH_OPTS[@]}" "root@${HOST}" "mkdir -p '${stable_root}/${sku}'"
+          publish_stable_metadata_atomically \
+            "${src_dir}/latest.yml" "${stable_root}/${sku}/latest.yml"
+          publish_stable_metadata_atomically \
+            "${src_dir}/latest-mac.yml" "${stable_root}/${sku}/latest-mac.yml"
+          publish_json_atomically "${RUNNER_TEMP}/manifest.json" "${stable_root}/manifest.json"
+          trap - ERR
+          echo "Unified Windows + macOS release published to official and stable paths."
+
+  cross-platform-parity:
+    needs: [generate-manifest]
+    if: >-
+      always() &&
+      (inputs.verify_only == true || needs.generate-manifest.result == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          ref: ${{ inputs.release_sha }}
+      - uses: actions/download-artifact@v8
+        if: ${{ inputs.verify_only != true }}
+        with:
+          name: xcagi-download-manifest
+          path: ${{ runner.temp }}/manifest
+      - name: Fetch published manifest (verify-only)
+        if: ${{ inputs.verify_only == true }}
+        run: |
+          set -euo pipefail
+          version="${{ inputs.version }}"
+          mkdir -p "${RUNNER_TEMP}/manifest"
+          curl -fsSL \
+            --retry 3 \
+            --retry-all-errors \
+            --retry-delay 2 \
+            --connect-timeout 15 \
+            --max-time 60 \
+            "https://xiu-ci.com/xcagi-v${version}/manifest.json" \
+            -o "${RUNNER_TEMP}/manifest/manifest.json"
+      - name: Verify manifest parity between Windows and macOS artifacts
+        run: |
+          set -euo pipefail
+          manifest="${RUNNER_TEMP}/manifest/manifest.json"
+          test -f "$manifest"
+          top_version="$(jq -er '.version' "$manifest")"
+          top_git_sha="$(jq -er '.git_sha' "$manifest")"
+          top_release_id="$(jq -er '.release_id' "$manifest")"
+          expected_release_id="xcagi-${top_version}-${top_git_sha}"
+          if [ "$top_release_id" != "$expected_release_id" ]; then
+            echo "::error::Manifest release_id mismatch: ${top_release_id} != ${expected_release_id}"
+            exit 1
+          fi
+          # Manifest structure (scripts/package/generate-download-manifest.py):
+          # enterprise.win is a single object and enterprise.mac is an array
+          # (multi-arch dmg/pkg, platform key is exactly "mac"); entries carry
+          # url/sha256/size/filename only — version/git_sha live at the manifest
+          # top level and are embedded in the artifact filenames.
+          jq -e '
+            .release_ready == true and
+            (.channels.official_download.enterprise | type == "object" and has("win") and has("mac")) and
+            (.channels.official_download.enterprise.win | type == "object" and
+              (.url | type == "string" and length > 0) and
+              (.sha256 | type == "string" and length > 0) and
+              (.size | type == "number" and . > 0) and
+              (.filename | type == "string" and length > 0)) and
+            (.channels.official_download.enterprise.mac | type == "array" and length > 0) and
+            (all(.channels.official_download.enterprise.mac[];
+              (.url | type == "string" and length > 0) and
+              (.sha256 | type == "string" and length > 0) and
+              (.size | type == "number" and . > 0) and
+              (.filename | type == "string" and length > 0)))
+          ' "$manifest" >/dev/null || {
+            echo "::error::Manifest cross-platform structure invalid: expected .channels.official_download.enterprise.win object plus non-empty .mac array (platform key must be mac) with url/sha256/size/filename, and release_ready=true."
+            exit 1
+          }
+          jq -e --arg v "$top_version" '
+            ([.channels.official_download.enterprise.win.filename] +
+             [.channels.official_download.enterprise.mac[].filename]) | all(contains($v))
+          ' "$manifest" >/dev/null || {
+            echo "::error::Cross-platform parity mismatch: manifest top-level version=${top_version} is not embedded in every win/mac artifact filename."
+            exit 1
+          }
+          echo "Manifest parity OK: version=${top_version} git_sha=${top_git_sha} covers win + mac artifact entries."
+      - name: Verify latest.yml vs latest-mac.yml identity parity
+        run: |
+          set -euo pipefail
+          manifest="${RUNNER_TEMP}/manifest/manifest.json"
+          expected_version="$(jq -er '.version' "$manifest")"
+          expected_sha="$(jq -er '.git_sha' "$manifest")"
+          expected_release_id="$(jq -er '.release_id' "$manifest")"
+          if [ "${{ inputs.verify_only }}" = "true" ]; then
+            base="https://xiu-ci.com/releases/stable"
+          else
+            base="https://xiu-ci.com/xcagi-v${expected_version}"
+          fi
+          echo "Fetching per-platform update metadata from ${base}/enterprise"
+          tmpdir="$(mktemp -d)"
+          trap 'rm -rf "$tmpdir"' EXIT
+          curl -fsSL --retry 3 --retry-all-errors --retry-delay 2 --connect-timeout 15 --max-time 60 \
+            "${base}/enterprise/latest.yml" -o "$tmpdir/latest.yml"
+          curl -fsSL --retry 3 --retry-all-errors --retry-delay 2 --connect-timeout 15 --max-time 60 \
+            "${base}/enterprise/latest-mac.yml" -o "$tmpdir/latest-mac.yml"
+          win_version="$(sed -n 's/^productVersion:[[:space:]]*//p' "$tmpdir/latest.yml" | head -n 1)"
+          win_sha="$(sed -n 's/^buildSha:[[:space:]]*//p' "$tmpdir/latest.yml" | head -n 1)"
+          mac_version="$(sed -n 's/^productVersion:[[:space:]]*//p' "$tmpdir/latest-mac.yml" | head -n 1)"
+          mac_sha="$(sed -n 's/^buildSha:[[:space:]]*//p' "$tmpdir/latest-mac.yml" | head -n 1)"
+          win_release_id="$(sed -n 's/^releaseId:[[:space:]]*//p' "$tmpdir/latest.yml" | head -n 1)"
+          mac_release_id="$(sed -n 's/^releaseId:[[:space:]]*//p' "$tmpdir/latest-mac.yml" | head -n 1)"
+          missing=()
+          [ -n "$win_version" ] || missing+=("latest.yml productVersion")
+          [ -n "$win_sha" ] || missing+=("latest.yml buildSha")
+          [ -n "$mac_version" ] || missing+=("latest-mac.yml productVersion")
+          [ -n "$mac_sha" ] || missing+=("latest-mac.yml buildSha")
+          [ -n "$win_release_id" ] || missing+=("latest.yml releaseId")
+          [ -n "$mac_release_id" ] || missing+=("latest-mac.yml releaseId")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            printf '::error::Update metadata is missing identity lines: %s\n' "${missing[*]}"
+            exit 1
+          fi
+          if [ "$win_version" != "$mac_version" ] || [ "$win_sha" != "$mac_sha" ] ||
+             [ "$win_version" != "$expected_version" ] || [ "$win_sha" != "$expected_sha" ] ||
+             [ "$mac_version" != "$expected_version" ] || [ "$mac_sha" != "$expected_sha" ] ||
+             [ "$win_release_id" != "$expected_release_id" ] ||
+             [ "$mac_release_id" != "$expected_release_id" ]; then
+            printf '::error::Cross-platform parity mismatch: win version=%s git_sha=%s / mac version=%s git_sha=%s\n' \
+              "$win_version" "$win_sha" "$mac_version" "$mac_sha"
+            echo "Manifest top-level identity: version=${expected_version} git_sha=${expected_sha}"
+            exit 1
+          fi
+          echo "Windows + macOS parity OK: ${expected_version} @ ${expected_sha}"
+
+  verify-download:
+    needs: [generate-manifest]
+    if: >-
+      always() &&
+      (inputs.verify_only == true || needs.generate-manifest.result == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha }}
+      - uses: actions/download-artifact@v8
+        if: ${{ inputs.verify_only != true }}
+        with:
+          name: xcagi-download-manifest
+          path: ${{ runner.temp }}/manifest
+      - name: Fetch published manifest (verify-only)
+        if: ${{ inputs.verify_only == true }}
+        run: |
+          set -euo pipefail
+          version="${{ inputs.version }}"
+          mkdir -p "${RUNNER_TEMP}/manifest"
+          curl -fsSL \
+            --retry 3 \
+            --retry-all-errors \
+            --retry-delay 2 \
+            --connect-timeout 15 \
+            --max-time 60 \
+            "https://xiu-ci.com/xcagi-v${version}/manifest.json" \
+            -o "${RUNNER_TEMP}/manifest/manifest.json"
+      - name: Verify download URLs (HTTP 200 + SHA256 + size)
+        run: |
+          set -euo pipefail
+          # Workflow-level defaults already set working-directory to FHD.
+          bash scripts/deploy/verify-download.sh "${RUNNER_TEMP}/manifest/manifest.json"
+      - name: Verify public update metadata parity and signed identity
+        run: |
+          set -euo pipefail
+          manifest="${RUNNER_TEMP}/manifest/manifest.json"
+          expected_version="$(jq -er '.version' "$manifest")"
+          expected_sha="$(jq -er '.git_sha' "$manifest")"
+          expected_release_id="$(jq -er '.release_id' "$manifest")"
+          tmpdir="$(mktemp -d)"
+          trap 'rm -rf "$tmpdir"' EXIT
+          for metadata in latest.yml latest-mac.yml; do
+            stable="$tmpdir/stable-$metadata"
+            official="$tmpdir/official-$metadata"
+            curl -fsSL --retry 3 --retry-all-errors --connect-timeout 15 --max-time 60 \
+              "https://xiu-ci.com/releases/stable/enterprise/$metadata" -o "$stable"
+            curl -fsSL --retry 3 --retry-all-errors --connect-timeout 15 --max-time 60 \
+              "https://xiu-ci.com/xcagi-v${expected_version}/enterprise/$metadata" -o "$official"
+            cmp -s "$stable" "$official" || {
+              echo "::error::$metadata differs between stable and official download paths."
+              exit 1
+            }
+            grep -Eq '^signature: ed25519:[A-Za-z0-9+/=]+$' "$official" || {
+              echo "::error::$metadata is missing its Ed25519 signature."
+              exit 1
+            }
+            grep -Fxq "productVersion: ${expected_version}" "$official"
+            grep -Fxq "buildSha: ${expected_sha}" "$official"
+            grep -Fxq "releaseId: ${expected_release_id}" "$official"
+            grep -Eq "^releaseDate: ['\''\"]?[0-9]{4}-[0-9]{2}-[0-9]{2}T" "$official" || {
+              echo "::error::$metadata is missing a usable releaseDate (required to prevent same-version downgrade)."
+              exit 1
+            }
+          done
+
+  verify-public-windows-signature:
+    needs: [verify-download, cross-platform-parity]
+    if: >-
+      always() &&
+      needs.verify-download.result == 'success'
+    runs-on: windows-latest
+    env:
+      XCAGI_WINDOWS_PUBLISHER_NAME: ${{ vars.XCAGI_WINDOWS_PUBLISHER_NAME }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha }}
+      - name: Verify published Windows Authenticode signature
+        shell: pwsh
+        run: |
+          $raw = "${{ github.event.inputs.version || github.ref_name }}"
+          $raw = $raw -replace '^FHD/', ''
+          $version = $raw.TrimStart('v','V')
+          if ($version -notmatch '^\d+\.\d+\.\d+(\.\d+)?$') {
+            throw "Invalid public desktop version: $version"
+          }
+
+          $manifestUrl = "https://xiu-ci.com/xcagi-v$version/manifest.json"
+          $manifestPath = Join-Path $env:RUNNER_TEMP 'xcagi-public-manifest.json'
+          Invoke-WebRequest `
+            -UseBasicParsing `
+            -TimeoutSec 60 `
+            -Uri $manifestUrl `
+            -OutFile $manifestPath
+          $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+          $entry = $manifest.channels.official_download.enterprise.win
+          if (-not $entry.url -or -not $entry.sha256 -or -not $entry.size) {
+            throw "Public manifest is missing the enterprise Windows artifact: $manifestUrl"
+          }
+
+          $installer = Join-Path $env:RUNNER_TEMP ([string]$entry.filename)
+          Invoke-WebRequest `
+            -UseBasicParsing `
+            -TimeoutSec 600 `
+            -Uri ([string]$entry.url) `
+            -OutFile $installer
+
+          $actualSize = (Get-Item -LiteralPath $installer).Length
+          if ($actualSize -ne [long]$entry.size) {
+            throw "Public Windows installer size mismatch: actual=$actualSize expected=$($entry.size)"
+          }
+          $actualSha = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expectedSha = ([string]$entry.sha256).ToLowerInvariant()
+          if ($actualSha -ne $expectedSha) {
+            throw "Public Windows installer SHA256 mismatch: actual=$actualSha expected=$expectedSha"
+          }
+
+          $signature = Get-AuthenticodeSignature -LiteralPath $installer
+          Write-Host "Public Authenticode status: $($signature.Status)"
+          Write-Host "Public Authenticode message: $($signature.StatusMessage)"
+          if ($signature.Status -ne 'Valid') {
+            throw "Published Windows installer is not Authenticode-valid: $($signature.Status) $($signature.StatusMessage)"
+          }
+          if (-not $env:XCAGI_WINDOWS_PUBLISHER_NAME) {
+            throw 'XCAGI_WINDOWS_PUBLISHER_NAME is required to verify the published certificate Subject.'
+          }
+
+          scripts/package/verify-windows-signature.ps1 `
+            -Path $installer `
+            -ExpectedPublisher $env:XCAGI_WINDOWS_PUBLISHER_NAME
+
+  publish-website-pointer:
+    needs: [generate-manifest, cross-platform-parity, verify-download, verify-public-windows-signature]
+    if: >-
+      always() &&
+      inputs.verify_only != true &&
+      needs.generate-manifest.result == 'success' &&
+      needs.cross-platform-parity.result == 'success' &&
+      needs.verify-download.result == 'success' &&
+      needs.verify-public-windows-signature.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: xcagi-download-manifest
+          path: ${{ runner.temp }}/manifest
+      - name: Publish verified website download pointer
+        env:
+          DESKTOP_SSH_KEY: ${{ secrets.SERVER_SSH_KEY || secrets.FHD_PUSH_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DESKTOP_SSH_KEY:-}" ]; then
+            echo "::error::Verified release pointer publication requires SERVER_SSH_KEY or FHD_PUSH_SSH_KEY."
+            exit 1
+          fi
+          manifest="${RUNNER_TEMP}/manifest/manifest.json"
+          pointer="${RUNNER_TEMP}/manifest/download-release.json"
+          test -f "$pointer"
+          jq -e --slurpfile manifest "$manifest" '
+            .schema == "xcagi.download_release.public/v1"
+            and .release_ready == true
+            and .version_lock == $manifest[0].version
+            and .download_version == $manifest[0].version
+            and .git_sha == $manifest[0].git_sha
+            and .release_id == $manifest[0].release_id
+            and .active_skus == ["enterprise"]
+            and (.frozen_skus | index("personal") != null)
+            and .primary_sku == "enterprise"
+            and (.android_version | type == "string" and length > 0)
+            and (.android_git_sha | test("^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$"))
+            and .release_history[0].version == $manifest[0].version
+            and (.release_history[0].date | type == "string" and length > 0)
+            and (.release_history[0].title | type == "string" and length > 0)
+            and (.release_history[0].notes | type == "array" and length > 0)
+          ' "$pointer" >/dev/null
+
+          HOST="${{ vars.FHD_PUSH_HOST || '119.27.178.147' }}"
+          mkdir -p ~/.ssh
+          printf '%s\n' "${DESKTOP_SSH_KEY}" > ~/.ssh/id_ci
+          chmod 600 ~/.ssh/id_ci
+          ssh-keyscan -H "${HOST}" >> ~/.ssh/known_hosts 2>/dev/null || true
+          SSH_OPTS=(-i "$HOME/.ssh/id_ci" -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=15)
+          root_target="/root/成都修茈科技有限公司/download-release.json"
+          remote_tmp="${root_target}.tmp.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+          scp "${SSH_OPTS[@]}" "$pointer" "root@${HOST}:${remote_tmp}"
+          ssh "${SSH_OPTS[@]}" "root@${HOST}" "bash -s" -- "$remote_tmp" "$root_target" <<'REMOTE'
+          set -euo pipefail
+          incoming="$1"
+          root_target="$2"
+          chmod 0644 "$incoming"
+          mv -f "$incoming" "$root_target"
+          for target in \
+            "/root/成都修茈科技有限公司/MODstore_deploy/market/public/download-release.json" \
+            "/root/成都修茈科技有限公司/MODstore_deploy/market/dist/download-release.json" \
+            "/root/成都修茈科技有限公司/corp-butler/download-release.json"
+          do
+            if [ -d "$(dirname "$target")" ]; then
+              tmp="${target}.tmp.$$"
+              cp -f "$root_target" "$tmp"
+              chmod 0644 "$tmp"
+              mv -f "$tmp" "$target"
+            fi
+          done
+          REMOTE
+
+  verify-download-center:
+    needs: [generate-manifest, verify-download, publish-website-pointer]
+    if: >-
+      always() &&
+      needs.verify-download.result == 'success' &&
+      (inputs.verify_only == true || needs.publish-website-pointer.result == 'success')
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - name: Verify public download center and changelog
+        shell: bash
+        run: |
+          set -euo pipefail
+          raw="${{ github.event.inputs.version || github.ref_name }}"
+          raw="${raw#FHD/}"; raw="${raw#v}"; raw="${raw#V}"
+          version="${raw:-1.0.0.1}"
+          tmpdir="$(mktemp -d)"
+          trap 'rm -rf "$tmpdir"' EXIT
+
+          curl -fsSL --retry 4 --retry-all-errors --connect-timeout 15 --max-time 90 \
+            "https://xiu-ci.com/xcagi-v${version}/manifest.json?release-run=${GITHUB_RUN_ID}" \
+            -o "$tmpdir/manifest.json"
+          expected_sha="$(jq -er '.git_sha' "$tmpdir/manifest.json")"
+
+          pointer_ok=0
+          for attempt in $(seq 1 12); do
+            curl -fsSL --retry 3 --retry-all-errors --connect-timeout 15 --max-time 60 \
+              "https://xiu-ci.com/download-release.json?release-run=${GITHUB_RUN_ID}-${attempt}" \
+              -o "$tmpdir/download-release.json"
+            if jq -e --arg version "$version" --arg sha "$expected_sha" '
+              .schema == "xcagi.download_release.public/v1"
+              and .release_ready == true
+              and .version_lock == $version
+              and .download_version == $version
+              and .git_sha == $sha
+              and .manifest_url == ("https://xiu-ci.com/xcagi-v" + $version + "/manifest.json")
+              and .release_history[0].version == $version
+              and (.release_history[0].date | type == "string" and length > 0)
+              and (.release_history[0].title | type == "string" and length > 0)
+              and (.release_history[0].notes | type == "array" and length > 0)
+            ' "$tmpdir/download-release.json" >/dev/null; then
+              pointer_ok=1
+              break
+            fi
+            sleep 5
+          done
+          if [ "$pointer_ok" -ne 1 ]; then
+            echo "::error::Public download pointer or changelog did not converge to ${version} @ ${expected_sha}."
+            jq . "$tmpdir/download-release.json" || true
+            exit 1
+          fi
+
+          curl -fsSL --retry 3 --retry-all-errors --connect-timeout 15 --max-time 60 \
+            "https://xiu-ci.com/download?release-run=${GITHUB_RUN_ID}" \
+            -o "$tmpdir/download.html"
+          curl -fsSL --retry 3 --retry-all-errors --connect-timeout 15 --max-time 60 \
+            "https://xiu-ci.com/download/releases?release-run=${GITHUB_RUN_ID}" \
+            -o "$tmpdir/download-releases.html"
+          # 官网对外只认发布清单：两张页面都必须从 /download-release.json 读取当前版本，
+          # 且不得残留写死的版本兜底值——写死的值会在每次发版后过期，让官网自相矛盾。
+          grep -Fq "fetch('/download-release.json'" "$tmpdir/download.html"
+          grep -Fq 'id="version"' "$tmpdir/download.html"
+          grep -Fq "fetchJson('/download-release.json')" "$tmpdir/download-releases.html"
+          grep -Fq 'id="release-list"' "$tmpdir/download-releases.html"
+          if grep -Eq "DEFAULT_VERSION *= *['\"][0-9]" "$tmpdir/download.html"; then
+            echo "::error::线上下载页仍写死版本兜底值，未同步到「以发布清单为准」的官网版本"; exit 1
+          fi
+          if grep -Eq 'id="summary-version">[v0-9]' "$tmpdir/download-releases.html"; then
+            echo "::error::线上更新日志页仍写死当前版本，未同步到「以发布清单为准」的官网版本"; exit 1
+          fi
+          # 发版即官网同步：能力中心必须同时在线（#1952 整目录漏发导致线上 404 的回归守卫）。
+          # 断言只落在实际发布的三个面上（corp-site-deploy 只发 capabilities/ 与 data/capabilities/）。
+          curl -fsSL --retry 3 --retry-all-errors --connect-timeout 15 --max-time 60 \
+            "https://xiu-ci.com/capabilities/catalog.html?release-run=${GITHUB_RUN_ID}" \
+            -o "$tmpdir/cap-catalog.html"
+          grep -Fq '能力目录' "$tmpdir/cap-catalog.html"
+          for surface in "/capabilities/" "/data/capabilities/catalog.json"; do
+            curl -fsSL --retry 3 --retry-all-errors --connect-timeout 15 --max-time 60 \
+              "https://xiu-ci.com${surface}?release-run=${GITHUB_RUN_ID}" -o /dev/null
+          done
+          echo "Download center, changelog and capability center verified for ${version} @ ${expected_sha}."
+
+  rollback-stable-pointers:
+    name: Restore previous stable pointers on failed acceptance
+    needs:
+      - generate-manifest
+      - cross-platform-parity
+      - verify-download
+      - verify-public-windows-signature
+      - publish-website-pointer
+      - verify-download-center
+    if: >-
+      always() &&
+      inputs.verify_only != true &&
+      needs.generate-manifest.result == 'success' &&
+      (needs.cross-platform-parity.result != 'success' ||
+       needs.verify-download.result != 'success' ||
+       needs.verify-public-windows-signature.result != 'success' ||
+       needs.publish-website-pointer.result != 'success' ||
+       needs.verify-download-center.result != 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Restore the exact pre-release metadata set
+        env:
+          DESKTOP_SSH_KEY: ${{ secrets.SERVER_SSH_KEY || secrets.FHD_PUSH_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "${DESKTOP_SSH_KEY:-}"
+          HOST="${{ vars.FHD_PUSH_HOST || '119.27.178.147' }}"
+          key="${RUNNER_TEMP}/desktop-rollback-key"
+          printf '%s\n' "$DESKTOP_SSH_KEY" > "$key"
+          chmod 600 "$key"
+          backup_root="/var/www/update/releases/rollback/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          ssh -i "$key" -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+            -o ConnectTimeout=15 "root@${HOST}" "bash -s" -- "$backup_root" <<'REMOTE'
+          set -euo pipefail
+          backup_root="$1"
+          test -d "$backup_root/files"
+          while IFS= read -r -d '' saved; do
+            target="${saved#${backup_root}/files}"
+            mkdir -p "$(dirname "$target")"
+            tmp="${target}.rollback.$$"
+            cp -p "$saved" "$tmp"
+            mv -f "$tmp" "$target"
+          done < <(find "$backup_root/files" -type f -print0)
+          while IFS= read -r target; do
+            [ -n "$target" ] && rm -f -- "$target"
+          done < "$backup_root/missing"
+          REMOTE
+          echo "Restored stable and public pointers; immutable failed-build payload retained for audit."
+
+  github-release:
+    needs: [release-preflight, windows, macos, cross-platform-parity, verify-download, verify-public-windows-signature, verify-download-center]
+    runs-on: ubuntu-latest
+    if: >-
+      always() &&
+      inputs.verify_only != true &&
+      inputs.windows_installer_only != true &&
+      inputs.candidate_only != true &&
+      needs.release-preflight.result == 'success' &&
+      needs.windows.result == 'success' &&
+      needs.macos.result == 'success' &&
+      needs.cross-platform-parity.result == 'success' &&
+      needs.verify-download.result == 'success' &&
+      needs.verify-public-windows-signature.result == 'success' &&
+      needs.verify-download-center.result == 'success'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha }}
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+      - name: Render GitHub release notes from the exact published pointer
+        working-directory: .
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          PRODUCT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          python FHD/scripts/release/render_github_release_notes.py \
+            --pointer artifacts/xcagi-download-manifest/download-release.json \
+            --version "$PRODUCT_VERSION" --sha "$RELEASE_SHA" \
+            --output artifacts/github-release-notes.md
+      - name: Guard against overwriting an unrelated tag or already-published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          PRODUCT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          tag="FHD/v${PRODUCT_VERSION}"
+          existing="$(gh api "repos/${GH_REPO}/releases/tags/${tag}" 2>/dev/null || true)"
+          if [ -n "$existing" ]; then
+            jq -e --arg sha "$RELEASE_SHA" '.draft == true and .target_commitish == $sha' <<<"$existing" >/dev/null
+          fi
+          ref_sha="$(gh api "repos/${GH_REPO}/git/ref/tags/${tag}" --jq '.object.sha' 2>/dev/null || true)"
+          if [ -n "$ref_sha" ] && [ "$ref_sha" != "$RELEASE_SHA" ]; then
+            echo "::error::Git tag already points to a different commit"
+            exit 1
+          fi
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: FHD/v${{ inputs.version }}
+          target_commitish: ${{ inputs.release_sha }}
+          name: XCAGI ${{ inputs.version }}
+          body_path: artifacts/github-release-notes.md
+          draft: true
+          files: |
+            artifacts/**/*.exe
+            artifacts/**/*.exe.blockmap
+            artifacts/**/*.dmg
+            artifacts/**/*.dmg.blockmap
+            artifacts/**/*.zip
+            artifacts/**/*.zip.blockmap
+            artifacts/**/latest*.yml
+            artifacts/**/manifest.json
+            artifacts/**/download-release.json

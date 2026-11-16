@@ -1,0 +1,615 @@
+import { ref, computed, watch, getCurrentScope, onScopeDispose, type Ref } from 'vue'
+import { storeToRefs } from 'pinia'
+import chatApi from '../api/chat'
+import { localMessagePersistence, samePersistedMessage, useChatMessagePersistence } from './useChatMessagePersistence'
+import { speakText, stopSpeaking, cleanTextForSpeech } from '../utils/tts'
+import { useModsStore } from '@/stores/mods'
+import { productReadAccountEpoch } from '@/utils/productReadAccountScope'
+import { useIndustryStore } from '@/stores/industry'
+import { getIndustryWelcomeMarkdown, isIndustryWelcomePlainText } from '@/constants/industryPresets'
+import { buildChatMessagesKey, buildChatSessionMetaKey, resolveChatIdentity, resolveChatStorageScope } from '@/utils/chatStorageKeys'
+import { readChatModelRoute, recordChatModelRoute } from '@/utils/chatModelRoute'
+import { asRecord, asArray, asString, asBoolean } from '@/utils/typeGuards'
+import { formatChatMessageTime } from '@/utils/chatTaskLabels'
+import { stripModelToolProtocol } from '@/utils/chatModelProtocol'
+import { restoreApprovalCard } from '@/utils/chatApprovalCard'
+import { captureAuthSession } from '@/utils/authSessionCache'
+
+const WELCOME_MESSAGE_PREFIX = '您好！我是您的'
+
+// TTS 语音队列：按顺序播放，避免多条并发抢扬声器
+const voiceQueue: string[] = []
+let isPlayingVoice = false
+let voiceGeneration = 0
+let voiceTimer: ReturnType<typeof setTimeout> | undefined
+
+async function playNextVoice(generation = voiceGeneration) {
+  if (generation !== voiceGeneration) return
+  const text = voiceQueue.shift()
+  if (!text) { isPlayingVoice = false; return }
+  isPlayingVoice = true
+  try { await speakText(text) } catch { if (generation !== voiceGeneration) return }
+  if (generation !== voiceGeneration) return
+  voiceTimer = setTimeout(() => { void playNextVoice(generation) }, 350)
+}
+
+export function queueVoice(text: string) {
+  // 去除 HTML 标签和标点符号，只保留纯文本用于语音
+  const plainText = cleanTextForSpeech(
+    String(text || '')
+      .replace(/<br\s*\/?>/gi, ' ')
+      .replace(/<[^>]*>/g, ' ')
+      .replace(/&nbsp;/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim(),
+  )
+
+  if (!plainText) return
+
+  voiceQueue.push(plainText)
+  if (!isPlayingVoice) {
+    void playNextVoice()
+  }
+}
+
+export function clearVoiceQueue() {
+  voiceGeneration++
+  clearTimeout(voiceTimer)
+  voiceTimer = undefined
+  voiceQueue.length = 0
+  isPlayingVoice = false
+  stopSpeaking()
+}
+
+import type { UiChatMessage, UiChatMessageExtras } from '@/types/chat-ui'
+
+/** UI 聊天消息（与 ApiChatMessage 不同：role 用 ai、时间字段为 time） */
+export type ChatMessage = UiChatMessage
+export type ChatMessageExtras = UiChatMessageExtras
+
+function metadataRecord(raw: unknown): Record<string, unknown> {
+  if (raw && typeof raw === 'object') return asRecord(raw)
+  if (typeof raw !== 'string' || !raw.trim()) return {}
+  try {
+    return asRecord(JSON.parse(raw))
+  } catch {
+    return {}
+  }
+}
+
+/** Restore only the structured UI fields that the chat renderer understands. */
+export function chatMessageExtrasFromServerRow(raw: unknown): ChatMessageExtras {
+  const row = asRecord(raw)
+  const metadata = metadataRecord(row.metadata)
+  const ui = asRecord(row.ui_payload || metadata.ui)
+  const stringArray = (value: unknown) =>
+    asArray(value)
+      .map((item) => asString(item).trim())
+      .filter(Boolean)
+  const objectArray = (value: unknown) =>
+    asArray(value)
+      .map((item) => asRecord(item))
+      .filter((item) => Object.keys(item).length > 0)
+  const extras: ChatMessageExtras = {}
+  const route = readChatModelRoute(metadata.route_metadata || ui.routeMetadata)
+  if (route && row.role !== 'user' && ui.role !== 'user') extras.routeMetadata = route
+  const turnId = asString(ui.turnId || asRecord(metadata.business_harness).turn_id || asRecord(metadata.summary).turn_id).trim()
+  if (turnId) extras.turnId = turnId
+  if (row.role !== 'user' && asRecord(metadata.summary).success === false) extras.workflowAction = 'failed'
+  const savedId = asString(metadata.client_message_id || row.client_message_id).trim()
+  const persisted = asRecord(ui.persistence)
+  const localId = asString(persisted.id).trim()
+  if (row.id != null || savedId) {
+    extras.persistence = { id: savedId || `server:${row.id}`, status: row.id != null ? 'saved' : 'local' }
+  } else if (localId && ['local', 'saving', 'saved', 'failed'].includes(asString(persisted.status))) {
+    const request = asRecord(persisted.request)
+    extras.persistence = {
+      id: localId,
+      status: persisted.status as NonNullable<ChatMessage['persistence']>['status'],
+      ...(typeof persisted.localSaved === 'boolean' ? { localSaved: persisted.localSaved } : {}),
+      ...(persisted.error ? { error: asString(persisted.error) } : {}),
+      ...(['user', 'ai', 'task'].includes(asString(request.role)) && typeof request.content === 'string' ? {
+        request: { role: request.role as ChatMessage['role'], content: request.content, ...(typeof request.metadata === 'string' ? { metadata: request.metadata } : {}) },
+      } : {}),
+    }
+  }
+  const thinkingSteps = asString(ui.thinkingSteps).trim()
+  const workflowAction = asString(ui.workflowAction).trim()
+  const contextSummary = asString(ui.contextSummary).trim()
+  const downloadUrl = asString(ui.downloadUrl).trim()
+  const shipmentDownloadUrl = asString(ui.shipmentDownloadUrl).trim()
+  if (thinkingSteps) extras.thinkingSteps = thinkingSteps
+  if (workflowAction) extras.workflowAction = workflowAction
+  if (contextSummary) extras.contextSummary = contextSummary
+  if (downloadUrl) extras.downloadUrl = downloadUrl
+  if (shipmentDownloadUrl) extras.shipmentDownloadUrl = shipmentDownloadUrl
+  const todoSteps = stringArray(ui.todoSteps)
+  if (todoSteps.length) extras.todoSteps = todoSteps
+  const nodeResults = objectArray(ui.nodeResults)
+  if (nodeResults.length) extras.nodeResults = nodeResults as NonNullable<ChatMessageExtras['nodeResults']>
+  const executionProgress = objectArray(ui.executionProgress)
+  if (executionProgress.length)
+    extras.executionProgress = executionProgress as unknown as NonNullable<ChatMessageExtras['executionProgress']>
+  const attachments = objectArray(ui.attachments)
+  if (attachments.length) extras.attachments = attachments
+  const approvalCard = asRecord(ui.approvalCard)
+  if (Object.keys(approvalCard).length) extras.approvalCard = restoreApprovalCard(approvalCard)
+  const agentRunTrace = asRecord(ui.agentRunTrace)
+  if (Object.keys(agentRunTrace).length) extras.agentRunTrace = agentRunTrace as unknown as NonNullable<ChatMessageExtras['agentRunTrace']>
+  const businessResult = asRecord(ui.businessResult)
+  if (Object.keys(businessResult).length) extras.businessResult = businessResult
+  const responseData = asRecord(row.data)
+  if (asBoolean(ui.sameAsPrevious ?? row.sameAsPrevious ?? row.cached ?? responseData.cached)) {
+    extras.sameAsPrevious = true
+  }
+  return extras
+}
+
+export function useChatMessages(sessionId: Ref<string>) {
+  const modsStore = useModsStore()
+  const industryStore = useIndustryStore()
+  const { activeModId } = storeToRefs(modsStore)
+  const storageKey = computed(() => buildChatMessagesKey(String(sessionId.value || 'default'), String(activeModId.value || '')))
+  const sessionMetaKey = computed(() => buildChatSessionMetaKey(String(sessionId.value || 'default'), String(activeModId.value || '')))
+
+  function getDefaultWelcome(): ChatMessage[] {
+    const industryId = String(industryStore.currentIndustryId || '').trim() || '通用'
+    return [
+      {
+        role: 'ai',
+        content: getIndustryWelcomeMarkdown(industryId),
+        time: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }),
+      },
+    ]
+  }
+
+  const cacheError = ref('')
+
+  function readCachedMessages(): ChatMessage[] {
+    try {
+      const raw = localStorage.getItem(storageKey.value)
+      if (!raw) return getDefaultWelcome()
+      const parsed = JSON.parse(raw)
+      if (!Array.isArray(parsed) || !parsed.length) return getDefaultWelcome()
+      const sanitized = sanitizeMessagesList(parsed)
+      for (const message of sanitized) {
+        if (message.streamingShell) {
+          delete message.streamingShell
+          message.content = `${message.content}${hasMeaningfulContent(message.content) ? '<br>' : ''}上次回复未收到完成回执。请核对任务状态，勿重复提交。`
+        }
+        if (message.persistence?.status === 'saving') {
+          message.persistence.status = 'failed'
+          message.persistence.error = '上次保存未确认，请仅重试保存。'
+        }
+      }
+      if (!sanitized.length) return getDefaultWelcome()
+      if (isWelcomeMessage(sanitized[0]) && /<[a-z]+[\s>]/i.test(sanitized[0].content)) {
+        sanitized[0] = getDefaultWelcome()[0]
+      }
+      const collapsed = withoutRepeatedWelcomes(sanitized)
+      return collapsed.length ? collapsed : getDefaultWelcome()
+    } catch (_e) {
+      return getDefaultWelcome()
+    }
+  }
+
+  let cacheTimer: ReturnType<typeof setTimeout> | undefined
+  let pendingCacheWrite: (() => void) | undefined
+  function flushMessagesCache() {
+    clearTimeout(cacheTimer)
+    cacheTimer = undefined
+    const write = pendingCacheWrite
+    pendingCacheWrite = undefined
+    write?.()
+  }
+  function scheduleMessagesCache() {
+    if (cacheTimer !== undefined) return
+    const list = messages.value, key = storageKey.value, metaKey = sessionMetaKey.value, sid = sessionId.value
+    pendingCacheWrite = () => persistMessagesCache(list, key, metaKey, sid)
+    cacheTimer = setTimeout(flushMessagesCache, 250)
+  }
+  if (getCurrentScope()) onScopeDispose(flushMessagesCache)
+
+  function persistMessagesCache(list = messages.value, key = storageKey.value, metaKey = sessionMetaKey.value, sid = sessionId.value): void {
+    clearTimeout(cacheTimer)
+    cacheTimer = undefined
+    pendingCacheWrite = undefined
+    try {
+      for (const message of list) if (message.persistence) message.persistence.localSaved = true
+      const sanitized = sanitizeMessagesList(list)
+      if (list === messages.value && sanitized.length !== messages.value.length) {
+        messages.value = sanitized
+      }
+      localStorage.setItem(key, JSON.stringify(sanitized))
+      persistSessionMeta(sanitized, metaKey, sid)
+      if (key === storageKey.value) cacheError.value = ''
+    } catch (_e) {
+      for (const message of list) if (message.persistence) message.persistence.localSaved = false
+      if (key === storageKey.value) cacheError.value = '本机保存失败。服务端未确认的消息请勿关闭页面，可重试本机保存或复制消息。'
+    }
+  }
+
+  const messages = ref<ChatMessage[]>(readCachedMessages())
+  function restoreModelRoute() {
+    const latest = [...messages.value].reverse().find(message => message.role === 'ai' && message.routeMetadata)
+    recordChatModelRoute(sessionId.value, latest?.routeMetadata || null, resolveChatIdentity(String(activeModId.value || '')))
+  }
+  restoreModelRoute()
+  const bootSanitized = sanitizeMessagesList(messages.value)
+  if (bootSanitized.length !== messages.value.length) {
+    messages.value = bootSanitized.length ? bootSanitized : getDefaultWelcome()
+    try {
+      localStorage.setItem(storageKey.value, JSON.stringify(messages.value))
+      persistSessionMeta(messages.value)
+    } catch {
+      // ignore storage errors
+    }
+  }
+
+  const lastMessage = computed(() => messages.value[messages.value.length - 1])
+
+  function escapeHtml(text: string): string {
+    const div = document.createElement('div')
+    div.textContent = text
+    return div.innerHTML
+  }
+
+  function extractPlainText(raw: unknown): string {
+    const source = String(raw || '')
+    const entities: Record<string, string> = {
+      amp: '&',
+      apos: "'",
+      gt: '>',
+      lt: '<',
+      nbsp: ' ',
+      quot: '"',
+    }
+    let plain = ''
+    let index = 0
+
+    while (index < source.length) {
+      if (source[index] === '<') {
+        const tagEnd = source.indexOf('>', index + 1)
+        if (tagEnd < 0) {
+          plain += source.slice(index)
+          break
+        }
+        const tagName = source
+          .slice(index + 1, tagEnd)
+          .trim()
+          .toLowerCase()
+        if (tagName === 'br' || tagName === 'br/' || tagName.startsWith('br ')) {
+          plain += '\n'
+        }
+        index = tagEnd + 1
+        continue
+      }
+
+      if (source[index] === '&') {
+        const entityEnd = source.indexOf(';', index + 1)
+        if (entityEnd > index && entityEnd - index <= 10) {
+          const entityName = source.slice(index + 1, entityEnd).toLowerCase()
+          const decoded = entities[entityName]
+          if (decoded !== undefined) {
+            plain += decoded
+            index = entityEnd + 1
+            continue
+          }
+        }
+      }
+
+      plain += source[index]
+      index += 1
+    }
+
+    return plain.replace(/\u00a0/g, ' ').trim()
+  }
+
+  function hasMeaningfulContent(raw: unknown): boolean {
+    return extractPlainText(raw).length > 0
+  }
+
+  function toPlainText(raw: unknown): string {
+    return extractPlainText(raw)
+  }
+
+  function isIndustryGreeting(plain: string): boolean {
+    const first = plain.trim().split('\n')[0]?.trim() || ''
+    if (first.startsWith('您好！我是您的智能考勤助手')) return true
+    return /^你好，(?:我是)?[^。\n]{0,24}助手。$/.test(first)
+  }
+
+  function isWelcomeMessage(msg: Pick<ChatMessage, 'role' | 'content'>): boolean {
+    if (msg.role !== 'ai') return false
+    const plain = toPlainText(msg.content)
+    if (plain.includes('未收到完成回执') || plain.includes('上次保存未确认')) return false
+    if (plain.startsWith(WELCOME_MESSAGE_PREFIX)) return true
+    return isIndustryGreeting(plain)
+  }
+
+  function withoutRepeatedWelcomes(list: ChatMessage[]): ChatMessage[] {
+    let keptWelcome = false
+    const kept: ChatMessage[] = []
+    for (const message of list) {
+      if (!isWelcomeMessage(message)) {
+        kept.push(message)
+        continue
+      }
+      if (keptWelcome || kept.length) continue
+      keptWelcome = true
+      kept.push(message)
+    }
+    return kept
+  }
+
+  function deriveSessionTitle(list: ChatMessage[]): string {
+    const meaningful = list.filter((msg) => hasMeaningfulContent(msg.content) && !isWelcomeMessage(msg))
+    const preferred = meaningful.find((msg) => msg.role === 'user') || meaningful[0]
+    const plain = toPlainText(preferred?.content || '')
+      .replace(/\s+/g, ' ')
+      .trim()
+    if (!plain) return '新会话'
+    return plain.length > 32 ? `${plain.slice(0, 32)}...` : plain
+  }
+
+  function persistSessionMeta(list: ChatMessage[], metaKey = sessionMetaKey.value, sid = sessionId.value): void {
+    try {
+      const meaningful = list.filter((msg) => hasMeaningfulContent(msg.content) && !isWelcomeMessage(msg))
+      if (!meaningful.length) {
+        localStorage.removeItem(metaKey)
+        return
+      }
+      localStorage.setItem(
+        metaKey,
+        JSON.stringify({
+          session_id: String(sid || 'default'),
+          title: deriveSessionTitle(list),
+          message_count: meaningful.length,
+          updated_at: new Date().toISOString(),
+        }),
+      )
+    } catch {
+      // ignore storage errors
+    }
+  }
+
+  function sanitizeMessagesList(rawList: unknown[]): ChatMessage[] {
+    return (Array.isArray(rawList) ? rawList : [])
+      .map((msg: unknown) => {
+        const row = asRecord(msg)
+        const roleRaw = asString(row.role)
+        const role = roleRaw === 'user' || roleRaw === 'task' ? roleRaw : 'ai'
+        const content = role === 'ai' ? stripModelToolProtocol(row.content) : asString(row.content)
+        const streamingShell = asBoolean(row.streamingShell)
+        const toolProgressLabel = asString(row.toolProgressLabel).trim()
+        if (!hasMeaningfulContent(content) && !streamingShell && !toolProgressLabel) return null
+        return {
+          role,
+          content,
+          time: asString(row.time).trim() || new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }),
+          ...(streamingShell ? { streamingShell: true } : {}),
+          ...(toolProgressLabel ? { toolProgressLabel } : {}),
+          ...chatMessageExtrasFromServerRow({ ui_payload: row }),
+        } as ChatMessage
+      })
+      .filter((m): m is ChatMessage => !!m)
+  }
+
+  function normalizeServerContentToHtml(raw: unknown): string {
+    const text = String(raw || '')
+    // 如果已经是 HTML（常见：<br>/<div>/<ul>），按原样展示，避免二次转义
+    if (/<[a-z][\s\S]*>/i.test(text)) return text
+    return escapeHtml(text).replace(/\n/g, '<br>')
+  }
+
+  function addMessage(content: string, role: 'user' | 'ai' | 'task' = 'ai', extras?: ChatMessageExtras, options?: { speak?: boolean }) {
+    const visibleContent = role === 'ai' ? stripModelToolProtocol(content) : content
+    if (!hasMeaningfulContent(visibleContent)) return
+    const time = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+    const safeContent = escapeHtml(visibleContent).replace(/\n/g, '<br>')
+    messages.value.push({
+      role,
+      content: safeContent,
+      time,
+      persistence: localMessagePersistence(),
+      ...(extras || {}),
+    })
+    persistMessagesCache()
+
+    // TTS 语音播报（仅 AI 消息且非欢迎消息）
+    if (options?.speak && role === 'ai' && !isWelcomeMessage({ role, content: safeContent })) {
+      queueVoice(safeContent)
+    }
+  }
+
+  const { saveMessage, retryMessageSave } = useChatMessagePersistence({
+    messages, sessionId,
+    scope: () => `${buildChatMessagesKey('scope', String(activeModId.value || ''))}:${productReadAccountEpoch.value}`,
+    read: (sid) => {
+      if (sid === sessionId.value) return messages.value
+      try { return sanitizeMessagesList(JSON.parse(localStorage.getItem(buildChatMessagesKey(sid, String(activeModId.value || ''))) || '[]')) }
+      catch { return [] }
+    },
+    persist: (list, sid) => persistMessagesCache(list, buildChatMessagesKey(sid, String(activeModId.value || '')), buildChatSessionMetaKey(sid, String(activeModId.value || '')), sid),
+    plainText: toPlainText,
+    html: (text) => escapeHtml(text).replace(/\n/g, '<br>'),
+  })
+
+  async function addAndSaveMessage(
+    content: string,
+    role: 'user' | 'ai' | 'task' = 'ai',
+    extras?: ChatMessageExtras,
+    options?: { speak?: boolean; sessionId?: string },
+  ): Promise<void> {
+    if (!hasMeaningfulContent(content)) return
+    if (!options?.sessionId || options.sessionId === sessionId.value) addMessage(content, role, extras, options)
+    await saveMessage(role, content, options?.sessionId, extras)
+  }
+
+  /** 流式回复：先占位一条 AI 消息，返回其在 messages 中的下标 */
+  function pushStreamingAiShell(): number {
+    const time = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+    messages.value.push({
+      role: 'ai',
+      content: '',
+      time,
+      streamingShell: true,
+      persistence: localMessagePersistence(),
+    })
+    persistMessagesCache()
+    return messages.value.length - 1
+  }
+
+  /** 将纯文本安全转为气泡 HTML 并写入指定下标（用于 SSE token 追加） */
+  function applyPlainTextToMessageIndex(index: number, plain: string, extras?: ChatMessageExtras) {
+    const safe = escapeHtml(stripModelToolProtocol(plain)).replace(/\n/g, '<br>')
+    const row = messages.value[index]
+    if (!row) return
+    row.content = safe
+    if (extras) Object.assign(row, extras)
+    if (safe) {
+      delete row.streamingShell
+    } else {
+      row.streamingShell = true
+    }
+    scheduleMessagesCache()
+  }
+
+  function clearMessages() {
+    messages.value = []
+    persistMessagesCache()
+  }
+
+  function loadMessages(newMessages: ChatMessage[]) {
+    messages.value = sanitizeMessagesList(newMessages)
+    restoreModelRoute()
+    persistMessagesCache()
+  }
+
+  async function syncFromServer(options: { required?: boolean; isCurrent?: () => boolean } = {}): Promise<boolean> {
+    try {
+      const sid = String(sessionId.value || '').trim()
+      if (!sid) { if (options.required) throw new Error('当前会话未就绪'); return false }
+      const sessionCurrent = captureAuthSession()
+      const scope = [sid, activeModId.value, productReadAccountEpoch.value]
+      const revision = JSON.stringify(messages.value)
+      const data = await chatApi.getConversation(sid)
+      if (!sessionCurrent() || options.isCurrent?.() === false ||
+        scope.some((value, i) => value !== [sessionId.value, activeModId.value, productReadAccountEpoch.value][i])
+        || revision !== JSON.stringify(messages.value)) {
+        if (options.required) throw new Error('当前会话已改变，请重试')
+        return false
+      }
+      const dataRow = asRecord(data)
+      if (options.required && (dataRow.success !== true || !Array.isArray(dataRow.messages)
+        || dataRow.id !== sid)) {
+        throw new Error('当前会话内容未确认，请重试')
+      }
+      const serverMessages = asArray(dataRow.messages)
+      if (!serverMessages.length) return options.required === true
+
+      const mapped: ChatMessage[] = serverMessages.map((msg: unknown) => {
+        const row = asRecord(msg)
+        const roleRaw = asString(row.role)
+        const role = roleRaw === 'user' || roleRaw === 'task' ? roleRaw : 'ai'
+        return {
+          role,
+          content: normalizeServerContentToHtml(role === 'ai' ? stripModelToolProtocol(row.content) : row.content),
+          time: formatChatMessageTime(row.time ?? row.timestamp ?? row.created_at ?? row.createdAt ?? row.updated_at),
+          ...chatMessageExtrasFromServerRow(row),
+        }
+      })
+      const sanitized = sanitizeMessagesList(mapped)
+      if (!sanitized.length) { if (options.required) throw new Error('当前会话内容无法读取，请重试'); return false }
+      const matched = new Set<number>()
+      const unsaved = messages.value.filter(local => {
+        const index = sanitized.findIndex((server, i) => !matched.has(i) && samePersistedMessage(local, server, toPlainText))
+        if (index >= 0) { matched.add(index); sanitized[index] = { ...local, ...sanitized[index] }; return false }
+        return local.persistence?.status !== 'saved'
+      })
+      loadMessages(withoutRepeatedWelcomes([...sanitized, ...unsaved.filter(message => !isWelcomeMessage(message))]))
+      return true
+    } catch (_e) {
+      if (options.required) throw _e
+      return false
+    }
+  }
+
+  watch(
+    () => sessionId.value,
+    () => {
+      flushMessagesCache()
+      cacheError.value = ''
+      messages.value = readCachedMessages()
+      restoreModelRoute()
+    },
+    { flush: 'sync' },
+  )
+
+  // 切换当前扩展（Mod）时：同一会话 ID 下不同 Mod 的消息缓存相互隔离，
+  // 切换后应重新读取当前 Mod 对应的本地消息（若无缓存则展示欢迎语）。
+  watch(
+    () => [String(activeModId.value || ''), productReadAccountEpoch.value, resolveChatStorageScope()] as const,
+    (next, prev) => {
+      // Identity can arrive after the first paint. Do not copy the provisional
+      // welcome buffer onto the authenticated conversation key.
+      if (prev && next[2] !== prev[2]) {
+        clearTimeout(cacheTimer)
+        cacheTimer = undefined
+        pendingCacheWrite = undefined
+        messages.value = readCachedMessages()
+        restoreModelRoute()
+        return
+      }
+      flushMessagesCache()
+      cacheError.value = ''
+      messages.value = readCachedMessages()
+      restoreModelRoute()
+    },
+    { flush: 'sync' },
+  )
+
+  // Cards and traces are mutated after a reply is inserted. Observe only these
+  // structured fields so SSE token updates do not cause a localStorage write
+  // for every token.
+  watch(
+    () =>
+      messages.value.map((message) => ({
+        thinkingSteps: message.thinkingSteps,
+        todoSteps: message.todoSteps,
+        workflowAction: message.workflowAction,
+        nodeResults: message.nodeResults,
+        contextSummary: message.contextSummary,
+        executionProgress: message.executionProgress,
+        downloadUrl: message.downloadUrl,
+        shipmentDownloadUrl: message.shipmentDownloadUrl,
+        approvalCard: message.approvalCard,
+        agentRunTrace: message.agentRunTrace,
+        attachments: message.attachments,
+        businessResult: message.businessResult,
+        sameAsPrevious: message.sameAsPrevious,
+        routeMetadata: message.routeMetadata,
+      })),
+    () => persistMessagesCache(),
+    { deep: true, flush: 'post' },
+  )
+
+  return {
+    messages,
+    cacheError,
+    retryMessagesCache: () => persistMessagesCache(),
+    retryMessageSave,
+    lastMessage,
+    addMessage,
+    saveMessage,
+    addAndSaveMessage,
+    pushStreamingAiShell,
+    applyPlainTextToMessageIndex,
+    flushMessagesCache,
+    clearMessages,
+    loadMessages,
+    syncFromServer,
+    queueVoice,
+    clearVoiceQueue,
+  }
+}

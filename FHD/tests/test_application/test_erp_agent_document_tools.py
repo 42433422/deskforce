@@ -1,0 +1,125 @@
+"""ERP Agent document-worker integration: real function calls, never text protocol."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from app.application.tools.workflow import (
+    get_workflow_tool_registry,
+    invalidate_workflow_tool_registry,
+)
+from app.mod_sdk.employee_pack_compat import list_office_pack_catalog
+from app.mod_sdk.employee_tool_registry import (
+    build_employee_tools_status,
+    invalidate_employee_tool_cache,
+)
+
+
+def test_all_ten_built_in_document_workers_are_registered_and_runnable() -> None:
+    expected = set(list_office_pack_catalog()["pack_ids"])
+    assert len(expected) == 10
+    invalidate_employee_tool_cache()
+    invalidate_workflow_tool_registry()
+    status = build_employee_tools_status()
+    names = {row["function"]["name"] for row in get_workflow_tool_registry() if row.get("function")}
+
+    assert status["office_ready"] is True
+    assert status["missing_office_pack_ids"] == []
+    # Some non-document host packs may intentionally be unavailable in a
+    # lightweight test environment.  The release contract here is that each
+    # bundled office employee is executable, not that every optional pack is.
+    assert not (expected & set(status["runtime_missing_pack_ids"]))
+    assert expected <= set(status["registered_tool_names"])
+    assert expected <= names
+
+
+def test_employee_tool_lookup_self_heals_after_scoped_discovery_cache(monkeypatch) -> None:
+    """A temporary one-pack discovery must not poison later desktop lookups."""
+    from app.mod_sdk import employee_tool_registry as registry
+
+    installed = registry.list_installed_pack_records()
+    narrow = [row for row in installed if row.get("pack_id") == "csv-full-read-employee"]
+    assert len(narrow) == 1
+
+    registry.invalidate_employee_tool_cache()
+    with monkeypatch.context() as scoped:
+        scoped.setattr(registry, "list_installed_pack_records", lambda: narrow)
+        assert (
+            registry.resolve_tool_to_pack_id("csv-full-read-employee") == "csv-full-read-employee"
+        )
+
+    assert registry.resolve_tool_to_pack_id("excel-generate-employee") == "excel-generate-employee"
+
+
+def test_word_generator_writes_an_actual_document_from_a_chat_request(
+    tmp_path, monkeypatch
+) -> None:
+    """A forced chat call must yield a file, even when no JSON was uploaded."""
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    from app.mod_sdk.employee_tool_registry import execute_employee_tool
+
+    def unexpected_cognition(*_args, **_kwargs):
+        raise AssertionError("bundled Office conversion must not need an LLM")
+
+    monkeypatch.setattr(
+        "app.application.employee_runtime.agent._ex._cognition_fhd",
+        unexpected_cognition,
+    )
+
+    result = json.loads(
+        execute_employee_tool(
+            "word-generate-employee",
+            {"user_request": "起草一份验收用销售合同，包含交付与付款条款。"},
+            str(tmp_path),
+        )
+    )
+
+    assert result["success"] is True
+    assert result["artifact_postcondition"]["verified"] is True
+    assert Path(result["artifact_postcondition"]["paths"][0]).suffix == ".docx"
+    generated = list((tmp_path / "outputs").glob("*.docx"))
+    assert generated and generated[0].stat().st_size > 0
+    read_result = json.loads(
+        execute_employee_tool(
+            "word-full-read-employee", {"file_path": str(generated[0])}, str(tmp_path)
+        )
+    )
+    assert read_result["success"] is True, read_result
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "reader_name", "suffix"),
+    [
+        ("excel-generate-employee", "excel-full-read-employee", ".xlsx"),
+        ("csv-generate-employee", "csv-full-read-employee", ".csv"),
+        ("pdf-generate-employee", "pdf-full-read-employee", ".pdf"),
+        ("ppt-generate-employee", "ppt-full-read-employee", ".pptx"),
+    ],
+)
+def test_other_document_generators_write_files_without_modstore_source(
+    tmp_path, monkeypatch, tool_name: str, reader_name: str, suffix: str
+) -> None:
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    from app.mod_sdk.employee_tool_registry import execute_employee_tool
+
+    result = json.loads(
+        execute_employee_tool(
+            tool_name,
+            {"user_request": "生成一份验收用业务摘要，包含客户、金额和交付状态。"},
+            str(tmp_path),
+        )
+    )
+
+    assert result["success"] is True
+    assert result["artifact_postcondition"]["verified"] is True
+    assert Path(result["artifact_postcondition"]["paths"][0]).suffix == suffix
+    generated = list((tmp_path / "outputs").glob(f"*{suffix}"))
+    assert generated and generated[0].stat().st_size > 0
+    read_result = json.loads(
+        execute_employee_tool(reader_name, {"file_path": str(generated[0])}, str(tmp_path))
+    )
+    assert read_result["success"] is True, read_result

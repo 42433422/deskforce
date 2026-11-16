@@ -1,0 +1,165 @@
+name: Performance Smoke Test
+
+on:
+  schedule:
+    - cron: "0 17 * * *"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "FHD/scripts/loadtest/**"
+      - "FHD/frontend/e2e/sla-perf.spec.ts"
+      - "FHD/frontend/e2e/performance-budget.ts"
+      - "FHD/frontend/playwright.config.ts"
+      - "FHD/frontend/tests/performance-budget.test.ts"
+      - "FHD/tests/test_ci/test_performance_evidence.py"
+      - "FHD/tests/test_sla_health_probe.py"
+      - "FHD/.github/workflows/performance-*.yml"
+      - ".github/workflows/fhd-performance-smoke.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: perf-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up k6
+        run: |
+          curl -fsSL https://github.com/grafana/k6/releases/download/v0.54.0/k6-v0.54.0-linux-amd64.tar.gz | tar xz
+          sudo mv k6-*/k6 /usr/local/bin/
+          mkdir -p performance-results
+          k6 version > performance-results/k6-version.txt
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies and start API
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-server-api.txt
+          export XCAGI_DEBUG=1
+          export XCAGI_UVICORN_RELOAD=0
+          export XCAGI_SKIP_LEGACY_COMPAT_ROUTES=1
+          export SECRET_KEY=test-secret-key-for-perf-smoke-at-least-32-chars
+          export DATABASE_URL=sqlite:///./perf_smoke.db
+          export FASTAPI_PORT=5000
+          python run.py > performance-results/api.log 2>&1 &
+          echo $! > performance-results/api.pid
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:5000/api/health >/dev/null 2>&1; then
+              echo "API ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::API did not become ready on :5000"
+          exit 1
+
+      - name: Check synthetic business work and memory bounds
+        run: python scripts/loadtest/business_regression.py
+
+      - name: Measure real HTTP samples with strict budgets
+        env:
+          BASE_URL: http://127.0.0.1:5000
+        run: k6 run --out json=performance-results/k6-samples.jsonl scripts/loadtest/smoke.js
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build production UI and run budget negative controls
+        working-directory: frontend
+        env:
+          VITE_XCAGI_GIT_SHA: ${{ github.sha }}
+        run: |
+          npm ci
+          npm test -- tests/performance-budget.test.ts
+          npm run build
+          npx playwright install chromium
+
+      - name: Install Playwright system deps (bounded retry)
+        working-directory: frontend
+        run: |
+          set -uo pipefail
+          rc=1
+          for attempt in 1 2 3; do
+            echo "[deps] attempt ${attempt}/3"
+            if npx playwright install-deps chromium; then
+              rc=0
+              break
+            fi
+            echo "::warning::playwright install-deps attempt ${attempt} failed; refreshing apt lists"
+            sudo apt-get clean || true
+            sudo rm -rf /var/lib/apt/lists/*
+            # Limit mirror fallback to APT source files; preserve keys and trust settings.
+            for source in /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+              [ -e "$source" ] || continue
+              if [ ! -f "$source" ] || [ -L "$source" ]; then
+                echo "::error::Refusing non-regular APT source: $source"; exit 1
+              fi
+              if ! sudo sed -i -E 's@(^|[[:space:]])(https?://)azure\.archive\.ubuntu\.com(/|[[:space:]]|$)@\1\2archive.ubuntu.com\3@g' "$source"; then
+                echo "::error::APT mirror fallback failed: $source"; exit 1
+              fi
+            done
+            sudo apt-get update
+          done
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::playwright system deps failed after 3 attempts (环境阻断，需人工排查，不得跳过)"
+            exit 1
+          fi
+
+
+      - name: Start production UI preview
+        working-directory: frontend
+        run: |
+          node --version > ../performance-results/node-version.txt
+          npm run preview -- --host 127.0.0.1 --port 5001 > ../performance-results/preview.log 2>&1 &
+          echo $! > ../performance-results/preview.pid
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:5001/ >/dev/null 2>&1; then exit 0; fi
+            sleep 1
+          done
+          exit 1
+
+      - name: Measure UI readiness and real HTTP percentiles
+        working-directory: frontend
+        env:
+          PLAYWRIGHT_BASE_URL: http://127.0.0.1:5001
+          E2E_API_BASE_URL: http://127.0.0.1:5000
+          E2E_FULL_STACK: "0"
+          XCAGI_SLA_READY_MS: "3000"
+          XCAGI_SLA_HEALTH_MS: "500"
+        run: npx playwright test e2e/sla-perf.spec.ts --reporter=json > ../performance-results/frontend.json
+
+      - name: Reject missing or failed evidence
+        if: always()
+        run: python scripts/loadtest/validate_evidence.py performance-results --source-sha "$GITHUB_SHA"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-${{ github.sha }}
+          path: |
+            FHD/performance-results/
+            FHD/frontend/test-results/
+          if-no-files-found: error
+
+      - name: Teardown
+        if: always()
+        run: |
+          for pidfile in performance-results/api.pid performance-results/preview.pid; do
+            if [ -f "$pidfile" ]; then kill "$(cat "$pidfile")" 2>/dev/null || true; fi
+          done

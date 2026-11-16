@@ -1,0 +1,182 @@
+"""业务域 → 当前实现映射；运行时挂载由 mounts/* 与 legacy/routes 管理。"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+BUSINESS_DOMAINS: tuple[str, ...] = (
+    "agent",
+    "auth",
+    "conversation",
+    "customer",
+    "excel",
+    "inventory",
+    "misc",
+    "product",
+    "shipment",
+    "static",
+    "system",
+    "template",
+    "workflow",
+    "db",
+)
+
+DOMAIN_TO_DIR: dict[str, str] = {
+    "agent": "app/fastapi_routes/domains/agent/",
+    "auth": "app/fastapi_routes/domains/auth/",
+    "conversation": "app/fastapi_routes/domains/conversation/",
+    "customer": "app/fastapi_routes/domains/customer/",
+    "excel": "app/fastapi_routes/domains/excel/",
+    "inventory": "app/fastapi_routes/",
+    "misc": "app/fastapi_routes/domains/misc/",
+    "product": "app/fastapi_routes/domains/product/",
+    "shipment": "app/fastapi_routes/domains/shipment/",
+    "static": "app/fastapi_routes/domains/static/",
+    "system": "app/fastapi_routes/domains/system/",
+    "template": "app/fastapi_routes/domains/template/",
+    "workflow": "app/fastapi_routes/domains/workflow/",
+    "db": "app/fastapi_routes/domains/db/",
+}
+
+# 顶层允许保留的 legacy/compat 文件白名单。
+# - xcagi_compat.py：compat 聚合入口（misc 域文档指向它）。
+# - xcagi_compat_chat_helpers.py：仍被 mod_sdk / application /
+#   mods-admin-runtime 桥接实时引用的 compat 辅助模块，已在 arch_fitness/layer_ratchet
+#   baseline 中登记为已知债，待后续迁入 domains/conversation、domains/product 后移除。
+ALLOWED_LEGACY_FILES: frozenset[str] = frozenset(
+    {
+        "xcagi_compat.py",
+        "xcagi_compat_chat_helpers.py",
+    }
+)
+
+# Implementation companions extracted from the approved compatibility
+# facades above.  They are not independently supported route entrypoints and
+# therefore must not expand ALLOWED_LEGACY_FILES.
+COMPAT_IMPLEMENTATION_FILES: frozenset[str] = frozenset(
+    {
+        "xcagi_compat_chat_models.py",
+        "xcagi_compat_chat_stream.py",
+        "xcagi_compat_product_actions.py",
+    }
+)
+
+
+@dataclass(frozen=True)
+class LegacyRoute:
+    """业务域文档条目（每域一行；不再逐已删 shim filename 登记）"""
+
+    target_domain: str
+    target_module: str
+    note: str = ""
+    filename: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.filename:
+            object.__setattr__(self, "filename", f"domain:{self.target_domain}")
+
+
+def _doc(domain: str, module: str, note: str = "") -> LegacyRoute:
+    return LegacyRoute(
+        target_domain=domain,
+        target_module=module,
+        note=note,
+        filename=f"domain:{domain}",
+    )
+
+
+LEGACY_ROUTE_REGISTRY: tuple[LegacyRoute, ...] = (
+    _doc("agent", "app.fastapi_routes.domains.agent.agent_routes", "Agent 运行/计划/执行"),
+    _doc("auth", "app.fastapi_routes.domains.auth.auth_routes", "认证/授权"),
+    _doc(
+        "conversation",
+        "app.fastapi_routes.domains.conversation.conversation_routes",
+        "对话/聊天（含 AI chat）",
+    ),
+    _doc("customer", "app.fastapi_routes.domains.customer.customer_routes", "客户/CRM"),
+    _doc("excel", "app.fastapi_routes.domains.excel.excel_routes", "Excel 解析/导出"),
+    _doc("inventory", "app.fastapi_routes.inventory", "库存现行入口"),
+    _doc(
+        "misc",
+        "app.fastapi_routes.domains.misc.helpers",
+        "杂项 helpers；compat 聚合见 xcagi_compat.py",
+    ),
+    _doc("product", "app.fastapi_routes.domains.product.product_routes", "产品/商品"),
+    _doc("shipment", "app.fastapi_routes.domains.shipment.shipment_routes", "发货/物流"),
+    _doc("static", "app.fastapi_routes.domains.static.static_routes", "静态资源"),
+    _doc("system", "app.fastapi_routes.domains.system.system_routes", "系统/管理"),
+    _doc("template", "app.fastapi_routes.domains.template.template_routes", "模板"),
+    _doc("workflow", "app.fastapi_routes.domains.workflow.workflow_routes", "工作流/审批"),
+    _doc("db", "app.fastapi_routes.domains.db.db_base", "DB 查询/写入（base 入口）"),
+)
+
+
+def get_routes_by_domain(domain: str) -> list[LegacyRoute]:
+    return [r for r in LEGACY_ROUTE_REGISTRY if r.target_domain == domain]
+
+
+def get_pending_domains() -> list[str]:
+    project_root = Path(__file__).resolve().parent.parent.parent
+    pending = []
+    for domain in BUSINESS_DOMAINS:
+        target_dir = project_root / DOMAIN_TO_DIR[domain].replace("app/", "app/")
+        if not target_dir.exists():
+            pending.append(domain)
+    return pending
+
+
+def verify_registry_integrity() -> list[str]:
+    errors: list[str] = []
+
+    if not BUSINESS_DOMAINS:
+        errors.append("BUSINESS_DOMAINS 为空")
+
+    for d in BUSINESS_DOMAINS:
+        if d not in DOMAIN_TO_DIR:
+            errors.append(f"业务域 {d} 缺少 DOMAIN_TO_DIR 映射")
+
+    project_root = Path(__file__).resolve().parent.parent.parent
+    legacy_dir = project_root / "app" / "fastapi_routes"
+    on_disk_legacy: set[str] = set()
+    for p in legacy_dir.iterdir():
+        if p.name.startswith("__") or p.suffix != ".py":
+            continue
+        if p.name.startswith("legacy_") or p.name.startswith("xcagi_compat"):
+            on_disk_legacy.add(p.name)
+
+    unexpected = on_disk_legacy - ALLOWED_LEGACY_FILES - COMPAT_IMPLEMENTATION_FILES
+    if unexpected:
+        errors.append(f"未允许的 legacy_/compat_ 顶栏文件: {sorted(unexpected)}")
+
+    registered_domains = {r.target_domain for r in LEGACY_ROUTE_REGISTRY}
+    missing_domains = set(BUSINESS_DOMAINS) - registered_domains
+    if missing_domains:
+        errors.append(f"文档表缺少业务域: {sorted(missing_domains)}")
+
+    for r in LEGACY_ROUTE_REGISTRY:
+        if r.target_domain not in BUSINESS_DOMAINS:
+            errors.append(f"{r.filename} → 未知业务域: {r.target_domain}")
+        if not r.target_module.startswith("app.fastapi_routes."):
+            errors.append(f"{r.target_domain} target_module 格式错误: {r.target_module}")
+        elif not (project_root / (r.target_module.replace(".", "/") + ".py")).is_file():
+            errors.append(f"{r.target_domain} target_module 不存在: {r.target_module}")
+
+    return errors
+
+
+if __name__ == "__main__":  # pragma: no cover
+    errs = verify_registry_integrity()
+    if errs:
+        print("❌ 域注册表错误：")
+        for e in errs:
+            print(f"  - {e}")
+        raise SystemExit(1)
+
+    pending = get_pending_domains()
+    print(
+        f"✅ 域注册表完整 · {len(BUSINESS_DOMAINS)} 业务域 · 文档表 {len(LEGACY_ROUTE_REGISTRY)} 条"
+    )
+    print(f"📋 待迁移业务域（{len(pending)}/{len(BUSINESS_DOMAINS)}）:")
+    for d in pending:
+        print(f"  - {d:14}  ({len(get_routes_by_domain(d))} 条文档)")

@@ -1,0 +1,51 @@
+id: miniapp-builder
+name: 小程序员工
+version: 1.0.0
+domain: 为员工包生成配套脚本工作流（小程序），将自然语言需求转化为可执行的脚本逻辑
+owner: admin
+area: craft-workshop
+scope_globs:
+- workbench/sessions/*
+- workbench/scripts/*
+forbidden_globs:
+- '*.py'
+- '*.vue'
+- '*.ts'
+triggers:
+  on_error: true
+  on_quality_fail: true
+  on_coverage_miss: false
+  max_patch_budget_tokens: 3000
+  max_patch_steps: 4
+sla:
+  timeout_seconds: 120
+  retry_max: 2
+  escalate_to_human: true
+llm_default: auto
+llm_reasoning: auto
+actions:
+  handlers:
+  - llm_md
+  - echo
+capabilities:
+  - miniapp.build
+
+skills:
+- skills/skill-miniapp-build.md
+depends_on:
+- quality-validator
+examples:
+  - title: "小程序员工岗位验收"
+    description: "以最小、无副作用输入验证岗位输出包含真实证据、风险与下一步。"
+    input:
+      task: "执行一次小程序员工职责范围内的只读检查，并返回证据、风险和下一步。"
+      dry_run: true
+
+changelog:
+- version: 1.0.0
+  date: '2026-05-18'
+  note: 初始创建
+all_hands:
+  standby: true
+  runbook: 制作车间流水线岗位：无上游员工包/workflow/产物路径时仅汇报职责边界与待机条件；收到 intent-analyst 或 pack-registrar
+    输入后再描述可执行步骤。

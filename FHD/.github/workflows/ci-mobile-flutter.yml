@@ -1,0 +1,73 @@
+# CI SSOT: edit this file, then run: python scripts/dev/publish_ci_workflows_to_root.py
+name: ci-mobile-flutter
+
+on:
+  push:
+    paths:
+      - "mobile-flutter-poc/**"
+      - ".github/workflows/ci-mobile-flutter.yml"
+  pull_request:
+    paths:
+      - "mobile-flutter-poc/**"
+      - ".github/workflows/ci-mobile-flutter.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-mobile-flutter-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test-and-apk:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mobile-flutter-poc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version-file: mobile-flutter-poc/.flutter-version
+          cache: true
+      - name: Flutter version
+        run: flutter --version
+      - name: Flutter pub get
+        run: flutter pub get
+      - name: Flutter analyze
+        run: flutter analyze --no-fatal-warnings --no-fatal-infos
+      - name: Flutter test
+        run: flutter test
+      - name: Flutter build apk (release)
+        run: flutter build apk --release
+      - name: Upload release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcagi-flutter-release-apk
+          path: mobile-flutter-poc/build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error
+
+  test-and-ios:
+    runs-on: macos-26
+    defaults:
+      run:
+        working-directory: mobile-flutter-poc
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify Xcode SDK
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version-file: mobile-flutter-poc/.flutter-version
+          cache: true
+      - name: Flutter version
+        run: flutter --version
+      - name: Flutter pub get
+        run: flutter pub get
+      - name: Flutter test
+        run: flutter test
+      - name: Flutter build ios (release, no codesign)
+        run: flutter build ios --release --no-codesign

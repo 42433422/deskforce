@@ -1,0 +1,67 @@
+{
+  "_ssot": "FHD 覆盖率唯一对外口径。全量 source=[app] + branch，.venv = CI 等价依赖（不含 ml extra）。棘轮见 pyproject.toml fail_under + coverage_ratchet_baseline.json；趋势见 coverage-history.jsonl。红灯 WIP 不可对外宣称达标。2026-09-01（D2-5）起 coverage_ramp stub 清零，backend 口径 = 真实行为口径（floor 78 行 / 69 分支）。",
+  "_updated": "2026-09-01",
+  "committed_head": {
+    "captured_at": "2026-07-25T11:34:00Z",
+    "commit": "92505cab6",
+    "status": "green_above_floor",
+    "backend_line_pct": 88.19,
+    "backend_branch_pct": 81.5,
+    "backend_statements": 115046,
+    "frontend_line_pct": 93.21,
+    "frontend_branch_pct": 82.45,
+    "frontend_function_pct": 91.39,
+    "frontend_statements_pct": 93.21,
+    "note": "2026-07-25 PR#616 CI 实测；ETL/模板解析吸收后下调 floor 至 line 88 / branch 81。"
+  },
+  "wip_local": {
+    "captured_at": "2026-07-25T11:34:00Z",
+    "branch": "fix/auto-merge-conflict-spam-dedupe",
+    "status": "clean_working_tree",
+    "backend_line_pct": 88.19,
+    "backend_branch_pct": 81.5,
+    "pytest_passed": 0,
+    "pytest_failed": 0,
+    "pytest_errors": 0,
+    "pytest_skipped": 0,
+    "note": "与 CI backend-test coverage ratchet 实测对齐（88.19 / 81.5）。"
+  },
+  "quality_gate": {
+    "status": "passed",
+    "reason": "2026-09-01（D2-5）coverage_ramp stub 82 个清零迁出后，总口径与真实行为口径合一：floor 自行为口径 line 78 / branch 69 起步，只升不降（ADR-0005）",
+    "backend_line_floor": 78,
+    "backend_branch_floor": 69,
+    "head_backend_line_delta": 10.19,
+    "head_backend_branch_delta": 12.5,
+    "wip_backend_line_delta": 10.19,
+    "wip_backend_branch_delta": 12.5,
+    "frontend_lines_delta": 1.21,
+    "frontend_branches_delta": 1.45,
+    "frontend_functions_delta": 1.39,
+    "frontend_statements_delta": 1.21
+  },
+  "ratchet_floors": {
+    "backend_line": 78,
+    "backend_branch": 69,
+    "branch_floor": 69,
+    "frontend_lines": 92,
+    "frontend_branches": 81,
+    "frontend_functions": 90,
+    "frontend_statements": 92,
+    "source": "pyproject.toml fail_under + metrics/coverage_ratchet_baseline.json"
+  },
+  "targets": {
+    "backend_line_pct": 90,
+    "backend_branch_pct": 85,
+    "frontend_line_pct": 80,
+    "frontend_branch_pct": 75
+  },
+  "_retired": {
+    "reason": "以下口径已退役，禁止再引用为当前值",
+    "values": {
+      "full_app_60_63": "富依赖环境 + 历史窄 include 混报（2026-06-04）",
+      "ci_narrow_70": "窄包 include/omit 门禁（2026-06-08 前）；已改为全量 source=[app] + coverage_ratchet.py",
+      "claimed_77_4_or_88": "周报误报，2026-06-08 已撤回"
+    }
+  }
+}

@@ -1,0 +1,255 @@
+import { describe, it, expect, vi } from 'vitest'
+import { ref } from 'vue'
+import { useChatResponseAttach } from './useChatResponseAttach'
+import { readPlannerBusinessResult } from '@/utils/readPlannerBusinessResult'
+import type { TaskItem } from './useChatPersistence'
+
+function makeDeps() {
+  const messages = ref([
+    { role: 'user' as const, content: 'hi' },
+    { role: 'ai' as const, content: 'reply' },
+  ])
+  const taskList = ref<TaskItem[]>([
+    {
+      id: 'wf-running',
+      type: 'workflow',
+      source: 'workflow',
+      title: 'running wf',
+      status: 'running',
+      progress: 20,
+    },
+  ])
+  const upsertTask = vi.fn()
+  const api = useChatResponseAttach({
+    messages,
+    lastRequestContextSummary: ref(''),
+    taskList,
+    upsertTask,
+    createTaskId: (p) => `${p}-id`,
+  })
+  return { messages, taskList, upsertTask, ...api }
+}
+
+describe('useChatResponseAttach', () => {
+  it('readPlannerBusinessResult accepts camel or nested snake_case results', () => {
+    expect(
+      readPlannerBusinessResult({
+        success: false,
+        businessResult: { status: 'failed', summary: '写入失败' },
+      }),
+    ).toEqual({ status: 'failed', summary: '写入失败' })
+    expect(
+      readPlannerBusinessResult({
+        success: true,
+        data: { business_result: { status: 'completed', summary: '已删除', evidence: { completed_tool_count: 1 } } },
+      }),
+    ).toEqual({ status: 'completed', summary: '已删除', evidence: { completed_tool_count: 1 } })
+    expect(readPlannerBusinessResult({ success: true, data: { business_result: {} } })).toBeUndefined()
+  })
+
+  it('attachBusinessResultToLastAiMessage sets a visible business result on last ai', () => {
+    const { messages, attachBusinessResultToLastAiMessage } = makeDeps()
+    attachBusinessResultToLastAiMessage({
+      success: true,
+      businessResult: { status: 'completed', summary: '客户创建成功', facts: { customer_id: 23 } },
+    })
+    expect(messages.value[1].businessResult).toEqual({
+      status: 'completed',
+      summary: '客户创建成功',
+      facts: { customer_id: 23 },
+    })
+  })
+
+  it('attachBusinessResultToLastAiMessage accepts nested business_result and skips empty objects', () => {
+    const { messages, attachBusinessResultToLastAiMessage } = makeDeps()
+    attachBusinessResultToLastAiMessage({
+      success: true,
+      data: { business_result: {} },
+    })
+    expect(messages.value[1].businessResult).toBeUndefined()
+    attachBusinessResultToLastAiMessage({
+      success: true,
+      data: { business_result: { status: 'failed', summary: '写入失败' } },
+    })
+    expect(messages.value[1].businessResult?.status).toBe('failed')
+  })
+
+  it('attachThinkingStepsToLastAiMessage sets thinking on last ai', () => {
+    const { messages, attachThinkingStepsToLastAiMessage } = makeDeps()
+    attachThinkingStepsToLastAiMessage({
+      success: true,
+      data: { data: { thinking_steps: '步骤1\n步骤2' } },
+    })
+    expect(messages.value[1].thinkingSteps).toContain('步骤1')
+  })
+
+  it('attachTodoStepsToLastAiMessage sets todo list', () => {
+    const { messages, attachTodoStepsToLastAiMessage } = makeDeps()
+    attachTodoStepsToLastAiMessage({
+      success: true,
+      data: { data: { todo: ['a', 'b'] } },
+    })
+    expect(messages.value[1].todoSteps).toEqual(['a', 'b'])
+  })
+
+  it('attachWorkflowTraceToLastAiMessage sets trace', () => {
+    const { messages, attachWorkflowTraceToLastAiMessage } = makeDeps()
+    attachWorkflowTraceToLastAiMessage({
+      success: true,
+      data: {
+        action: 'workflow_done',
+        data: {
+          node_results: [
+            {
+              node_id: 'n1',
+              success: false,
+              tool_id: 'business_db',
+              action: 'write',
+              retries: 0,
+              retryable: false,
+              recovery_hint: '请审批后重试',
+              duration_ms: 12,
+            },
+          ],
+        },
+      },
+    })
+    expect(messages.value[1].nodeResults?.length).toBe(1)
+    expect(messages.value[1].workflowAction).toBe('workflow_done')
+    expect(messages.value[1].nodeResults?.[0].retryable).toBe(false)
+    expect(messages.value[1].nodeResults?.[0].recovery_hint).toBe('请审批后重试')
+    expect(messages.value[1].nodeResults?.[0].duration_ms).toBe(12)
+  })
+
+  it('syncTaskFromChatResponse queues workflow confirmation', () => {
+    const { upsertTask, syncTaskFromChatResponse } = makeDeps()
+    syncTaskFromChatResponse(
+      {
+        success: true,
+        data: {
+          action: 'workflow_confirmation_required',
+          data: { pending_workflow_id: 'wf-9' },
+        },
+      },
+      '执行任务',
+    )
+    expect(upsertTask).toHaveBeenCalledWith(expect.objectContaining({ id: 'wf-9', type: 'workflow', status: 'queued' }))
+  })
+
+  it('syncTaskFromChatResponse marks workflow done', () => {
+    const { upsertTask, syncTaskFromChatResponse } = makeDeps()
+    syncTaskFromChatResponse(
+      {
+        success: true,
+        data: {
+          action: 'workflow_done',
+          data: { node_results: [{ node_id: 'n1', success: true }] },
+        },
+      },
+      'ok',
+    )
+    expect(upsertTask).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 'wf-running',
+        status: 'success',
+        progress: 100,
+        payload: expect.objectContaining({
+          workflowNodeResults: [expect.objectContaining({ node_id: 'n1' })],
+        }),
+      }),
+    )
+  })
+
+  it('syncTaskFromChatResponse marks workflow failed', () => {
+    const { upsertTask, syncTaskFromChatResponse } = makeDeps()
+    syncTaskFromChatResponse({ success: false, message: 'boom', data: { action: 'workflow_failed', data: {} } }, 'bad')
+    expect(upsertTask).toHaveBeenCalledWith(expect.objectContaining({ id: 'wf-running', status: 'failed', error: 'boom' }))
+  })
+
+  it('syncTaskFromChatResponse updates running workflow progress from node_results', () => {
+    const { upsertTask, syncTaskFromChatResponse } = makeDeps()
+    syncTaskFromChatResponse(
+      {
+        success: true,
+        data: {
+          data: {
+            node_results: [
+              { node_id: 'n1', success: true },
+              { node_id: 'n2', success: false },
+            ],
+          },
+        },
+      },
+      'progress',
+    )
+    expect(upsertTask).toHaveBeenCalledWith(expect.objectContaining({ status: 'running', stage: expect.stringContaining('1/2') }))
+  })
+
+  it('attachContextSummaryToLastAiMessage writes summary on last ai', () => {
+    const lastRequestContextSummary = ref('ctx summary')
+    const messages = ref([{ role: 'ai' as const, content: 'x' }])
+    const { attachContextSummaryToLastAiMessage } = useChatResponseAttach({
+      messages,
+      lastRequestContextSummary,
+      taskList: ref([]),
+      upsertTask: vi.fn(),
+      createTaskId: (p) => p,
+    })
+    attachContextSummaryToLastAiMessage()
+    expect(messages.value[0].contextSummary).toBe('ctx summary')
+  })
+
+  it('attaches a structured trace from a durable Business Harness agent task', () => {
+    const { messages, taskList, attachAgentRunTraceToLastAiMessage } = makeDeps()
+    taskList.value = [
+      {
+        id: 'agent_task_task_1',
+        messageRef: '1',
+        type: 'agent_task',
+        source: 'agent',
+        title: '写入业务数据',
+        status: 'blocked',
+        payload: {
+          activeRunId: 'run_business_1',
+          agentEvents: [
+            {
+              event_id: 'event_1',
+              event_type: 'tool.started',
+              created_at: '2026-08-23T03:39:00Z',
+              message: '准备写入业务数据库',
+              data: {
+                intent: 'business_db_write',
+                node_id: 'write_business_product',
+                tool_id: 'business_db',
+                action: 'write',
+              },
+            },
+            {
+              event_id: 'event_2',
+              event_type: 'step.waiting_user',
+              created_at: '2026-08-23T03:39:01Z',
+              message: '等待用户确认',
+              data: { node_id: 'write_business_product' },
+            },
+          ],
+        },
+      },
+    ]
+
+    attachAgentRunTraceToLastAiMessage('unrelated-run')
+    expect(messages.value[1].agentRunTrace).toBeUndefined()
+    taskList.value[0].messageRef = undefined
+    attachAgentRunTraceToLastAiMessage('run_business_1')
+    expect(messages.value[1].agentRunTrace).toBeUndefined()
+    taskList.value[0].messageRef = '1'
+    attachAgentRunTraceToLastAiMessage('run_business_1')
+
+    expect(messages.value[1].agentRunTrace).toEqual(
+      expect.objectContaining({
+        run_id: 'run_business_1',
+        intent: 'business_db_write',
+        status: 'waiting',
+      }),
+    )
+  })
+})

@@ -1,0 +1,379 @@
+# CI SSOT: generated from FHD/.github/workflows/release-orchestrator.yml — DO NOT edit here.
+# Edit that source, then run: python scripts/dev/publish_ci_workflows_to_root.py
+name: Release Orchestrator
+
+on:
+  workflow_dispatch:
+    inputs:
+      product_version:
+        required: true
+        default: "1.0.0.7"
+        type: choice
+        options: ["1.0.0.7"]
+      release_sha:
+        description: "Full 40-character commit to freeze after required CI/security gates pass"
+        required: true
+        type: string
+      security_scan_run_id:
+        description: "Most recent completed all-source zero-finding scan run ID"
+        required: true
+        type: string
+      previous_security_scan_run_id:
+        description: "Compatibility input; pass the current scan run ID for the single-scan policy"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: write
+  checks: read
+  statuses: read
+  security-events: read
+
+concurrency:
+  group: xcagi-release-orchestrator
+  cancel-in-progress: false
+
+env:
+  XCAGI_RELEASE_SHA: ${{ inputs.release_sha || github.sha }}
+  XCAGI_PRODUCT_VERSION: ${{ inputs.product_version || github.ref_name }}
+
+
+defaults:
+  run:
+    working-directory: FHD
+
+jobs:
+  security-preflight:
+    name: Verify exact-SHA all-source security evidence
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Require frozen SHA to be current main with every protected check successful
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          RELEASE_PROTECTION_TOKEN: ${{ secrets.RELEASE_PROTECTION_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$RELEASE_SHA" | grep -Eq '^[0-9a-f]{40}$'
+          main_sha="$(gh api "repos/${GH_REPO}/commits/main" --jq .sha)"
+          test "$main_sha" = "$RELEASE_SHA" || {
+            echo "::error::release_sha is not the current origin/main SHA."
+            exit 1
+          }
+          protection="$(GH_TOKEN="${RELEASE_PROTECTION_TOKEN:?RELEASE_PROTECTION_TOKEN secret missing (needs a PAT with admin read on branch protection)}" gh api "repos/${GH_REPO}/branches/main/protection/required_status_checks")"
+          mapfile -t required < <(
+            jq -r '(.contexts[]?), (.checks[]?.context)' <<<"$protection" | sort -u
+          )
+          [ "${#required[@]}" -gt 0 ] || {
+            echo "::error::main has no readable required status checks; refusing release."
+            exit 1
+          }
+          checks="$(gh api --paginate --slurp \
+            "repos/${GH_REPO}/commits/${RELEASE_SHA}/check-runs?per_page=100")"
+          statuses="$(gh api --paginate --slurp \
+            "repos/${GH_REPO}/commits/${RELEASE_SHA}/statuses?per_page=100")"
+          failed=()
+          for context in "${required[@]}"; do
+            check="$(jq -r --arg context "$context" '
+              [.[].check_runs[] | select(.name == $context)]
+              | sort_by(.completed_at // .started_at // "") | last
+              | .conclusion // empty
+            ' <<<"$checks")"
+            status="$(jq -r --arg context "$context" '
+              [.[][] | select(.context == $context)]
+              | sort_by(.created_at // "") | last | .state // empty
+            ' <<<"$statuses")"
+            if [ "$check" != success ] && [ "$status" != success ]; then
+              failed+=("${context}:${check:-${status:-missing}}")
+            fi
+          done
+          if [ "${#failed[@]}" -gt 0 ]; then
+            printf '::error::Required checks are not successful: %s\n' "${failed[*]}"
+            exit 1
+          fi
+      - uses: actions/download-artifact@v8
+        with:
+          name: xcagi-security-release-reports
+          path: security-reports/current
+          run-id: ${{ inputs.security_scan_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: xcagi-security-release-reports
+          path: security-reports/previous
+          run-id: ${{ inputs.previous_security_scan_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Refuse stale, mismatched, incomplete, or nonzero evidence
+        run: >-
+          python FHD/scripts/security/verify_security_scan_pair.py
+          --previous-dir security-reports/previous
+          --current-dir security-reports/current
+          --release-sha "${XCAGI_RELEASE_SHA}"
+
+  verify-version-anchors:
+    needs: security-preflight
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: FHD
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha || github.sha }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Verify stable version anchors
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${XCAGI_RELEASE_SHA}"
+          printf '%s' "${XCAGI_RELEASE_SHA}" | grep -Eq '^[0-9a-fA-F]{40}$'
+          python scripts/dev/verify_version_anchors.py
+      - name: Reject test-only versions before server deployment
+        env:
+          REQUESTED_VERSION: ${{ inputs.product_version }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          version = os.environ["REQUESTED_VERSION"]
+          release = json.loads(Path("config/download_release.json").read_text(encoding="utf-8"))
+          if release.get("version_lock") != version or release.get("download_version") != version:
+              raise SystemExit("Product version must match both frozen catalog anchors")
+          interim = release.get("windows_interim_release") or {}
+          if interim.get("test_only") is True and interim.get("version") == version:
+              raise SystemExit("Test-only candidate cannot trigger production deployments")
+          PY
+
+  # 前端唯一构建：产出共享 templates/vue-dist，作为 Web 与桌面端「单次构建、双端共用」的 SSOT 产物。
+  # 桌面/网页流水线各自下载该 artifact 并复用，不再各自重建（避免网页≠桌面、每次打包漂移/回退）。
+  build-frontend:
+    needs: verify-version-anchors
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: FHD
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha || github.sha }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: FHD/frontend/package-lock.json
+      - name: Build shared vue-dist (enterprise/full)
+        run: |
+          set -euo pipefail
+          bash scripts/package/build-frontend.sh enterprise
+          test -f templates/vue-dist/index.html
+          echo "index=$(grep -oE 'index-[A-Za-z0-9_-]+\.js' templates/vue-dist/index.html | head -1)"
+      - name: Upload shared vue-dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcagi-vue-dist
+          path: FHD/templates/vue-dist
+          retention-days: 7
+          if-no-files-found: error
+
+  deploy-servers-in-order:
+    name: staging then MODstore then approved FHD production
+    needs: verify-version-anchors
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha }}
+      - name: Deploy the exact SHA through the mandatory server sequence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          PRODUCT_VERSION: ${{ inputs.product_version }}
+          SECURITY_SCAN_RUN_ID: ${{ inputs.security_scan_run_id }}
+          PREVIOUS_SECURITY_SCAN_RUN_ID: ${{ inputs.previous_security_scan_run_id }}
+        run: |
+          set -euo pipefail
+          helper="FHD/scripts/release/dispatch_workflow_and_wait.sh"
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+          # security-preflight already verified these reports for this SHA.
+          # Keep their exact run IDs; never infer evidence from a latest run.
+          if [[ ! "$SECURITY_SCAN_RUN_ID" =~ ^[1-9][0-9]*$ ]] \
+            || [[ ! "$PREVIOUS_SECURITY_SCAN_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::Both security scan run ID inputs must be numeric; the same run ID is valid for the single-scan policy."
+            exit 1
+          fi
+
+          # 1. Full staging deployment and its own health/readback gates.
+          "$helper" fhd-ci-cd.yml "CI/CD ${RELEASE_SHA}" \
+            -f "release_sha=${RELEASE_SHA}" \
+            -f release_channel=staging \
+            -f push_to_cvm=true \
+            -f push_image_tar=false
+
+          # 2. MODstore immutable exact-SHA production deployment.
+          "$helper" modstore-prod-deploy.yml "Deploy MODstore ${RELEASE_SHA}" \
+            -f "git_sha=${RELEASE_SHA}" \
+            -f "product_version=${PRODUCT_VERSION}" \
+            -f "security_scan_run_id=${SECURITY_SCAN_RUN_ID}" \
+            -f "previous_security_scan_run_id=${PREVIOUS_SECURITY_SCAN_RUN_ID}" \
+            -f require_platform_key=true
+
+          # 3. Upload the same FHD build to stable without applying it.
+          "$helper" fhd-ci-cd.yml "CI/CD ${RELEASE_SHA}" \
+            -f "release_sha=${RELEASE_SHA}" \
+            -f release_channel=stable \
+            -f push_to_cvm=true \
+            -f push_image_tar=false \
+            -f "security_scan_run_id=${SECURITY_SCAN_RUN_ID}" \
+            -f "previous_security_scan_run_id=${PREVIOUS_SECURITY_SCAN_RUN_ID}"
+
+          # 4. Apply the configured production environment protection rules and
+          # reverify the exact SHA/scan pair before consuming release:<SHA>.
+          "$helper" fhd-deploy.yml \
+            "fhd-deploy production apply-latest autonomy:release:${RELEASE_SHA}" \
+            -f environment=production \
+            -f action=apply-latest \
+            -f "action_id=release:${RELEASE_SHA}" \
+            -f "release_sha=${RELEASE_SHA}" \
+            -f "security_scan_run_id=${SECURITY_SCAN_RUN_ID}" \
+            -f "previous_security_scan_run_id=${PREVIOUS_SECURITY_SCAN_RUN_ID}"
+
+          # 5. Install the audited Prometheus SSOT and require FHD stable,
+          # staging, and MODstore targets to read back healthy.  The workflow
+          # atomically restores the previous config if target validation fails.
+          "$helper" fhd-production-observability.yml \
+            "Production observability configuration ${RELEASE_SHA}" \
+            -f "release_sha=${RELEASE_SHA}"
+
+  dispatch-client-releases:
+    needs: [verify-version-anchors, build-frontend, deploy-servers-in-order]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Root workflow filenames: `gh workflow run` targets the repo-root
+        # .github/workflows/, where these client workflows are published as
+        # fhd-release-*.yml. Keep the fhd- prefix or dispatch 404s.
+        workflow:
+          - fhd-release-desktop.yml
+          - fhd-release-web.yml
+          - fhd-release-android.yml
+    steps:
+      - name: Trigger ${{ matrix.workflow }}
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          raw="${XCAGI_PRODUCT_VERSION}"
+          raw="${raw#FHD/}"
+          raw="${raw#v}"
+          raw="${raw#V}"
+          version="${raw:-1.0.0.5}"
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
+            echo "::error::Invalid product_version: $version"
+            exit 1
+          fi
+          # 把本次 run 的 build-frontend artifact run_id 传给桌面/网页流水线，供其下载共享 vue-dist。
+          case "${{ matrix.workflow }}" in
+            fhd-release-desktop.yml)
+              FHD/scripts/release/dispatch_workflow_and_wait.sh \
+                "${{ matrix.workflow }}" "Release Desktop ${XCAGI_RELEASE_SHA}" \
+                -f "version=${version}" -f "release_sha=${XCAGI_RELEASE_SHA}" \
+                -f "security_scan_run_id=${{ inputs.security_scan_run_id }}" \
+                -f "previous_security_scan_run_id=${{ inputs.previous_security_scan_run_id }}" \
+                -f "frontend_run_id=${{ github.run_id }}" \
+                -f windows_installer_only=false \
+                -f candidate_only=false \
+                -f verify_only=false
+              ;;
+            fhd-release-web.yml)
+              FHD/scripts/release/dispatch_workflow_and_wait.sh \
+                "${{ matrix.workflow }}" "Release Web ${XCAGI_RELEASE_SHA}" \
+                -f "version=${version}" -f "release_sha=${XCAGI_RELEASE_SHA}" \
+                -f "frontend_run_id=${{ github.run_id }}"
+              ;;
+            *)
+              FHD/scripts/release/dispatch_workflow_and_wait.sh \
+                "${{ matrix.workflow }}" "Release Android ${XCAGI_RELEASE_SHA}" \
+                -f "version=${version}" -f "release_sha=${XCAGI_RELEASE_SHA}"
+              ;;
+          esac
+
+  verify-full-convergence:
+    name: Full source and device readback
+    needs: dispatch-client-releases
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha }}
+      - name: Require every source and device to report the frozen release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: >-
+          FHD/scripts/release/dispatch_workflow_and_wait.sh
+          fhd-release-convergence-readback.yml
+          "Release convergence ${{ inputs.release_sha }}"
+          -f "release_sha=${{ inputs.release_sha }}"
+          -f "product_version=${{ inputs.product_version }}"
+
+  publish-converged-github-release:
+    name: Publish exact-SHA draft only after device convergence
+    needs: [verify-full-convergence]
+    if: ${{ needs.verify-full-convergence.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Promote and read back the already-verified GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          PRODUCT_VERSION: ${{ inputs.product_version }}
+        run: |
+          set -euo pipefail
+          tag="FHD/v${PRODUCT_VERSION}"
+          printf '%s' "$RELEASE_SHA" | grep -Eq '^[0-9a-f]{40}$'
+          release="$(gh api "repos/${GH_REPO}/releases/tags/${tag}")"
+          jq -e --arg sha "$RELEASE_SHA" --arg tag "$tag" '
+            .draft == true and .target_commitish == $sha and .tag_name == $tag and
+            ([.assets[].name | select(endswith(".exe"))] | length > 0) and
+            ([.assets[].name | select(endswith(".dmg"))] | length > 0)
+          ' <<<"$release" >/dev/null
+          ref_sha="$(gh api "repos/${GH_REPO}/git/ref/tags/${tag}" --jq '.object.sha' 2>/dev/null || true)"
+          if [ -n "$ref_sha" ]; then
+            test "$ref_sha" = "$RELEASE_SHA" || {
+              echo "::error::tag already identifies another source commit"
+              exit 1
+            }
+          else
+            gh api --method POST "repos/${GH_REPO}/git/refs" \
+              -f "ref=refs/tags/${tag}" -f "sha=${RELEASE_SHA}" >/dev/null
+          fi
+          gh release edit "$tag" --repo "$GH_REPO" --draft=false
+          published="$(gh api "repos/${GH_REPO}/releases/tags/${tag}")"
+          jq -e --arg sha "$RELEASE_SHA" --arg tag "$tag" '
+            .draft == false and .target_commitish == $sha and .tag_name == $tag and
+            (.published_at | type == "string" and length > 0)
+          ' <<<"$published" >/dev/null

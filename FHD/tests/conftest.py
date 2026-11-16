@@ -1,0 +1,508 @@
+"""
+pytest 配置与 fixtures（FastAPI 版）
+"""
+
+from __future__ import annotations
+
+import asyncio
+import atexit
+import importlib
+import os
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+os.environ.setdefault("SECRET_KEY", "xcagi-test-only-secret-key-32-bytes-minimum")
+
+_PYTEST_RUNTIME_ROOT = Path(tempfile.mkdtemp(prefix="xcagi_fhd_pytest_"))
+atexit.register(shutil.rmtree, _PYTEST_RUNTIME_ROOT, True)
+_PYTEST_DATABASE_URL = f"sqlite+pysqlite:///{_PYTEST_RUNTIME_ROOT / 'xcagi-test.sqlite3'}"
+os.environ.setdefault("DATABASE_URL", _PYTEST_DATABASE_URL)
+os.environ.setdefault("VECTOR_DB_URL", _PYTEST_DATABASE_URL)
+# 语义兜底默认关闭：单测不加载真实 embedding 模型；需要时用例内显式开启。
+os.environ.setdefault("FHD_INTENT_SEMANTIC_ENABLED", "0")
+os.environ.setdefault("DATASET_RAG_STORE_PATH", str(_PYTEST_RUNTIME_ROOT / "dataset_rag.json"))
+os.environ.setdefault(
+    "DATASET_RAG_VECTOR_INDEX_PATH", str(_PYTEST_RUNTIME_ROOT / "dataset_vectors.sqlite")
+)
+os.environ.setdefault("XCAGI_AUTONOMY_DATA_DIR", str(_PYTEST_RUNTIME_ROOT / "autonomy"))
+os.environ.setdefault(
+    "XCAGI_AUTONOMY_AUDIT_DB_PATH", str(_PYTEST_RUNTIME_ROOT / "autonomy-audit.sqlite3")
+)
+os.environ.setdefault(
+    "XCAGI_AUTONOMY_AUDIT_LOG_PATH", str(_PYTEST_RUNTIME_ROOT / "autonomy-audit.jsonl")
+)
+os.environ.setdefault("XCAGI_PLAN_GRAPH_LOG", str(_PYTEST_RUNTIME_ROOT / "plan_graphs.jsonl"))
+os.environ.setdefault(
+    "XIUCI_PLATFORM_MADE_TOKENS_PATH", str(_PYTEST_RUNTIME_ROOT / "platform_made_tokens.json")
+)
+os.environ.setdefault("XCAGI_SLA_SNAPSHOT_PATH", str(_PYTEST_RUNTIME_ROOT / "sla-snapshot.json"))
+os.environ.setdefault(
+    "XCMAX_TEST_BLOAT_METRICS_PATH", str(_PYTEST_RUNTIME_ROOT / "test-bloat-history.jsonl")
+)
+# 历史 fixture 生成未签名样例包；生产默认仍为强制验签。
+os.environ.setdefault("XCAGI_REQUIRE_SIGNED_MODS", "0")
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+# 评测脚本归在 FHD/assets/evals；保持 ``from evals.… import`` 的既有写法可解析。
+ASSETS_ROOT = os.path.join(PROJECT_ROOT, "assets")
+if ASSETS_ROOT not in sys.path:
+    sys.path.insert(0, ASSETS_ROOT)
+
+from app.utils.operational_errors import BOUNDARY_ERRORS
+
+# A few legacy coverage modules install minimal ``sys.modules`` stubs during
+# collection. Preload the real host-policy modules used by the application
+# factory so one test module cannot poison later, unrelated route suites.
+for _stable_module in (
+    "app.mod_sdk.edition_policy",
+    "app.enterprise.mod_entitlements",
+):
+    try:
+        importlib.import_module(_stable_module)
+    except (ImportError, OSError):
+        # Optional-dependency environments may still let the owning tests skip.
+        pass
+
+
+def pytest_collection_modifyitems(config, items):
+    """按文件名自动给行覆盖率填充 stub 打 ``coverage_ramp`` 标记。
+
+    历史遗留 ~184 个 ``test_coverage_ramp_*.py``（约 5274 用例、占 ~25%）断言弱、
+    杀变体能力低。打标后可用 ``-m 'not coverage_ramp'`` 测量真实行为套件覆盖率，
+    与对外覆盖率口径分离。默认仍全量运行。
+    """
+    ramp_marker = pytest.mark.coverage_ramp
+    for item in items:
+        if os.path.basename(str(item.fspath)).startswith("test_coverage_ramp_"):
+            item.add_marker(ramp_marker)
+
+
+_legacy_sync_test_loops: set[asyncio.AbstractEventLoop] = set()
+
+
+class _AutoCreatingEventLoopPolicy(asyncio.DefaultEventLoopPolicy):
+    """Keep legacy ``asyncio.get_event_loop()`` behavior for sync tests."""
+
+    def get_event_loop(self):
+        try:
+            loop = super().get_event_loop()
+        except (RuntimeError, DeprecationWarning):
+            loop = self.new_event_loop()
+            self.set_event_loop(loop)
+        _legacy_sync_test_loops.add(loop)
+        return loop
+
+
+asyncio.set_event_loop_policy(_AutoCreatingEventLoopPolicy())
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Close event loops created for legacy synchronous coroutine tests."""
+    try:
+        from app.infrastructure.memory.mem0_backend import reset_long_term_memory_for_tests
+
+        reset_long_term_memory_for_tests()
+    except BOUNDARY_ERRORS:
+        pass
+    for loop in tuple(_legacy_sync_test_loops):
+        if not loop.is_closed():
+            loop.close()
+    _legacy_sync_test_loops.clear()
+    asyncio.set_event_loop(None)
+
+
+# pytest-cov 采集时会多次触达 ORM；先一次性加载全部 model，避免 Table 重复注册。
+try:
+    import app.db.models
+    import app.infrastructure.mods.employee_registry
+except BOUNDARY_ERRORS:  # pragma: no cover - 个别桌面/缺依赖环境允许后续用例自行 skip
+    pass
+
+
+@pytest.fixture(autouse=True)
+def _default_enterprise_tenant_scope_for_tests(request):
+    """普通后端测试默认运行在企业租户上下文中。
+
+    生产代码仍然 fail-closed；这里补的是单测环境缺少 HTTP request/session 中间件时的
+    租户上下文。专门验证无租户 fail-closed 的测试文件必须保持 None。
+    """
+    if request.node.fspath.basename in {
+        "test_tenant_scope.py",
+        "test_document_templates_tenant_isolation.py",
+        "test_inventory_background_tenant.py",
+        "test_ai_group_chat_tenant_isolation.py",
+        "test_ai_group_chat_tenant_route_isolation.py",
+    }:
+        yield
+        return
+    if request.node.get_closest_marker("release_gate"):
+        yield
+        return
+    from app.infrastructure.tenant_scope import tenant_scope
+
+    with tenant_scope(1):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _workspace_root_for_excel_reload_tests(request, monkeypatch):
+    """Keep direct Excel reload unit tests inside the production workspace boundary."""
+    if (
+        "TestTryStructuredReloadRecords" in request.node.nodeid
+        and "tmp_path" in request.fixturenames
+    ):
+        monkeypatch.setenv("WORKSPACE_ROOT", str(request.getfixturevalue("tmp_path")))
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _compat_db_coverage_ramp_tenant_scope(request, monkeypatch):
+    """Compat DB tests migrated from coverage-ramp use narrow legacy mock schemas.
+
+    原文件名 ``test_coverage_ramp_phase3_p1_deep_backend.py`` /
+    ``test_coverage_ramp_phase6_p17_backend.py`` 已于 2026-09-01 去
+    ``coverage_ramp_`` 前缀迁出为契约测试（D2-5），fixture 引用同步更新。
+    """
+    if request.node.fspath.basename not in {
+        "test_phase3_p1_deep_backend.py",
+        "test_phase6_p17_backend.py",
+    }:
+        yield
+        return
+
+    import app.infrastructure.persistence.compat_db.writes as writes
+
+    def _append_scope(where_parts, bind, column_names, *, table_name):
+        where_parts.append("tenant_id = :tenant_id")
+        bind["tenant_id"] = 1
+
+    def _require_scope(column_names, *, table_name):
+        return 1
+
+    monkeypatch.setattr(writes, "_append_tenant_scope_or_raise", _append_scope)
+    monkeypatch.setattr(writes, "_require_tenant_id_or_raise", _require_scope)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_edition_and_product_sku_env(monkeypatch):
+    """
+    全量后端测试顺序敏感：其它用例或桌面 product-sku.json 会留下
+    XCAGI_PRODUCT_SKU / XCAGI_EDITION，导致 edition/generic/minimal 与 deliverable 断言失败。
+    同时清理桌面 runtime bootstrap（configure_desktop_environment）通过 os.environ.setdefault
+    设置的 XCAGI_MODS_ROOT / XCAGI_MODS_DIR 等环境变量，避免污染 ModManager 测试。
+    """
+    for key in (
+        "XCAGI_PRODUCT_SKU",
+        "XCAGI_EDITION",
+        "XCAGI_GENERIC_EDITION",
+        "XCAGI_MINIMAL_EDITION",
+        "XCAGI_DEFAULT_EDITION",
+        "XCAGI_RESOURCES_DIR",
+        "XCAGI_DESKTOP_RESOURCES",
+        "XCAGI_STAGED_MODS_DIR",
+        "XCAGI_MODS_ROOT",
+        "XCAGI_MODS_DIR",
+        "XCAGI_DESKTOP_MODE",
+        "XCAGI_DESKTOP_DATA_DIR",
+        "XCAGI_USER_MEMORY_DIR",
+        "XCAGI_USER_MEMORY_JSON_PATH",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("XCAGI_DATA_DIR", str(_PYTEST_RUNTIME_ROOT / "app-data"))
+    monkeypatch.setenv("FHD_ALLOW_X_USER_ID_HEADER", "1")
+    monkeypatch.setenv(
+        "XCAGI_PRODUCT_SKU_FILE",
+        os.path.join(PROJECT_ROOT, "tests", "_fixtures", "no-product-sku.json"),
+    )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _create_schema_before_any_test():
+    """首个用例运行前一次性建全表（时序不变量，D2-5 stub 迁出回归修复）。
+
+    历史上建表只发生在 session 级 ``app`` fixture 首次被使用时；原
+    ``test_coverage_ramp_routes``（test_c 排序位置）恰好使用共享 ``client``，
+    使建表先于绝大多数用例。该文件去前缀更名为 ``test_routes`` 后首次使用
+    大幅后移，早于此的 mini-app 用例可能踩到已在其他 DATABASE_URL 窗口完成
+    ``_ensure_schema`` 的共享 SQL 仓储单例（agent orchestrator 等），在测试库
+    上缺表（no such table: agent_runs）。这里把建表提前到会话第一个用例之前，
+    ``checkfirst=True`` 幂等，与 ``app`` fixture 内的建表共存。
+    """
+    from app.db import engine
+    from app.db.db_base import Base
+
+    Base.metadata.create_all(engine, checkfirst=True)
+
+
+@pytest.fixture(scope="session")
+def app():
+    """FastAPI 应用实例（整机装配，走 ``get_test_fastapi_app()``）。"""
+    from app.db import engine
+    from app.db.db_base import Base
+    from tests.fixtures.app_factory import get_test_fastapi_app
+
+    # The session app uses the isolated SQLite URL declared above.  Production
+    # startup deliberately refuses an unmigrated schema, so give the test-only
+    # database the same current ORM shape before entering the lifespan.
+    Base.metadata.create_all(engine, checkfirst=True)
+    return get_test_fastapi_app()
+
+
+@pytest.fixture(scope="function")
+def client(app):
+    """与整机 FastAPI 应用绑定的 ``TestClient``。"""
+    from fastapi.testclient import TestClient
+
+    with TestClient(app, raise_server_exceptions=False) as test_client:
+        yield test_client
+
+
+@pytest.fixture
+def logged_in_session(monkeypatch):
+    """Stub a validated session user with all permissions; mutate ``tenant_id`` per test."""
+    from types import SimpleNamespace
+
+    user = SimpleNamespace(id=1, tenant_id=None, is_active=True, tier="enterprise")
+    monkeypatch.setattr(
+        "app.infrastructure.auth.dependencies.resolve_session_user", lambda _request: user
+    )
+    monkeypatch.setattr(
+        "app.application.facades.session_facade.get_auth_service",
+        lambda: SimpleNamespace(has_permission=lambda _user, _code: True),
+    )
+    return user
+
+
+@pytest.fixture
+def mock_external_api():
+    """Mock 常见外部 API 客户端。"""
+    mocks = {
+        "httpx": MagicMock(),
+        "redis": MagicMock(),
+        "wechat": MagicMock(),
+    }
+
+    with patch("httpx.AsyncClient", mocks["httpx"]), patch("redis.Redis", mocks["redis"]):
+        yield mocks
+
+
+@pytest.fixture
+def mock_file_system():
+    """Mock 常见文件系统操作（并提供临时目录）。"""
+    temp_dir = tempfile.mkdtemp()
+
+    mocks = {
+        "temp_dir": temp_dir,
+        "os_path_exists": MagicMock(return_value=True),
+        "os_path_join": MagicMock(side_effect=os.path.join),
+        "open": MagicMock(),
+    }
+
+    with (
+        patch("os.path.exists", mocks["os_path_exists"]),
+        patch("os.path.join", mocks["os_path_join"]),
+        patch("builtins.open", mocks["open"]),
+    ):
+        yield mocks
+
+    try:
+        shutil.rmtree(temp_dir)
+    except BOUNDARY_ERRORS:
+        pass
+
+
+@pytest.fixture
+def sample_data_factory():
+    """测试数据工厂 - 生成各种测试数据。"""
+
+    class SampleDataFactory:
+        @staticmethod
+        def product(overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+            data = {
+                "product_name": f"测试产品_{SampleDataFactory._random_id()}",
+                "price": 99.99,
+                "unit": "个",
+                "description": "测试描述",
+                "category": "测试分类",
+                "specification": "测试规格",
+            }
+            if overrides:
+                data.update(overrides)
+            return data
+
+        @staticmethod
+        def customer(overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+            data = {
+                "unit_name": f"测试公司_{SampleDataFactory._random_id()}",
+                "contact": "张三",
+                "phone": "13800138000",
+                "address": "测试地址",
+                "tax_id": "91310000MA1234567X",
+                "bank_info": "测试银行信息",
+            }
+            if overrides:
+                data.update(overrides)
+            return data
+
+        @staticmethod
+        def shipment(overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+            data = {
+                "unit_name": f"测试公司_{SampleDataFactory._random_id()}",
+                "order_number": f"ORD{SampleDataFactory._random_id()}",
+                "products": [
+                    {"name": "产品 A", "quantity": 10, "price": 100},
+                    {"name": "产品 B", "quantity": 5, "price": 50},
+                ],
+                "date": "2026-03-17",
+                "total_amount": 1250.00,
+                "status": "pending",
+            }
+            if overrides:
+                data.update(overrides)
+            return data
+
+        @staticmethod
+        def wechat_contact(overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+            data = {
+                "wxid": f"wxid_{SampleDataFactory._random_id()}",
+                "nickname": f"测试用户_{SampleDataFactory._random_id()}",
+                "remark": "测试备注",
+                "phone": "13800138000",
+                "type": "friend",
+            }
+            if overrides:
+                data.update(overrides)
+            return data
+
+        @staticmethod
+        def material(overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+            data = {
+                "name": f"原材料_{SampleDataFactory._random_id()}",
+                "specification": "测试规格",
+                "unit": "kg",
+                "quantity": 100.0,
+                "min_quantity": 10.0,
+                "price": 50.0,
+            }
+            if overrides:
+                data.update(overrides)
+            return data
+
+        @staticmethod
+        def _random_id() -> str:
+            import random
+            import time
+
+            return f"{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
+
+    return SampleDataFactory
+
+
+@pytest.fixture
+def sample_product() -> dict[str, Any]:
+    return {
+        "product_name": "测试产品",
+        "price": 99.99,
+        "unit": "个",
+        "description": "测试描述",
+    }
+
+
+@pytest.fixture
+def sample_customer() -> dict[str, Any]:
+    return {
+        "unit_name": "测试公司",
+        "contact": "张三",
+        "phone": "13800138000",
+        "address": "测试地址",
+    }
+
+
+@pytest.fixture
+def sample_shipment() -> dict[str, Any]:
+    return {
+        "unit_name": "测试公司",
+        "products": [
+            {"name": "产品 A", "quantity": 10, "price": 100},
+            {"name": "产品 B", "quantity": 5, "price": 50},
+        ],
+        "date": "2026-03-17",
+    }
+
+
+@pytest.fixture
+def sample_template() -> dict[str, Any]:
+    return {
+        "name": "测试发货单模板",
+        "template_type": "发货单",
+        "business_scope": "orders",
+        "fields": [
+            {"label": "产品型号", "name": "model", "type": "text"},
+            {"label": "数量", "name": "quantity", "type": "number"},
+            {"label": "单价", "name": "price", "type": "number"},
+            {"label": "金额", "name": "amount", "type": "number"},
+        ],
+        "preview_data": {
+            "sample_rows": [{"产品型号": "ABC-001", "数量": 5}],
+            "sheet_name": "Sheet1",
+        },
+    }
+
+
+@pytest.fixture
+def assert_response():
+    """针对 httpx ``Response`` 的断言辅助。"""
+
+    def assert_success(response, expected_status: int = 200) -> None:
+        assert response.status_code == expected_status
+        ct = response.headers.get("content-type", "")
+        assert "application/json" in ct
+
+    def assert_error(response, expected_status: int = 400) -> None:
+        assert response.status_code == expected_status
+        ct = response.headers.get("content-type", "")
+        assert "application/json" in ct
+        data = response.json()
+        assert "error" in data or "message" in data
+
+    def assert_json_structure(response, required_fields: list[str]) -> None:
+        data = response.json()
+        assert isinstance(data, dict)
+        for field in required_fields:
+            assert field in data, f"缺少必需字段：{field}"
+
+    def assert_list_response(response, key: str = "items") -> None:
+        data = response.json()
+        assert isinstance(data, dict)
+        assert key in data
+        assert isinstance(data[key], list)
+
+    return {
+        "success": assert_success,
+        "error": assert_error,
+        "json_structure": assert_json_structure,
+        "list": assert_list_response,
+    }
+
+
+@pytest.fixture
+def local_tools(monkeypatch):
+    """Opt-in parent mocks only; persistence/process acceptance keeps the real executor."""
+    from app.application.agent_orchestrator.tool_executor import AgentToolExecutor
+
+    class LocalContractExecutor(AgentToolExecutor):
+        def execute_with_deadline(self, step, *, runtime_context, deadline_monotonic):
+            return self.execute(step, runtime_context=runtime_context)
+
+    monkeypatch.setattr(
+        "app.application.agent_orchestrator.orchestrator.AgentToolExecutor", LocalContractExecutor
+    )

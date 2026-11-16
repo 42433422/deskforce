@@ -1,0 +1,134 @@
+"""工作流工具统一分发：路由注册表与 execute_registered_workflow_tool。"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+
+from app.domain.shared_services.tools_workflow_business_db import (
+    _registered_router_business_db,
+)
+from app.domain.shared_services.tools_workflow_erp import (
+    _registered_router_customers,
+    _registered_router_finance,
+    _registered_router_inventory,
+    _registered_router_purchase,
+    _registered_router_reports,
+    _registered_router_sales,
+)
+from app.domain.shared_services.tools_workflow_erp_master import (
+    _registered_router_materials,
+    _registered_router_products,
+)
+from app.domain.shared_services.tools_workflow_excel_ocr import (
+    _registered_router_excel_analysis,
+    _registered_router_excel_vector_index,
+    _registered_router_generate_office_document,
+)
+from app.domain.shared_services.tools_workflow_excel_ocr_ops import (
+    _registered_router_excel_import,
+    _registered_router_ocr,
+    _registered_router_unit_products_import,
+)
+from app.domain.shared_services.tools_workflow_memory_rag import (
+    _registered_router_dataset_rag,
+    _registered_router_memory_v2,
+)
+from app.domain.shared_services.tools_workflow_shipments_docs import (
+    _registered_router_business_docking_family,
+    _registered_router_business_event,
+    _registered_router_mrp,
+    _registered_router_shipment_orders,
+    _registered_router_shipment_records,
+    _registered_router_suppliers,
+    _registered_router_system_maintenance,
+)
+from app.domain.shared_services.tools_workflow_shipments_docs_ops import (
+    _registered_router_document_template,
+    _registered_router_excel_analyzer,
+    _registered_router_excel_toolkit,
+    _registered_router_label_template_generator,
+)
+from app.domain.shared_services.tools_workflow_workspace import (
+    _registered_router_desktop_automation,
+    _registered_router_employee,
+    _registered_router_print,
+    _registered_router_printer_list,
+    _registered_router_settings,
+    _registered_router_template_preview,
+)
+
+
+def _registered_router_client_product_issue(action, params, runtime_context, profile, user_message):
+    if action != "submit":
+        return {"success": False, "message": "不支持的产品问题上报操作"}
+    from app.application.registered_client_issue import submit_client_product_issue
+
+    return submit_client_product_issue(user_message, runtime_context)
+
+
+class _WorkflowRouterMap(dict):
+    _hidden_keys = {"employee", "business_db"}
+
+    def keys(self):
+        return [key for key in super().keys() if key not in self._hidden_keys]
+
+    def get(self, key, default=None):
+        """外部 MCP 工具按 ``mcp__<server>`` 前缀动态路由，无需静态注册。"""
+        if str(key).startswith("mcp__"):
+            from app.application.tools.mcp.registry import call_mcp_tool
+
+            return lambda action, params, runtime_context, profile, user_message: call_mcp_tool(
+                str(key), action, params
+            )
+        return super().get(key, default)
+
+
+_REGISTERED_WORKFLOW_ROUTERS: dict[str, Callable[..., dict]] = _WorkflowRouterMap(
+    {
+        "customers": _registered_router_customers,
+        "products": _registered_router_products,
+        "materials": _registered_router_materials,
+        "inventory": _registered_router_inventory,
+        "purchase": _registered_router_purchase,
+        "sales": _registered_router_sales,
+        "reports": _registered_router_reports,
+        "finance": _registered_router_finance,
+        "mrp": _registered_router_mrp,
+        "suppliers": _registered_router_suppliers,
+        "shipment_records": _registered_router_shipment_records,
+        "shipment_orders": _registered_router_shipment_orders,
+        "business_event": _registered_router_business_event,
+        "system_maintenance": _registered_router_system_maintenance,
+        "business_docking": _registered_router_business_docking_family,
+        "template_extract": _registered_router_business_docking_family,
+        "excel_analyzer": _registered_router_excel_analyzer,
+        "excel_toolkit": _registered_router_excel_toolkit,
+        "label_template_generator": _registered_router_label_template_generator,
+        "document_template": _registered_router_document_template,
+        "template_preview": _registered_router_template_preview,
+        "print": _registered_router_print,
+        "printer_list": _registered_router_printer_list,
+        "settings": _registered_router_settings,
+        "desktop_automation": _registered_router_desktop_automation,
+        "employee": _registered_router_employee,
+        "business_db": _registered_router_business_db,
+        "dataset_rag": _registered_router_dataset_rag,
+        "memory_v2": _registered_router_memory_v2,
+        "excel_analysis": _registered_router_excel_analysis,
+        "generate_office_document": _registered_router_generate_office_document,
+        "excel_vector_index": _registered_router_excel_vector_index,
+        "ocr": _registered_router_ocr,
+        "excel_import": _registered_router_excel_import,
+        "client_product_issue": _registered_router_client_product_issue,
+        "unit_products_import": _registered_router_unit_products_import,
+    }
+)
+
+
+def execute_registered_workflow_tool(tool_id: str, action: str, params: dict | None = None) -> dict:
+    """Legacy entry point; authorization and execution belong to the application layer."""
+    from app.application.tools.workflow_tools.dispatch import (
+        execute_registered_workflow_tool as execute,
+    )
+
+    return execute(tool_id, action, params)

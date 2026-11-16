@@ -1,0 +1,351 @@
+"""Stable chat-trace API; compose typed recording and lifecycle services here."""
+
+from __future__ import annotations
+
+import copy
+import logging
+from typing import Any
+
+from app.utils.operational_errors import RECOVERABLE_ERRORS
+
+from .budget import refresh_ai_budget_metadata
+from .run_models import AgentArtifact, AgentRun, LLMCall
+from .run_repository import AgentRunRepository, get_agent_run_repository
+from .trace_artifacts import (
+    _append_artifacts_to_final_output as _append_artifacts_to_final_output,
+)
+from .trace_artifacts import (
+    _artifact_from_excel_analysis_payload as _artifact_from_excel_analysis_payload,
+)
+from .trace_artifacts import (
+    _artifact_from_file_analysis_payload as _artifact_from_file_analysis_payload,
+)
+from .trace_artifacts import (
+    _artifact_from_generated_document_payload as _artifact_from_generated_document_payload,
+)
+from .trace_artifacts import (
+    _artifact_from_ocr_payload as _artifact_from_ocr_payload,
+)
+from .trace_artifacts import (
+    _artifact_signature as _artifact_signature,
+)
+from .trace_artifacts import (
+    _artifact_type_from_document as _artifact_type_from_document,
+)
+from .trace_artifacts import (
+    _extract_artifacts as _extract_artifacts,
+)
+from .trace_artifacts import (
+    _iter_explicit_artifact_payloads as _iter_explicit_artifact_payloads,
+)
+from .trace_artifacts import (
+    _iter_inferred_artifacts as _iter_inferred_artifacts,
+)
+from .trace_artifacts import (
+    _mime_from_document_name as _mime_from_document_name,
+)
+from .trace_artifacts import (
+    _refresh_artifact_metadata as _refresh_artifact_metadata,
+)
+from .trace_memory import (
+    _append_memory_references_to_final_output as _append_memory_references_to_final_output,
+)
+from .trace_memory import (
+    _append_memory_references_to_run as _append_memory_references_to_run,
+)
+from .trace_memory import (
+    _extract_memory_references as _extract_memory_references,
+)
+from .trace_memory import (
+    _first_list_value as _first_list_value,
+)
+from .trace_memory import (
+    _has_user_memory_marker as _has_user_memory_marker,
+)
+from .trace_memory import (
+    _iter_memory_payloads as _iter_memory_payloads,
+)
+from .trace_memory import (
+    _memory_reference_from_payload as _memory_reference_from_payload,
+)
+from .trace_memory import (
+    _memory_reference_signature as _memory_reference_signature,
+)
+from .trace_memory import (
+    _refresh_memory_metadata as _refresh_memory_metadata,
+)
+from .trace_model_usage import ModelUsageRecorder
+from .trace_model_usage import (
+    _extract_llm_calls as _extract_llm_calls,
+)
+from .trace_model_usage import (
+    _iter_llm_trace_payloads as _iter_llm_trace_payloads,
+)
+from .trace_model_usage import (
+    _llm_call_from_trace as _llm_call_from_trace,
+)
+from .trace_model_usage import (
+    _llm_call_signature as _llm_call_signature,
+)
+from .trace_model_usage import (
+    _record_llm_usage_entry as _record_llm_usage_entry,
+)
+from .trace_payloads import (
+    _MAX_TRACE_DICT_ITEMS as _MAX_TRACE_DICT_ITEMS,
+)
+from .trace_payloads import (
+    _MAX_TRACE_LIST_ITEMS as _MAX_TRACE_LIST_ITEMS,
+)
+from .trace_payloads import (
+    _MAX_TRACE_STRING_CHARS as _MAX_TRACE_STRING_CHARS,
+)
+from .trace_payloads import (
+    _attach_run_id as _attach_run_id,
+)
+from .trace_payloads import (
+    _coerce_trace_float as _coerce_trace_float,
+)
+from .trace_payloads import (
+    _coerce_trace_int as _coerce_trace_int,
+)
+from .trace_payloads import (
+    _iter_payload_dicts as _iter_payload_dicts,
+)
+from .trace_payloads import (
+    _payload_data as _payload_data,
+)
+from .trace_payloads import (
+    _payload_error_message as _payload_error_message,
+)
+from .trace_payloads import (
+    _payload_status as _payload_status,
+)
+from .trace_payloads import (
+    _resolved_user_id as _resolved_user_id,
+)
+from .trace_payloads import (
+    _trace_safe_value as _trace_safe_value,
+)
+from .trace_recording import TraceRecorder
+from .trace_retrieval import (
+    _append_retrieval_calls_to_final_output as _append_retrieval_calls_to_final_output,
+)
+from .trace_retrieval import (
+    _append_retrieval_calls_to_run as _append_retrieval_calls_to_run,
+)
+from .trace_retrieval import (
+    _extract_retrieval_calls as _extract_retrieval_calls,
+)
+from .trace_retrieval import (
+    _iter_retrieval_payloads as _iter_retrieval_payloads,
+)
+from .trace_retrieval import (
+    _refresh_retrieval_metadata as _refresh_retrieval_metadata,
+)
+from .trace_retrieval import (
+    _retrieval_call_from_payload as _retrieval_call_from_payload,
+)
+from .trace_retrieval import (
+    _retrieval_signature as _retrieval_signature,
+)
+from .trace_runs import TraceRunService
+
+logger = logging.getLogger(__name__)
+
+
+def _model_usage() -> ModelUsageRecorder:
+    return ModelUsageRecorder(_record_llm_usage_entry, refresh_ai_budget_metadata)
+
+
+def _recording() -> TraceRecorder:
+    return TraceRecorder(_model_usage())
+
+
+def _run_service(repository: AgentRunRepository | None = None) -> TraceRunService:
+    return TraceRunService(
+        repository if repository is not None else get_agent_run_repository(),
+        _recording(),
+    )
+
+
+def _refresh_ai_cost_metadata(run: AgentRun) -> None:
+    _model_usage().refresh_cost(run)
+
+
+def _refresh_llm_metadata(run: AgentRun) -> None:
+    _model_usage().refresh(run)
+
+
+def _append_llm_calls_to_run(run: AgentRun, calls: list[LLMCall]) -> None:
+    _model_usage().append(run, calls)
+
+
+def _append_llm_calls_to_final_output(run: AgentRun) -> None:
+    _model_usage().finalize(run)
+
+
+def _append_artifacts_to_run(run: AgentRun, artifacts: list[AgentArtifact]) -> None:
+    _recording().append_artifacts(run, artifacts)
+
+
+def create_chat_trace_run(
+    payload: dict[str, Any],
+    *,
+    message: str,
+    runtime_context: dict[str, Any] | None = None,
+    user_id: str | None = None,
+    source: str | None = None,
+    channel: str = "compat_chat",
+    intent: str = "chat_reply",
+) -> AgentRun:
+    from app.application.network_stability import emit_current_lane
+
+    emit_current_lane("chat")
+    return _run_service().create(
+        payload,
+        message=message,
+        runtime_context=runtime_context,
+        user_id=user_id,
+        source=source,
+        channel=channel,
+        intent=intent,
+    )
+
+
+def attach_chat_trace_run(
+    payload: dict[str, Any],
+    *,
+    message: str,
+    runtime_context: dict[str, Any] | None = None,
+    user_id: str | None = None,
+    source: str | None = None,
+    channel: str = "compat_chat",
+    intent: str = "chat_reply",
+) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return payload
+    data = payload.get("data")
+    if isinstance(data, dict) and (data.get("run_id") or data.get("agent_run_id")):
+        return payload
+    if payload.get("run_id") or payload.get("agent_run_id"):
+        return payload
+    try:
+        run = create_chat_trace_run(
+            payload,
+            message=message,
+            runtime_context=runtime_context,
+            user_id=user_id,
+            source=source,
+            channel=channel,
+            intent=intent,
+        )
+    except RECOVERABLE_ERRORS:
+        logger.exception("failed to attach AgentRun trace to chat response")
+        return payload
+    from app.application.agent_orchestrator.business_harness import guard_unexecuted_payload
+
+    if run.error == "unplanned_tool_call_rejected":
+        # The trace service rejected and replaced this response. Do not return
+        # the original model payload after persisting a failed run.
+        payload = copy.deepcopy(run.final_output["chat_payload"])
+    return _attach_run_id(guard_unexecuted_payload(run, payload), run.run_id)
+
+
+def mark_chat_stream_interrupted(expected: AgentRun, *, pending: bool, reason: str) -> None:
+    """Record lost observation using the original owner/generation, never settle tools."""
+    import copy
+
+    from app.application.agent_orchestrator.run_sql_repository import same_run_generation
+
+    repository = get_agent_run_repository()
+    for _attempt in range(8):
+        previous = repository.get(expected.run_id)
+        if previous is None or previous.status not in {
+            "queued",
+            "planning",
+            "running",
+            "retrying",
+            "blocked",
+            "cancelled",
+            "paused",
+        }:
+            return
+        if not same_run_generation(previous, expected):
+            return
+        if (
+            previous.status in {"cancelled", "paused"}
+            and (previous.metadata.get("control") or {}).get("state") != previous.status
+        ):
+            return
+        existing = previous.metadata.get("stream_interruption")
+        if previous.status == "blocked" and not existing:
+            return
+        if existing and existing.get("worker_pending") is False:
+            pending = False
+        state = {
+            "reason": reason,
+            "worker_pending": pending,
+            "business_outcome": "unknown",
+            "replay_allowed": False,
+        }
+        recovery = previous.metadata.get("recovery")
+        recovery = recovery if isinstance(recovery, dict) else {}
+        if (
+            existing == state
+            and previous.metadata.get("non_retryable") is True
+            and recovery.get("state") == "manual_reconciliation_required"
+        ):
+            return
+        run = copy.deepcopy(previous)
+        run.metadata["stream_interruption"] = state
+        # Reuse the server-side retry/resume/recovery gate, not only a UI hint.
+        run.metadata["non_retryable"] = True
+        run.metadata["recovery"] = {
+            **recovery,
+            "state": "manual_reconciliation_required",
+            "stream_interruption": state,
+        }
+        run.final_output["stream_interruption"] = state
+        if previous.status not in {"cancelled", "paused"}:
+            run.status = "running" if pending else "blocked"
+        message = (
+            "对话观察已中断，后台工作尚未结束；请核对任务结果，勿重复提交。"
+            if pending
+            else "对话观察已中断，执行线程已退出但业务结果未确认；请核对任务与账本，勿重复提交。"
+        )
+        run.add_event("run.observation_interrupted", message, state)
+        if repository.save_stream_interruption_if_unchanged(run, previous):
+            return
+    raise RuntimeError("agent run changed repeatedly while recording stream interruption")
+
+
+def record_legacy_stream_tool_receipt(
+    expected: AgentRun, *, sequence: int, record: dict[str, Any]
+) -> None:
+    """Append bounded evidence only: no execution, billing, enrichment or finalization."""
+    import copy
+
+    from app.application.agent_orchestrator.run_sql_repository import same_run_generation
+
+    repository = get_agent_run_repository()
+    entry = {"sequence": sequence, "record": _trace_safe_value(record)}
+    for _attempt in range(8):
+        previous = repository.get(expected.run_id)
+        if previous is None or not same_run_generation(previous, expected):
+            raise ValueError("stream tool receipt owner or generation changed")
+        audit = previous.metadata.get("stream_tool_audit") or []
+        matched = next((item for item in audit if item.get("sequence") == sequence), None)
+        if matched is not None:
+            if matched != entry:
+                raise ValueError("stream tool receipt sequence already has different evidence")
+            return
+        run = copy.deepcopy(previous)
+        run.metadata["stream_tool_audit"] = [*audit, entry]
+        run.add_event(
+            "tool.receipt_observed",
+            "已保存工具返回回执；不代表整项任务完成或重新结算",
+            {"sequence": sequence},
+        )
+        if repository.save_stream_tool_audit_if_unchanged(run, previous):
+            return
+    raise RuntimeError("agent run changed repeatedly while recording tool receipt")

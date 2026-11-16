@@ -1,0 +1,185 @@
+{
+  "id": "daily-orchestrator",
+  "name": "每日编排员",
+  "version": "1.1.0",
+  "author": "admin",
+  "description": "每日编排员工包：direct-python 子能力只读排序工作项；真实派工、分支、提交与审批仍由宿主受控链执行。",
+  "artifact": "employee_pack",
+  "scope": "global",
+  "dependencies": {
+    "xcagi": ">=1.0.0"
+  },
+  "employee": {
+    "id": "daily-orchestrator",
+    "label": "每日编排员",
+    "capabilities": [
+      {
+        "label": "skill-daily-orchestrator",
+        "description": ""
+      }
+    ]
+  },
+  "employee_config_v2": {
+    "identity": {
+      "id": "daily-orchestrator",
+      "version": "1.1.0",
+      "artifact": "employee_pack",
+      "name": "每日编排员",
+      "description": "每日编排员工包：direct-python 子能力只读排序工作项；真实派工、分支、提交与审批仍由宿主受控链执行。",
+      "owner": "admin",
+      "area": "platform-core",
+      "domain": "每日编排员工包：宿主负责分支、提交、OpsStagedChange 入队和审批链；员工包负责在注入 agent_runner 时执行任务。"
+    },
+    "perception": {
+      "type": "web_rankings"
+    },
+    "memory": {
+      "type": "session"
+    },
+    "cognition": {
+      "agent": {
+        "system_prompt": "你是 XCAGI 每日编排员。实际修复/分支/提交/待审批入队由宿主 daily_orchestrator_job 和 ctx.agent_runner 协同完成；当 agent_runner 未注入时，只能输出离线计划或明确说明缺少执行能力。不得声称已经创建分支、提交或入队，除非宿主返回了对应证据。",
+        "role": {
+          "name": "每日编排员",
+          "persona": "每日编排员工包：通过宿主注入能力执行每日修复链；无宿主能力时只做结构化说明。",
+          "tone": "professional",
+          "expertise": [
+            "skill-daily-orchestrator"
+          ]
+        },
+        "behavior_rules": [
+          "始终围绕每日编排员的职责范围处理请求。",
+          "优先使用 input 中提供的 manifest_signals / role_context / yuangon 节选作答；缺口用「待确认」标注，不要补造缺失事实。",
+          "当输入不足、工具失败或结论不确定时，明确说明原因和需要补充的信息。",
+          "输出保持结构化、可执行，避免泛泛而谈。"
+        ],
+        "few_shot_examples": [],
+        "model": {
+          "provider": "auto",
+          "model_name": "auto",
+          "temperature": 0.2,
+          "max_tokens": 4000,
+          "top_p": 0.9
+        }
+      },
+      "skills": [
+        {
+          "name": "skill-daily-orchestrator",
+          "brief": "skill-daily-orchestrator 每日编排员相关内容，输出结构化结果；真实分支/提交/审批入队由宿主 daily_orchestrator_job 完成。"
+        }
+      ]
+    },
+    "collaboration": {
+      "workflow": {
+        "workflow_id": 0,
+        "name": "每日编排员"
+      },
+      "depends_on": [
+        "test-qa-runner",
+        "dbops-engineer"
+      ]
+    },
+    "actions": {
+      "handlers": [
+        "direct_python"
+      ],
+      "direct_python": {
+        "module": "daily_orchestrator",
+        "action": "prioritize_work_items",
+        "implementation": "employee_module",
+        "execution_mode": "deterministic",
+        "read_only": true,
+        "input_schema": {
+          "type": "object",
+          "required": ["work_items"],
+          "properties": {
+            "work_items": {"type": "array", "minItems": 1}
+          }
+        },
+        "output_schema": {
+          "type": "object",
+          "required": ["ok", "status", "summary", "queue", "issues", "evidence", "read_only", "side_effects"]
+        },
+        "burn_in_fixture": {
+          "work_items": [
+            {
+              "id": "goal-health-audit",
+              "priority": "p1",
+              "risk_level": "low",
+              "blocked_by": [],
+              "acceptance": ["输出健康证据"]
+            },
+            {
+              "id": "goal-release-context",
+              "priority": "p2",
+              "risk_level": "medium",
+              "blocked_by": ["goal-health-audit"],
+              "acceptance": ["只生成发布上下文"]
+            }
+          ]
+        }
+      }
+    },
+    "metadata": {
+      "framework_version": "2.0.0",
+      "created_by": "employee_ai_scaffold",
+      "actual_behavior": {
+        "host_entrypoint": "modstore_server.daily_orchestrator_job.run_daily_orchestrator_job",
+        "employee_runtime": "backend/employees/daily_orchestrator.py",
+        "execution_contract": "employee package dispatches handlers declared in employee_config_v2.actions.handlers; only the agent handler calls ctx.agent_runner, and it fails closed when agent_runner is absent",
+        "host_responsibilities": [
+          "checkout or create daily branch",
+          "call employee_orchestrator.plan_and_dispatch",
+          "commit resulting changes",
+          "create OpsStagedChange pending approval row",
+          "optionally run low-risk auto-deploy gate"
+        ],
+        "non_goals": [
+          "employee package alone does not guarantee branch creation",
+          "employee package alone does not write OpsStagedChange",
+          "employee package alone does not bypass approval"
+        ]
+      }
+    },
+    "workspace_policy": {
+      "scope_globs": [
+        "MODstore_deploy/market/src/**",
+        "MODstore_deploy/modstore_server/**",
+        "MODstore_deploy/tests/**",
+        "MODstore_deploy/pyproject.toml"
+      ],
+      "forbidden_globs": [
+        "MODstore_deploy/modstore_server/models.py",
+        "MODstore_deploy/modstore_server/migrations/**",
+        "MODstore_deploy/alembic/**",
+        "**/*.db",
+        "MODstore_deploy/modstore_server/catalog_data/**",
+        "MODstore_deploy/modstore_server/library/**",
+        "MODstore_deploy/var/**",
+        "_local_secrets/**"
+      ]
+    }
+  },
+  "workflow_employees": [
+    {
+      "id": "daily-orchestrator",
+      "label": "每日编排员",
+      "panel_title": "每日编排员",
+      "panel_summary": "每日编排员工包；真实分支/提交/审批入队由宿主 daily_orchestrator_job 完成。",
+      "api_base_path": "employees/daily-orchestrator"
+    }
+  ],
+  "backend": {
+    "entry": "blueprints",
+    "init": "mod_init"
+  },
+  "depends_on": [
+    "test-qa-runner",
+    "dbops-engineer"
+  ],
+  "triggers": {
+    "on_error": true,
+    "on_quality_fail": true,
+    "on_coverage_miss": false
+  }
+}

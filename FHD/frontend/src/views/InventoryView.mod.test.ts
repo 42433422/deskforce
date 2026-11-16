@@ -1,0 +1,272 @@
+import { flushPromises, mount } from '@vue/test-utils'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+const { getMock, postMock, productsGetMock, downloadMock, downloadBlobMock } = vi.hoisted(() => ({
+  getMock: vi.fn(),
+  postMock: vi.fn(),
+  productsGetMock: vi.fn(),
+  downloadMock: vi.fn(),
+  downloadBlobMock: vi.fn(),
+}))
+
+vi.mock('@/api', () => ({
+  get: getMock,
+  post: postMock,
+  api: { download: downloadMock },
+}))
+
+vi.mock('@/utils', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/utils')>()),
+  downloadBlob: downloadBlobMock,
+}))
+
+vi.mock('@/api/products', () => ({
+  default: {
+    getProducts: productsGetMock,
+  },
+}))
+
+vi.mock('@/utils/appDialog', () => ({
+  appAlert: vi.fn(),
+}))
+
+import InventoryView from '../../../mods/bridge/xcagi-erp-domain-bridge/frontend/views/InventoryView.vue'
+
+describe('ERP domain bridge InventoryView', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    downloadMock.mockReset()
+    productsGetMock.mockResolvedValue({
+      success: true,
+      data: [{ id: 7, name: 'A 产品', model_number: 'A-001' }],
+    })
+    getMock.mockImplementation((path: string) => {
+      if (path === '/api/inventory/warehouses') {
+        return Promise.resolve({ success: true, data: [{ id: 3, name: '主仓' }] })
+      }
+      return Promise.resolve({ success: true, data: [], total: 0 })
+    })
+  })
+
+  it('loads products from the ERP product SSOT for the stock-in form', async () => {
+    const wrapper = mount(InventoryView)
+    await flushPromises()
+
+    await wrapper.get('button.btn-primary').trigger('click')
+
+    expect(productsGetMock).toHaveBeenCalledWith({ page: 1, per_page: 1000 })
+    expect(wrapper.text()).toContain('A 产品 - A-001')
+    expect(wrapper.text()).toContain('主仓')
+  })
+
+  it('exports all filtered rows with progress and preserves the active filters', async () => {
+    let resolveDownload!: (response: Response) => void
+    downloadMock.mockReturnValue(
+      new Promise<Response>((resolve) => {
+        resolveDownload = resolve
+      }),
+    )
+    const wrapper = mount(InventoryView)
+    await flushPromises()
+    await wrapper.get('.search-box select').setValue('3')
+    await wrapper.get('.search-box input').setValue('涂料')
+    await flushPromises()
+
+    await wrapper.get('[data-testid="inventory-export"]').trigger('click')
+    expect(wrapper.get('[data-testid="inventory-export"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.text()).toContain('正在生成')
+    expect(downloadMock).toHaveBeenCalledWith('/api/inventory/export.xlsx', { warehouse_id: '3', keyword: '涂料' }, { timeoutMs: 60000 })
+    resolveDownload(
+      new Response('excel-bytes', {
+        headers: {
+          'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          'Content-Disposition': "attachment; filename*=UTF-8''%E5%BA%93%E5%AD%98%E6%98%8E%E7%BB%86.xlsx",
+          'X-Inventory-Row-Count': '60',
+        },
+      }),
+    )
+    await flushPromises()
+
+    expect(downloadBlobMock).toHaveBeenCalledWith(expect.objectContaining({ size: 11 }), '库存明细.xlsx')
+    expect(wrapper.text()).toContain('60 条库存明细')
+    expect(wrapper.text()).toContain('已发起下载')
+    expect(wrapper.get('[data-testid="inventory-export"]').attributes('disabled')).toBeUndefined()
+    expect((wrapper.get('.search-box select').element as HTMLSelectElement).value).toBe('3')
+    expect((wrapper.get('.search-box input').element as HTMLInputElement).value).toBe('涂料')
+  })
+
+  it('exports CSV with the same filters and blocks concurrent Excel downloads', async () => {
+    let finish!: (response: Response) => void
+    downloadMock.mockReturnValue(new Promise<Response>(resolve => { finish = resolve }))
+    const wrapper = mount(InventoryView)
+    await flushPromises()
+    await wrapper.get('.search-box select').setValue('3')
+    await wrapper.get('.search-box input').setValue('涂料')
+    await flushPromises()
+    await wrapper.get('[data-testid="inventory-export-csv"]').trigger('click')
+    expect(downloadMock).toHaveBeenCalledWith('/api/inventory/export.csv', { warehouse_id: '3', keyword: '涂料' }, { timeoutMs: 60000 })
+    for (const id of ['inventory-export', 'inventory-export-csv']) {
+      expect(wrapper.get(`[data-testid="${id}"]`).attributes('disabled')).toBeDefined()
+      await wrapper.get(`[data-testid="${id}"]`).trigger('click')
+    }
+    expect(downloadMock).toHaveBeenCalledTimes(1)
+    const csv = '\ufeff产品名称,数量\r\n涂料,1.25'
+    finish(new Response(csv, { headers: {
+      'Content-Type': 'text/csv; charset=utf-8', 'X-Inventory-Row-Count': '1',
+    } }))
+    await flushPromises()
+    // Response.blob() and jsdom may use different Blob constructors; verify the download bytes.
+    expect(downloadBlobMock).toHaveBeenCalledTimes(1)
+    const [blob, filename] = downloadBlobMock.mock.calls[0] as [Blob, string]
+    expect(filename).toBe('库存明细.csv')
+    expect(blob.type).toBe('text/csv;charset=utf-8')
+    const bytes = await (blob.arrayBuffer?.() ?? new Promise<ArrayBuffer>((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onload = () => resolve(reader.result as ArrayBuffer)
+      reader.onerror = () => reject(reader.error)
+      reader.readAsArrayBuffer(blob)
+    }))
+    expect(Array.from(new Uint8Array(bytes))).toEqual(Array.from(new TextEncoder().encode(csv)))
+    expect(wrapper.text()).toContain('1 条库存明细')
+    for (const id of ['inventory-export', 'inventory-export-csv'])
+      expect(wrapper.get(`[data-testid="${id}"]`).attributes('disabled')).toBeUndefined()
+    expect((wrapper.get('.search-box input').element as HTMLInputElement).value).toBe('涂料')
+  })
+
+  it.each([
+    ['text/html', 'login', '有效的库存 CSV'],
+    ['application/text/csv-evil', 'data', '有效的库存 CSV'],
+    ['text/csv', '', '文件为空'],
+  ])('CSV rejects invalid download (%s)', async (mime, content, message) => {
+    downloadMock.mockResolvedValue(new Response(content, { headers: { 'Content-Type': mime } }))
+    const wrapper = mount(InventoryView)
+    await flushPromises()
+    await wrapper.get('[data-testid="inventory-export-csv"]').trigger('click')
+    await flushPromises()
+    expect(downloadBlobMock).not.toHaveBeenCalled()
+    expect(wrapper.get('[role="alert"]').text()).toContain(message)
+    expect(wrapper.get('[data-testid="inventory-export-csv"]').attributes('disabled')).toBeUndefined()
+    expect(wrapper.get('[data-testid="inventory-export"]').attributes('disabled')).toBeUndefined()
+  })
+
+  it.each(['当前筛选条件下没有库存数据可导出。', '库存导出最多支持 50,000 条，请缩小筛选范围。', '连接失败，请稍后重试。'])(
+    'does not download on an export failure: %s',
+    async (message) => {
+      downloadMock.mockRejectedValue(new Error(message))
+      const wrapper = mount(InventoryView)
+      await flushPromises()
+      await wrapper.get('[data-testid="inventory-export"]').trigger('click')
+      await flushPromises()
+      expect(downloadBlobMock).not.toHaveBeenCalled()
+      expect(wrapper.get('[role="alert"]').text()).toContain(message)
+      expect(wrapper.get('[data-testid="inventory-export"]').attributes('disabled')).toBeUndefined()
+    },
+  )
+
+  it('rejects a successful HTTP response containing an error page instead of Excel', async () => {
+    downloadMock.mockResolvedValue(new Response('login required', { headers: { 'Content-Type': 'text/html' } }))
+    const wrapper = mount(InventoryView)
+    await flushPromises()
+    await wrapper.get('[data-testid="inventory-export"]').trigger('click')
+    await flushPromises()
+    expect(downloadBlobMock).not.toHaveBeenCalled()
+    expect(wrapper.get('[role="alert"]').text()).toContain('有效的库存 Excel')
+  })
+
+  it('does not download an empty file even when the server sends an Excel content type', async () => {
+    downloadMock.mockResolvedValue(
+      new Response('', { headers: { 'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' } }),
+    )
+    const wrapper = mount(InventoryView)
+    await flushPromises()
+    await wrapper.get('[data-testid="inventory-export"]').trigger('click')
+    await flushPromises()
+    expect(downloadBlobMock).not.toHaveBeenCalled()
+    expect(wrapper.get('[role="alert"]').text()).toContain('文件为空')
+  })
+
+  it('resets pagination when filters change and sends the keyword to the server', async () => {
+    getMock.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === '/api/inventory'
+          ? { success: true, data: [{ id: 1, product_name: '库存', quantity: 1, available_quantity: 1 }], total: 60 }
+          : { success: true, data: [] },
+      ),
+    )
+    const wrapper = mount(InventoryView)
+    await flushPromises()
+    await wrapper.get('.pagination button:last-child').trigger('click')
+    await flushPromises()
+    expect(getMock).toHaveBeenCalledWith('/api/inventory', { page: 2, per_page: 50 })
+    await wrapper.get('.search-box input').setValue(' SKU-003 ')
+    await flushPromises()
+    expect(getMock).toHaveBeenLastCalledWith('/api/inventory', { page: 1, per_page: 50, keyword: 'SKU-003' })
+    expect((wrapper.get('.search-box input').element as HTMLInputElement).value).toBe(' SKU-003 ')
+  })
+
+  it('keeps the newest search result if an older request completes later', async () => {
+    let resolveOlder!: (result: unknown) => void
+    getMock.mockImplementation((path: string, params?: { keyword?: string }) => {
+      if (path !== '/api/inventory') return Promise.resolve({ success: true, data: [] })
+      if (params?.keyword === '旧')
+        return new Promise((resolve) => {
+          resolveOlder = resolve
+        })
+      if (params?.keyword === '新') return Promise.resolve({ success: true, data: [{ id: 2, product_name: '新库存结果' }], total: 1 })
+      return Promise.resolve({ success: true, data: [], total: 0 })
+    })
+    const wrapper = mount(InventoryView)
+    await flushPromises()
+    await wrapper.get('.search-box input').setValue('旧')
+    await wrapper.get('.search-box input').setValue('新')
+    await flushPromises()
+    resolveOlder({ success: true, data: [{ id: 1, product_name: '旧库存结果' }], total: 1 })
+    await flushPromises()
+    expect(wrapper.text()).toContain('新库存结果')
+    expect(wrapper.text()).not.toContain('旧库存结果')
+  })
+
+  it('shows a warehouse setup guide when no active warehouse exists and initializes one on click', async () => {
+    let warehouseRows: Array<Record<string, unknown>> = [{ id: 9, name: '旧仓', status: 'deleted' }]
+    getMock.mockImplementation((path: string) => {
+      if (path === '/api/inventory/warehouses') return Promise.resolve({ success: true, data: warehouseRows })
+      return Promise.resolve({ success: true, data: [], total: 0 })
+    })
+    postMock.mockImplementation(async (path: string) => {
+      expect(path).toBe('/api/inventory/setup/warehouse')
+      warehouseRows = [...warehouseRows, { id: 11, name: '默认仓库', status: 'active' }]
+      return { success: true, data: { id: 11, name: '默认仓库', created: true }, message: '已创建默认仓库，请先入库再销售发货' }
+    })
+    const wrapper = mount(InventoryView)
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="warehouse-setup-guide"]').exists()).toBe(true)
+    expect(wrapper.text()).not.toContain('旧仓')
+    await wrapper.get('[data-testid="warehouse-setup-init"]').trigger('click')
+    await flushPromises()
+
+    expect(postMock).toHaveBeenCalledTimes(1)
+    expect(wrapper.find('[data-testid="warehouse-setup-guide"]').exists()).toBe(false)
+    expect(wrapper.text()).toContain('默认仓库')
+    expect((wrapper.get('.search-box select').element as HTMLSelectElement).value).toBe('11')
+  })
+
+  it('keeps the guide and shows the server error when initialization is refused', async () => {
+    getMock.mockImplementation((path: string) =>
+      Promise.resolve(path === '/api/inventory/warehouses' ? { success: true, data: [] } : { success: true, data: [], total: 0 }),
+    )
+    postMock.mockRejectedValue(new Error('权限不足'))
+    const wrapper = mount(InventoryView)
+    await flushPromises()
+    await wrapper.get('[data-testid="warehouse-setup-init"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('[data-testid="warehouse-setup-guide"]').exists()).toBe(true)
+    expect(wrapper.get('[data-testid="warehouse-setup-guide"] [role="alert"]').text()).toContain('权限不足')
+  })
+
+  it('does not show the setup guide when an active warehouse exists', async () => {
+    const wrapper = mount(InventoryView)
+    await flushPromises()
+    expect(wrapper.find('[data-testid="warehouse-setup-guide"]').exists()).toBe(false)
+  })
+})

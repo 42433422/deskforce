@@ -1,0 +1,296 @@
+"""Client for the remote MODstore public catalog."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+from pathlib import Path
+from typing import Any, AsyncIterator
+from urllib.parse import urlparse
+
+import httpx
+from fastapi import HTTPException
+
+from app.infrastructure.topology import LLM_V1_BASE_URL, MARKET_CATALOG_URL
+from app.utils.http_tls import shared_ssl_context
+from app.utils.operational_errors import RECOVERABLE_ERRORS
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_CATALOG_BASE_URL = LLM_V1_BASE_URL
+DEFAULT_MARKET_CATALOG_URL = MARKET_CATALOG_URL
+
+
+def catalog_base_url() -> str:
+    """Return the configured public catalog base URL without a trailing slash."""
+    raw = os.environ.get("XCAGI_CATALOG_BASE_URL", DEFAULT_CATALOG_BASE_URL)
+    base = (raw or DEFAULT_CATALOG_BASE_URL).strip().rstrip("/")
+    return base or DEFAULT_CATALOG_BASE_URL
+
+
+def market_catalog_list_url() -> str:
+    """与 SUNBIRD 市场「全部商品」同一列表 API。"""
+    explicit = (os.environ.get("XCAGI_MARKET_CATALOG_URL") or "").strip().rstrip("/")
+    if explicit:
+        return explicit
+    parsed = urlparse(catalog_base_url())
+    if parsed.scheme and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}/api/market/catalog"
+    return DEFAULT_MARKET_CATALOG_URL
+
+
+def _use_market_catalog() -> bool:
+    raw = (os.environ.get("XCAGI_CATALOG_USE_MARKET") or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _catalog_headers() -> dict[str, str]:
+    token = (os.environ.get("XCAGI_CATALOG_TOKEN") or "").strip()
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def _catalog_origin_url() -> str:
+    parsed = urlparse(catalog_base_url())
+    if parsed.scheme and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}"
+    return catalog_base_url()
+
+
+def _catalog_url(path: str) -> str:
+    parsed = urlparse(path)
+    if parsed.scheme in {"http", "https"}:
+        return path
+    clean = path if path.startswith("/") else f"/{path}"
+    if clean.startswith("/v1/"):
+        clean = clean[3:]
+    if clean.startswith("/api/"):
+        return f"{_catalog_origin_url()}{clean}"
+    return f"{catalog_base_url()}{clean}"
+
+
+async def _http_get_json(
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """GET 远端 catalog JSON。远端 5xx/SSL 握手超时短退避重试，4xx 直接抛。"""
+    max_attempts = 3
+    # 精细化超时：连接 5s（避免 SSL 握手卡 60s）、读取 15s、写入 5s、连接池 5s
+    timeout = httpx.Timeout(5.0, read=15.0, write=5.0, connect=5.0)
+    for attempt in range(1, max_attempts + 1):
+        try:
+            # 目录服务是服务端到服务端的直连，不能让桌面系统代理（尤其是
+            # 失效的 PAC/HTTP_PROXY）把请求带偏成 TLS/DNS/超时假故障。
+            async with httpx.AsyncClient(
+                timeout=timeout, verify=shared_ssl_context(), trust_env=False
+            ) as client:
+                request_headers = _catalog_headers()
+                if headers:
+                    request_headers.update(headers)
+                resp = await client.get(url, headers=request_headers)
+        except httpx.RequestError as exc:
+            # 网络层错误（含 SSL 握手超时）：最后一次直接抛，中间次退避后重试
+            if attempt == max_attempts:
+                raise HTTPException(status_code=502, detail=f"远端 Catalog 不可达：{exc}") from exc
+            logger.warning(
+                "catalog request failed (attempt %s/%s): %s; retrying", attempt, max_attempts, exc
+            )
+            await asyncio.sleep(0.8 * attempt)
+            continue
+        if resp.status_code < 400:
+            break
+        # 4xx 不重试（客户端错误，重试无意义）；5xx 退避后重试
+        if resp.status_code < 500 or attempt == max_attempts:
+            raise HTTPException(
+                status_code=502,
+                detail=f"远端 Catalog 返回 {resp.status_code}: {resp.text[:300]}",
+            )
+        logger.warning(
+            "远端 Catalog 返回 %s (attempt %s/%s); retrying after backoff",
+            resp.status_code,
+            attempt,
+            max_attempts,
+        )
+        await asyncio.sleep(0.8 * attempt)
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="远端 Catalog 返回的不是 JSON") from exc
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=502, detail="远端 Catalog JSON 根节点不是对象")
+    return data
+
+
+async def catalog_get_json(
+    path: str,
+    *,
+    headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """GET a JSON document from the remote catalog, optionally with account auth."""
+    return await _http_get_json(_catalog_url(path), headers=headers)
+
+
+def _market_item_to_package_row(item: dict[str, Any]) -> dict[str, Any] | None:
+    pid = str(item.get("pkg_id") or "").strip()
+    if not pid:
+        return None
+    ver = str(item.get("version") or "1.0.0").strip() or "1.0.0"
+    price = float(item.get("price") or 0)
+    return {
+        "id": pid,
+        "pkg_id": pid,
+        "name": item.get("name") or pid,
+        "version": ver,
+        "description": str(item.get("description") or "").strip(),
+        "artifact": item.get("artifact") or "employee_pack",
+        "author": item.get("author") or item.get("publisher"),
+        "download_url": f"/v1/packages/{pid}/{ver}/download",
+        "public_listing": True,
+        "download_count": int(item.get("download_count") or item.get("total_downloads") or 0),
+        "total_downloads": int(item.get("total_downloads") or item.get("download_count") or 0),
+        "avg_rating": float(item.get("avg_rating") or 0.0),
+        "rating_count": int(item.get("rating_count") or 0),
+        "created_at": item.get("created_at") or item.get("updated_at"),
+        "commerce": {
+            "mode": "free" if price <= 0 else "paid",
+            "price": price,
+            "collection": item.get("collection"),
+        },
+        "license": item.get("license"),
+        "material_category": item.get("material_category"),
+        "industry": item.get("industry"),
+    }
+
+
+market_item_to_package_row = _market_item_to_package_row
+
+
+async def fetch_market_catalog_page(
+    *,
+    q: str | None = None,
+    collection: str | None = None,
+    artifact: str | None = None,
+    material_category: str | None = None,
+    license_scope: str | None = None,
+    industry: str | None = None,
+    security_level: str | None = None,
+    limit: int = 80,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """分页拉取与市场 AiStore 一致的 /api/market/catalog 列表。"""
+    from urllib.parse import quote
+
+    base = market_catalog_list_url()
+    params: list[str] = [f"limit={max(1, min(limit, 200))}", f"offset={max(0, offset)}"]
+    if q:
+        params.append(f"q={quote(q.strip(), safe='')}")
+    if collection:
+        params.append(f"collection={quote(collection.strip(), safe='')}")
+    if artifact:
+        params.append(f"artifact={quote(artifact.strip(), safe='')}")
+    if material_category:
+        params.append(f"material_category={quote(material_category.strip(), safe='')}")
+    if license_scope:
+        params.append(f"license_scope={quote(license_scope.strip(), safe='')}")
+    if industry:
+        params.append(f"industry={quote(industry.strip(), safe='')}")
+    if security_level:
+        params.append(f"security_level={quote(security_level.strip(), safe='')}")
+    sep = "&" if "?" in base else "?"
+    url = f"{base}{sep}{'&'.join(params)}"
+    return await _http_get_json(url)
+
+
+async def _fetch_market_catalog_rows() -> list[dict[str, Any]]:
+    """拉取与市场页一致的已上架商品（分页合并）。"""
+    base = market_catalog_list_url()
+    out: list[dict[str, Any]] = []
+    offset = 0
+    limit = 200
+    total = None
+    while True:
+        sep = "&" if "?" in base else "?"
+        url = f"{base}{sep}limit={limit}&offset={offset}"
+        data = await _http_get_json(url)
+        items = data.get("items")
+        if not isinstance(items, list):
+            raise HTTPException(status_code=502, detail="市场 Catalog items 字段不是数组")
+        if total is None:
+            try:
+                total = int(data.get("total") or 0)
+            except (TypeError, ValueError):
+                total = len(items)
+        for raw in items:
+            if not isinstance(raw, dict):
+                continue
+            row = _market_item_to_package_row(raw)
+            if row:
+                out.append(row)
+        offset += len(items)
+        if not items or offset >= (total or 0):
+            break
+        if offset > 2000:
+            logger.warning("market catalog pagination stopped at offset=%s", offset)
+            break
+    return out
+
+
+async def catalog_download_to(
+    path: str,
+    dest: Path,
+    *,
+    headers: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Stream a catalog artifact into ``dest`` and retain its delivery headers."""
+    url = _catalog_url(path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    request_headers = _catalog_headers()
+    if headers:
+        request_headers.update(headers)
+    try:
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+            async with client.stream("GET", url, headers=request_headers) as resp:
+                if resp.status_code >= 400:
+                    text = await resp.aread()
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"远端 Mod 包下载失败 {resp.status_code}: {text[:300].decode('utf-8', 'ignore')}",
+                    )
+                with dest.open("wb") as fh:
+                    async for chunk in resp.aiter_bytes():
+                        if chunk:
+                            fh.write(chunk)
+                return dict(resp.headers)
+    except HTTPException:
+        raise
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"远端 Mod 包下载不可达：{exc}") from exc
+
+
+async def iter_catalog_packages() -> AsyncIterator[dict[str, Any]]:
+    """Yield 可安装包：默认与 SUNBIRD 市场同源（/api/market/catalog），失败时回退过滤后的 index.json。"""
+    from app.domain.shared_services.catalog_visibility import is_public_catalog_row
+
+    if _use_market_catalog():
+        try:
+            rows = await _fetch_market_catalog_rows()
+            if rows:
+                for row in rows:
+                    if is_public_catalog_row(row):
+                        yield row
+                return
+        except HTTPException:
+            logger.warning(
+                "market catalog unavailable, falling back to /v1/index.json", exc_info=True
+            )
+        except RECOVERABLE_ERRORS as exc:
+            logger.warning("market catalog failed: %s; fallback to index.json", exc)
+
+    data = await catalog_get_json("/index.json")
+    packages = data.get("packages") or []
+    if not isinstance(packages, list):
+        raise HTTPException(status_code=502, detail="远端 Mod Catalog packages 字段不是数组")
+    for row in packages:
+        if isinstance(row, dict) and is_public_catalog_row(row):
+            yield row

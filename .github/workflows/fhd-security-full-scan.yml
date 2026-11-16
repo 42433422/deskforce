@@ -1,0 +1,248 @@
+# CI SSOT: generated from FHD/.github/workflows/security-full-scan.yml — DO NOT edit here.
+# Edit that source, then run: python scripts/dev/publish_ci_workflows_to_root.py
+name: Security full release scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_sha:
+        description: "Exact 40-character release SHA; scan its complete ancestor history"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  security-events: read
+  actions: read
+
+jobs:
+  scan-and-gate:
+    name: security-release-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Lock scan checkout to exact SHA
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${{ inputs.release_sha }}"
+          test "$(git rev-parse --is-shallow-repository)" = false
+          mkdir -p "${RUNNER_TEMP}/security-native" "${RUNNER_TEMP}/security-reports"
+
+      - name: Export open and manually dismissed CodeQL and Dependabot alerts
+        continue-on-error: true
+        env:
+          # GITHUB_TOKEN cannot read Dependabot alerts in this repository.
+          # The existing CI token is read-only here and keeps the scanner from
+          # silently treating an HTTP 403 envelope as a zero-alert report.
+          GH_TOKEN: ${{ secrets.CI_COMMIT_TOKEN || github.token }}
+        run: |
+          set +e
+          for state in open dismissed; do
+            gh api --paginate --slurp \
+              "repos/${GITHUB_REPOSITORY}/code-scanning/alerts?state=${state}&per_page=100" \
+              > "${RUNNER_TEMP}/security-native/codeql-${state}.json"
+            gh api --paginate --slurp \
+              "repos/${GITHUB_REPOSITORY}/dependabot/alerts?state=${state}&per_page=100" \
+              > "${RUNNER_TEMP}/security-native/dependabot-${state}.json"
+          done
+          gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/code-scanning/analyses?ref=refs/heads/main&tool_name=CodeQL&per_page=100" \
+            > "${RUNNER_TEMP}/security-native/codeql-analyses.json"
+          jq -s '[.[][][]]' \
+            "${RUNNER_TEMP}/security-native/codeql-open.json" \
+            "${RUNNER_TEMP}/security-native/codeql-dismissed.json" \
+            > "${RUNNER_TEMP}/security-native/codeql.json"
+          jq -s '[.[][][]]' \
+            "${RUNNER_TEMP}/security-native/dependabot-open.json" \
+            "${RUNNER_TEMP}/security-native/dependabot-dismissed.json" \
+            > "${RUNNER_TEMP}/security-native/dependabot.json"
+
+      - name: Run gitleaks without hiding findings
+        continue-on-error: true
+        run: |
+          set +e
+          docker run --rm -v "${PWD}:/repo" zricethezav/gitleaks:latest detect \
+            --source /repo --config /repo/.github/gitleaks-config.toml \
+            --log-opts="--full-history HEAD" \
+            --report-format sarif \
+            --report-path /repo/gitleaks-release.sarif --no-banner --redact
+          test -s gitleaks-release.sarif && mv gitleaks-release.sarif "${RUNNER_TEMP}/security-native/gitleaks.sarif"
+      - name: Run Trivy filesystem scan including unfixed findings
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: json
+          output: ${{ runner.temp }}/security-native/trivy-filesystem.json
+          severity: CRITICAL,HIGH
+          ignore-unfixed: false
+          exit-code: "0"
+
+      - name: Build production admin console for image context
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          npm ci --prefix FHD/frontend
+          VITE_XCAGI_GIT_SHA="${{ inputs.release_sha }}" npm --prefix FHD/admin-console run build
+
+      - name: Build and scan final FHD production image
+        continue-on-error: true
+        working-directory: .
+        run: docker build --target production -f FHD/ops/docker/Dockerfile.fhd-api -t xcagi-release-scan:${{ inputs.release_sha }} FHD
+      - name: Scan final FHD production image
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: xcagi-release-scan:${{ inputs.release_sha }}
+          format: json
+          output: ${{ runner.temp }}/security-native/trivy-image.json
+          severity: CRITICAL,HIGH
+          ignore-unfixed: false
+          exit-code: "0"
+
+      - name: Audit locked Python dependencies
+        continue-on-error: true
+        run: |
+          set +e
+          python -m pip install --quiet pip-audit uv
+          (cd FHD && uv export --frozen --all-extras --no-dev \
+            --no-emit-project --no-emit-local --no-hashes \
+            --output-file "${RUNNER_TEMP}/fhd-production-requirements.txt")
+          pip-audit -r "${RUNNER_TEMP}/fhd-production-requirements.txt" -f json \
+            -o "${RUNNER_TEMP}/security-native/python-dependencies.json"
+
+      - name: Audit every shipped Node lockfile
+        continue-on-error: true
+        run: |
+          set +e
+          for directory in FHD/frontend FHD/desktop FHD/XCAGI \
+            "成都修茈科技有限公司/MODstore_deploy/desktop-shell" \
+            "成都修茈科技有限公司/MODstore_deploy/market"
+          do
+            safe="$(printf '%s' "$directory" | tr '/ ' '__')"
+            (cd "$directory" && npm audit --json) > "${RUNNER_TEMP}/security-native/npm-${safe}.json"
+          done
+          jq -s '.' "${RUNNER_TEMP}"/security-native/npm-*.json \
+            > "${RUNNER_TEMP}/security-native/node-dependencies.json"
+
+      - name: Run desktop prerelease Electron scan
+        continue-on-error: true
+        env:
+          ELECTRONEGATIVITY_REPORT_DIR: ${{ runner.temp }}/desktop-security
+        run: |
+          set +e
+          bash FHD/desktop/scripts/security-scan.sh --gate-severity high
+          test -s "${RUNNER_TEMP}/desktop-security/electronegativity.sarif" && \
+            cp "${RUNNER_TEMP}/desktop-security/electronegativity.sarif" \
+              "${RUNNER_TEMP}/security-native/desktop-prerelease.sarif"
+
+      - name: Scan production host packages read-only
+        continue-on-error: true
+        env:
+          HOST: ${{ vars.FHD_PUSH_HOST || '119.27.178.147' }}
+          SSH_KEY: ${{ secrets.FHD_PUSH_SSH_KEY || secrets.SERVER_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "${SSH_KEY:-}"
+          key="${RUNNER_TEMP}/production-host-scan-key"
+          printf '%s\n' "$SSH_KEY" > "$key"
+          chmod 600 "$key"
+          ssh_opts=(-i "$key" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20)
+          ssh "${ssh_opts[@]}" "root@${HOST}" 'cat /etc/os-release' \
+            > "${RUNNER_TEMP}/security-native/production-host-os-release"
+          ssh "${ssh_opts[@]}" "root@${HOST}" 'uname -r' \
+            > "${RUNNER_TEMP}/security-native/production-host-running-kernel"
+          ssh "${ssh_opts[@]}" "root@${HOST}" \
+            'dnf -q repoquery --installed --latest-limit 1 \
+             --qf "%{version}-%{release}.%{arch}" kernel-core' \
+            > "${RUNNER_TEMP}/security-native/production-host-installed-kernel"
+          ssh "${ssh_opts[@]}" "root@${HOST}" \
+            'set -euo pipefail
+             scan_dir=$(mktemp -d /tmp/xcmax-security-scan.XXXXXX)
+             trap '\''rm -rf -- "$scan_dir"'\'' EXIT
+             LC_ALL=C dnf -q --refresh \
+               --setopt=cachedir="$scan_dir/cache" \
+               --setopt=persistdir="$scan_dir/persist" \
+               --setopt=logdir="$scan_dir/log" \
+               updateinfo list --security updates' \
+            > "${RUNNER_TEMP}/security-native/production-host-updateinfo.txt"
+          python FHD/scripts/security/collect_dnf_updateinfo.py \
+            --input "${RUNNER_TEMP}/security-native/production-host-updateinfo.txt" \
+            --os-release "${RUNNER_TEMP}/security-native/production-host-os-release" \
+            --running-kernel "${RUNNER_TEMP}/security-native/production-host-running-kernel" \
+            --installed-kernel "${RUNNER_TEMP}/security-native/production-host-installed-kernel" \
+            --output "${RUNNER_TEMP}/security-native/production-host.json"
+
+      - name: Normalize all scanner reports
+        if: always()
+        continue-on-error: true
+        run: |
+          set +e
+          normalize() {
+            python FHD/scripts/security/normalize_security_report.py \
+              --scanner "$1" --kind "$2" --input "$3" \
+              --release-sha "${{ inputs.release_sha }}" \
+              --output "${RUNNER_TEMP}/security-reports/$1.json"
+          }
+          python FHD/scripts/security/normalize_security_report.py \
+            --scanner codeql --kind codeql \
+            --input "${RUNNER_TEMP}/security-native/codeql.json" \
+            --provenance-input "${RUNNER_TEMP}/security-native/codeql-analyses.json" \
+            --required-codeql-category /language:python \
+            --required-codeql-category /language:javascript-typescript \
+            --release-sha "${{ inputs.release_sha }}" \
+            --output "${RUNNER_TEMP}/security-reports/codeql.json"
+          normalize dependabot dependabot "${RUNNER_TEMP}/security-native/dependabot.json"
+          normalize trivy-filesystem trivy "${RUNNER_TEMP}/security-native/trivy-filesystem.json"
+          normalize trivy-image trivy "${RUNNER_TEMP}/security-native/trivy-image.json"
+          normalize python-dependencies pip-audit "${RUNNER_TEMP}/security-native/python-dependencies.json"
+          normalize node-dependencies npm-audit "${RUNNER_TEMP}/security-native/node-dependencies.json"
+          normalize desktop-prerelease sarif "${RUNNER_TEMP}/security-native/desktop-prerelease.sarif"
+          normalize gitleaks sarif "${RUNNER_TEMP}/security-native/gitleaks.sarif"
+          normalize credential-rotation credential-incidents ".github/security/credential-incidents.json"
+          normalize production-host dnf-updateinfo "${RUNNER_TEMP}/security-native/production-host.json"
+
+      - name: Enforce all-source zero critical/high gate
+        if: always()
+        id: release-gate
+        continue-on-error: true
+        run: >-
+          python FHD/scripts/security/security_release_gate.py
+          --reports-dir "${RUNNER_TEMP}/security-reports"
+          --release-sha "${{ inputs.release_sha }}"
+          --output "${RUNNER_TEMP}/security-release-gate.json"
+
+      - name: Upload auditable security evidence even when gate fails
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcagi-security-release-reports
+          path: ${{ runner.temp }}/security-reports/*.json
+          retention-days: 120
+          if-no-files-found: error
+
+      - name: Upload native scanner payloads and gate decision
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcagi-security-release-native
+          path: |
+            ${{ runner.temp }}/security-native/*
+            ${{ runner.temp }}/security-release-gate.json
+          retention-days: 120
+          if-no-files-found: error
+
+      - name: Keep security-release-gate fail closed
+        if: ${{ always() && steps.release-gate.outcome != 'success' }}
+        run: exit 1

@@ -1,0 +1,56 @@
+id: ecosystem-delivery-reporter
+name: 生态交付回传员
+version: 1.0.0
+domain: O-B B3 联合包交付遥测 · 里程碑回写 O-A CRM 快照 · 生态进度事件。
+owner: admin
+area: partner-ecosystem
+five_line_id: ops_partner
+subzone: delivery-bridge
+also_serves:
+- ops_acquisition
+scope_globs:
+- MODstore_deploy/modstore_server/**/production_line*
+- MODstore_deploy/modstore_server/**/operations*
+- FHD/app/**/telemetry/**
+forbidden_globs:
+- _local_secrets/**
+triggers:
+  on_error: true
+  schedule:
+    cron: 0 9 * * 1-5
+    timezone: Asia/Shanghai
+sla:
+  timeout_seconds: 120
+  retry_max: 2
+  escalate_to_human: true
+llm_default: auto
+capabilities:
+  - delivery.evidence.report
+  - partner.status.sync
+
+skills:
+  - skills/skill-ecosystem-delivery-reporter.md
+actions:
+  handlers: ["llm_md", "echo"]
+
+depends_on:
+- enterprise-adoption-officer
+- deploy-release-officer
+examples:
+  - title: "生态交付回传员岗位验收"
+    description: "以最小、无副作用输入验证岗位输出包含真实证据、风险与下一步。"
+    input:
+      task: "执行一次生态交付回传员职责范围内的只读检查，并返回证据、风险和下一步。"
+      dry_run: true
+
+changelog:
+- version: 1.0.0
+  date: '2026-06-03'
+  note: O-B B3 生态交付回传专岗
+business_context:
+  five_line: O-B
+  subzone: delivery-report
+  kpis:
+  - 交付报告准时率
+  - 客户可见状态准确率
+  summary: O-B B3 联合包交付遥测 · 里程碑回写 O-A CRM 快照 · 生态进度事件。

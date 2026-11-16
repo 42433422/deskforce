@@ -1,0 +1,134 @@
+# ============================================================================
+# XCMAX 根目录 pre-commit 配置
+# ----------------------------------------------------------------------------
+# 触发时机：git commit 之前
+# 安装方式：pip install pre-commit && pre-commit install
+# 手动跑：  pre-commit run --all-files
+# ----------------------------------------------------------------------------
+# v9.0.0 整改：archive-hygiene 钩子保证"零裸 .env / 零裸 db 提交"——任何
+# 在 _archive/ 下新增的真实 .env、login_out.json、客户数据库等敏感文件
+# 都会被 commit 阶段拦截，提示用户先跑 scripts/cleanup_archive_secrets.py。
+# ============================================================================
+repos:
+  # ----- 自定义钩子：XCAGI archive 卫生检查 -----
+  - repo: local
+    hooks:
+      - id: customer-runtime-data
+        name: Block customer runtime files and known private blobs
+        entry: python3 scripts/ci/guard_customer_data.py
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: guard-no-new-coverage-ramp
+        name: Block new test_coverage_ramp_phase* files
+        entry: python3 scripts/guard_no_new_coverage_ramp.py
+        language: system
+        types: [python]
+        files: '^FHD/tests/|^成都修茈科技有限公司/(MODstore_deploy|vibe-coding)/tests/|^packages/.*/tests/'
+        pass_filenames: true
+        stages: [pre-commit]
+      - id: guard-no-new-v2-files
+        name: Block new FHD/app/**/*_vN.py files
+        entry: python3 scripts/guard_no_new_v2_files.py
+        language: system
+        types: [python]
+        files: '^FHD/app/.*_v[0-9]+\.py$'
+        pass_filenames: true
+        stages: [pre-commit]
+      - id: alembic-single-head
+        name: Alembic 迁移链单 head 校验(无多头/无悬空 down_revision)
+        # 任一活跃 alembic 版本目录变动时，整树校验 revision 图
+        files: '^FHD/alembic/versions/.*\.py$|^成都修茈科技有限公司/MODstore_deploy/alembic/versions/.*\.py$'
+        entry: python3 scripts/guard_alembic_single_head.py
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+      - id: guard-temp-scripts
+        name: Block temporary diagnostic scripts
+        entry: python3 FHD/scripts/ci/guard_temp_scripts.py --added-from-git
+        language: system
+        files: '.*'
+        pass_filenames: true
+        stages: [pre-commit]
+      - id: xcagi-archive-hygiene
+        name: XCAGI archive hygiene (--check 模式)
+        # 仅当 _archive/ 或清理脚本本身变化时才触发，避免无谓开销
+        files: '^_archive/.*$|^scripts/cleanup_archive_secrets\.py$'
+        entry: python3 scripts/cleanup_archive_secrets.py --check
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+        # pre-commit 框架的退出码语义：非零即视为失败
+        # 我们的 --check 模式在发现未脱敏文件时已正确返回 1
+      - id: ssot-registry-sanity
+        name: SSOT registry sanity (list domains)
+        # 仅当 ssot.yaml 或 ssot_cli/插件变化时才触发，验证注册表可解析
+        files: '^FHD/config/ssot\.yaml$|^FHD/scripts/dev/ssot_cli\.py$|^FHD/scripts/dev/ssot_plugins/.*\.py$'
+        entry: python3 FHD/scripts/dev/ssot_cli.py list
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+      - id: ssot-service-topology
+        name: Service topology SSOT in sync
+        # 改 SSOT 源或派生产物时，校验 Python/TS/Dart 常量与 JSON 未漂移
+        files: '^FHD/config/service_topology\.yaml$|^FHD/scripts/dev/service_topology_ssot\.py$|^FHD/app/infrastructure/topology\.py$|^FHD/frontend/src/constants/topology\.ts$|^FHD/mobile-flutter-poc/lib/src/data/service_topology_ssot\.dart$|^FHD/config/topology\.generated\.json$'
+        entry: bash -c 'cd FHD && python3 scripts/dev/service_topology_ssot.py check'
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: ssot-duty-roster
+        name: 花名册派生件同步校验 (duty_roster.json ↔ 派生件)
+        # 改了 SSOT 或任一派生件就强制对账；漂移时本地拦截，须先跑
+        # `python scripts/dev/sync_duty_roster.py --generate` 重生再提交。
+        # 这是 main blocking SSOT gate 反复变红的两大根因之一（roster 改了不重生）。
+        files: '^FHD/config/duty_roster\.json$|^FHD/frontend/src/domain/yuangonDutyRoster\.ts$|^成都修茈科技有限公司/MODstore_deploy/market/src/domain/yuangonDutyRoster\.ts$|^FHD/frontend/src/constants/enterpriseWorkflowEstablishment\.ts$|^FHD/MODstore/modstore_server/duty_roster\.py$|^FHD/app/infrastructure/mods/catalog_visibility\.py$|^FHD/mobile-flutter-poc/lib/src/data/duty_roster_ssot\.dart$'
+        entry: python3 scripts/dev/sync_duty_roster.py --check
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: ssot-mods
+        name: Mod 导出副本同步校验 (FHD/mods ↔ XCAGI/mods)
+        # 改了 mods/ 或导出副本就强制对账；漂移（含孤儿 Mod）时本地拦截，须先跑
+        # `python FHD/scripts/dev/mods_ssot.py sync` 再提交。
+        # 另一根因：bulk-merge 丢掉 FHD/mods 的 SSOT 副本、只剩 XCAGI/mods 导出。
+        files: '^FHD/mods/|^FHD/XCAGI/mods/'
+        entry: python3 FHD/scripts/dev/mods_ssot.py check
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+
+  # ----- FHD Python 格式化 / lint：Ruff 是唯一工具（import sort 由 Ruff I 规则处理） -----
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.6
+    hooks:
+      - id: ruff
+        name: Ruff lint and import sort (FHD)
+        args: [--config=FHD/pyproject.toml, --fix]
+        files: '^FHD/(app|tests)/.*\.py$'
+      - id: ruff-format
+        name: Ruff format (FHD)
+        args: [--config=FHD/pyproject.toml]
+        files: '^FHD/(app|tests)/.*\.py$'
+
+  # ----- 类型检查 -----
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.13.0
+    hooks:
+      - id: mypy
+        additional_dependencies: [types-all]
+        args: [--config-file=FHD/pyproject.toml]
+        files: '^FHD/app/'
+
+  # ----- 通用检查：禁止提交超大文件 -----
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=2048]  # 2MB 上限，xcmod / dist 二进制应走 .gitignore
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: mixed-line-ending
+        args: [--fix=lf]

@@ -1,0 +1,389 @@
+{
+  "decisions": [
+    {
+      "action": "allow",
+      "dimension": "absorption_depth",
+      "evidence": [
+        "quality_gate_bundle",
+        "absorption_continuity_probe"
+      ],
+      "name": "run_absorption",
+      "ready": true
+    },
+    {
+      "action": "allow",
+      "dimension": "branch_absorption_workflow",
+      "evidence": [
+        "product_mainline_absorption_proof"
+      ],
+      "name": "prove_product_mainline_absorption_merge",
+      "ready": true
+    },
+    {
+      "action": "allow",
+      "dimension": "employee_execution",
+      "evidence": [
+        "employee_patch_closure"
+      ],
+      "name": "dispatch_employee_patch",
+      "ready": true
+    },
+    {
+      "action": "allow",
+      "dimension": "employee_execution",
+      "evidence": [
+        "employee_patch_stress"
+      ],
+      "name": "stress_employee_patch_rollback",
+      "ready": true
+    },
+    {
+      "action": "allow",
+      "dimension": "employee_execution",
+      "evidence": [
+        "employee_scheduler_stress"
+      ],
+      "name": "stress_employee_independent_processes",
+      "ready": true
+    },
+    {
+      "action": "allow",
+      "dimension": "product_operability",
+      "evidence": [
+        "pr_long_run_review",
+        "production_recovery_drill"
+      ],
+      "name": "publish_or_degrade_review",
+      "ready": true
+    },
+    {
+      "action": "allow",
+      "dimension": "feedback_loop_closure",
+      "evidence": [
+        "review_quality_benchmark"
+      ],
+      "name": "claim_absorbed_quality_gain",
+      "ready": true
+    },
+    {
+      "action": "allow",
+      "dimension": "comparative_analysis_depth",
+      "evidence": [
+        "external_advantage_matrix"
+      ],
+      "name": "prove_external_advantage_matrix",
+      "ready": true
+    },
+    {
+      "action": "allow",
+      "dimension": "comparative_analysis_depth",
+      "evidence": [
+        "external_advantage_ci_regression"
+      ],
+      "name": "prove_external_advantage_ci_regression",
+      "ready": true
+    },
+    {
+      "action": "allow",
+      "dimension": "comparative_analysis_depth",
+      "evidence": [
+        "external_process_adjudication"
+      ],
+      "name": "prove_external_process_adjudication",
+      "ready": true
+    },
+    {
+      "action": "allow",
+      "dimension": "comparative_analysis_depth",
+      "evidence": [
+        "external_advantage_repeat"
+      ],
+      "name": "prove_repeatable_external_advantage",
+      "ready": true
+    },
+    {
+      "action": "allow",
+      "dimension": "branch_absorption_workflow",
+      "evidence": [
+        "upstream_pr_ci_probe"
+      ],
+      "name": "prove_upstream_pr_ci",
+      "ready": true
+    },
+    {
+      "action": "allow",
+      "dimension": "comparative_analysis_depth",
+      "evidence": [
+        "competitor_runtime_comparison"
+      ],
+      "name": "prove_competitor_runtime_comparison",
+      "ready": true
+    },
+    {
+      "action": "allow",
+      "dimension": "comparative_analysis_depth",
+      "evidence": [
+        "competitor_blind_adjudication"
+      ],
+      "name": "prove_competitor_blind_adjudication",
+      "ready": true
+    },
+    {
+      "action": "allow",
+      "dimension": "capability_absorption",
+      "evidence": [
+        "competitor_behavior_regression"
+      ],
+      "name": "prove_competitor_behavior_regression",
+      "ready": true
+    },
+    {
+      "action": "allow",
+      "dimension": "comparative_analysis_depth",
+      "evidence": [
+        "paibi_cli_cross_adjudication"
+      ],
+      "name": "prove_paibi_four_cli_cross_adjudication",
+      "ready": true
+    },
+    {
+      "action": "allow",
+      "dimension": "cross_language_absorption",
+      "evidence": [
+        "heterogeneous_absorption_replay"
+      ],
+      "name": "prove_heterogeneous_absorption",
+      "ready": true
+    },
+    {
+      "action": "allow",
+      "dimension": "cross_domain_absorption",
+      "evidence": [
+        "cross_domain_absorption_replay"
+      ],
+      "name": "prove_non_pr_cross_domain_absorption",
+      "ready": true
+    },
+    {
+      "action": "allow",
+      "dimension": "cross_domain_absorption",
+      "evidence": [
+        "cross_domain_end_to_end"
+      ],
+      "name": "prove_cross_domain_end_to_end_absorption",
+      "ready": true
+    },
+    {
+      "action": "allow",
+      "dimension": "cross_domain_absorption",
+      "evidence": [
+        "cross_domain_ci_regression"
+      ],
+      "name": "prove_cross_domain_continuous_regression",
+      "ready": true
+    },
+    {
+      "action": "allow",
+      "dimension": "api_contract_quality",
+      "evidence": [
+        "contract_runtime_rehearsal"
+      ],
+      "name": "reject_contract_runtime_violations",
+      "ready": true
+    },
+    {
+      "action": "allow",
+      "dimension": "api_contract_quality",
+      "evidence": [
+        "contract_stability_stress"
+      ],
+      "name": "prove_contract_stability_under_load",
+      "ready": true
+    },
+    {
+      "action": "allow",
+      "dimension": "branch_absorption_workflow",
+      "evidence": [
+        "review_family_behavior_replay"
+      ],
+      "name": "prove_review_family_core_behavior",
+      "ready": true
+    },
+    {
+      "action": "allow",
+      "dimension": "branch_absorption_workflow",
+      "evidence": [
+        "external_merge_landing"
+      ],
+      "name": "prove_external_merge_landing",
+      "ready": true
+    },
+    {
+      "action": "allow",
+      "dimension": "blind_external_validation",
+      "evidence": [
+        "pr_holdout_blind_eval"
+      ],
+      "name": "accept_blind_holdout_quality",
+      "ready": true
+    },
+    {
+      "action": "allow",
+      "dimension": "failure_recovery_validation",
+      "evidence": [
+        "pr_failure_rollback_replay"
+      ],
+      "name": "allow_failure_rollback_replay",
+      "ready": true
+    },
+    {
+      "action": "allow",
+      "dimension": "product_operability",
+      "evidence": [
+        "operator_journey_replay"
+      ],
+      "name": "replay_operator_absorption_journey",
+      "ready": true
+    }
+  ],
+  "evidence": {
+    "source_reports": [
+      "retort_quality_gate_bundle.json",
+      "retort_absorption_continuity_probe.json",
+      "retort_pr_long_run_review.json",
+      "retort_pr_holdout_blind_eval.json",
+      "retort_pr_failure_rollback_replay.json",
+      "retort_production_recovery_drill.json",
+      "retort_product_mainline_absorption_proof.json",
+      "retort_employee_patch_closure.json",
+      "retort_employee_patch_stress.json",
+      "retort_employee_scheduler_stress.json",
+      "retort_review_quality_benchmark.json",
+      "retort_external_advantage_matrix.json",
+      "retort_external_advantage_ci_regression.json",
+      "retort_external_process_adjudication.json",
+      "retort_external_advantage_repeat.json",
+      "retort_upstream_pr_ci_probe.json",
+      "retort_competitor_runtime_comparison.json",
+      "retort_competitor_blind_adjudication.json",
+      "retort_competitor_behavior_regression.json",
+      "retort_paibi_cli_cross_adjudication.json",
+      "retort_heterogeneous_absorption_replay.json",
+      "retort_cross_domain_absorption_replay.json",
+      "retort_cross_domain_end_to_end.json",
+      "retort_cross_domain_ci_regression.json",
+      "retort_contract_runtime_rehearsal.json",
+      "retort_contract_stability_stress.json",
+      "retort_review_family_behavior_replay.json",
+      "retort_external_merge_landing.json",
+      "retort_operator_journey_replay.json"
+    ],
+    "style": "core_product_decision_gate"
+  },
+  "project": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine",
+  "status": "ready",
+  "summary": {
+    "all_core_decisions_ready": true,
+    "blocking_decision_count": 0,
+    "competitor_behavior_regression_assertions": 18,
+    "competitor_behavior_regression_cases": 3,
+    "competitor_behavior_regression_direct": true,
+    "competitor_behavior_regression_ready": true,
+    "competitor_blind_adjudication_accepted": 3,
+    "competitor_blind_adjudication_competitors": 3,
+    "competitor_blind_adjudication_imports_retort": false,
+    "competitor_blind_adjudication_min_delta": 56,
+    "competitor_blind_adjudication_ready": true,
+    "competitor_runtime_hunks": 2,
+    "competitor_runtime_live_upstream_materialized": true,
+    "competitor_runtime_live_upstream_projects": 3,
+    "competitor_runtime_live_upstream_verified": true,
+    "competitor_runtime_multi_side_by_side": true,
+    "competitor_runtime_project_count": 3,
+    "competitor_runtime_ready": true,
+    "competitor_runtime_ready_projects": 3,
+    "competitor_runtime_retort_comments": 4,
+    "contract_runtime_rehearsal_concurrent_rejected": 360,
+    "contract_runtime_rehearsal_concurrent_rollback": true,
+    "contract_runtime_rehearsal_ready": true,
+    "contract_runtime_rehearsal_rejected": 3,
+    "contract_runtime_rehearsal_rollback": true,
+    "contract_stability_stress_faults": 720,
+    "contract_stability_stress_ready": true,
+    "contract_stability_stress_state_leaks": 0,
+    "contract_stability_stress_workers": 120,
+    "core_decision_path_count": 12,
+    "cross_domain_absorption_direct_modules": 10,
+    "cross_domain_absorption_domains": 10,
+    "cross_domain_absorption_output_assertions": true,
+    "cross_domain_absorption_ready": true,
+    "cross_domain_ci_regression_ready": true,
+    "cross_domain_ci_regression_rounds": 3,
+    "cross_domain_ci_regression_total_domains": 30,
+    "cross_domain_end_to_end_domains": 10,
+    "cross_domain_end_to_end_ready": true,
+    "cross_domain_end_to_end_review_status": "reviewed",
+    "decision_count": 27,
+    "employee_patch_ready": true,
+    "employee_patch_stress_post_rollback_gates": 120,
+    "employee_patch_stress_ready": true,
+    "employee_patch_stress_rollbacks": 120,
+    "employee_patch_stress_workers": 120,
+    "employee_scheduler_stress_queued_tasks": 30,
+    "employee_scheduler_stress_ready": true,
+    "employee_scheduler_stress_unique_processes": 30,
+    "external_advantage_blind_third_party_min_delta": 80,
+    "external_advantage_blind_third_party_ready": true,
+    "external_advantage_ci_regression_cases": 6,
+    "external_advantage_ci_regression_min_delta": 80,
+    "external_advantage_ci_regression_ready": true,
+    "external_advantage_matrix_delta": 55.0,
+    "external_advantage_matrix_ready": true,
+    "external_advantage_repeat_ready": true,
+    "external_advantage_repeat_total_cases": 12,
+    "external_merge_landing_merge_commits": 10,
+    "external_merge_landing_post_merge_tests": 10,
+    "external_merge_landing_ready": true,
+    "external_process_adjudication_imports_retort": false,
+    "external_process_adjudication_min_delta": 80,
+    "external_process_adjudication_ready": true,
+    "failure_rollback_ready": true,
+    "heterogeneous_absorption_before_after": true,
+    "heterogeneous_absorption_languages": 5,
+    "heterogeneous_absorption_ready": true,
+    "holdout_blind_eval_ready": true,
+    "long_run_ready": true,
+    "operator_journey_cross_domain_ready": true,
+    "operator_journey_ready": true,
+    "paibi_cli_cross_adjudication_calibration_labels": 50,
+    "paibi_cli_cross_adjudication_calibration_pass_rate": 1.0,
+    "paibi_cli_cross_adjudication_consensus": true,
+    "paibi_cli_cross_adjudication_human_calibrated": true,
+    "paibi_cli_cross_adjudication_human_required": false,
+    "paibi_cli_cross_adjudication_human_reviewed": false,
+    "paibi_cli_cross_adjudication_no_human_model": true,
+    "paibi_cli_cross_adjudication_oracle_calibrated": true,
+    "paibi_cli_cross_adjudication_ready": true,
+    "paibi_cli_cross_adjudication_tool_count": 4,
+    "paibi_cli_cross_adjudication_tools": 4,
+    "product_mainline_absorption_behavior_sources": 11,
+    "product_mainline_absorption_behavior_tests": 6,
+    "product_mainline_absorption_merge": true,
+    "product_mainline_absorption_ready": true,
+    "quality_gate_all_passed": true,
+    "ready_decision_count": 27,
+    "recovery_ready": true,
+    "review_family_behavior_outputs": true,
+    "review_family_behavior_python_cases": 1,
+    "review_family_behavior_ready": true,
+    "review_family_behavior_typescript_cases": 2,
+    "upstream_pr_ci_all_successful": true,
+    "upstream_pr_ci_all_targets_successful": true,
+    "upstream_pr_ci_check_runs": 19,
+    "upstream_pr_ci_distinct_repos": 5,
+    "upstream_pr_ci_ready": true,
+    "upstream_pr_ci_ready_targets": 5,
+    "upstream_pr_ci_target_count": 5,
+    "upstream_pr_ci_total_check_runs": 174
+  }
+}

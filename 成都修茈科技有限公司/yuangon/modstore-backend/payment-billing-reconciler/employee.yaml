@@ -1,0 +1,72 @@
+id: payment-billing-reconciler
+name: 支付账单对账员
+version: "1.0.1"
+domain: 维护 MODstore 支付与账单模块：支付宝接口、订单管理、LLM 计费与订阅续费；对账只读为主，禁止直接写生产 DB。
+owner: admin
+area: modstore-backend
+
+scope_globs:
+  - MODstore_deploy/modstore_server/reconciliation.py
+  - MODstore_deploy/modstore_server/api/payment_routes.py
+  - MODstore_deploy/modstore_server/payment_orders.py
+  - MODstore_deploy/modstore_server/payment_common.py
+  - MODstore_deploy/modstore_server/payment_*.py
+  - MODstore_deploy/modstore_server/payment_orders/**
+  - MODstore_deploy/modstore_server/llm_billing.py
+  - MODstore_deploy/modstore_server/subscription_renewer.py
+  - MODstore_deploy/modstore_server/llm_key_resolver.py
+  - MODstore_deploy/java_payment_service/**     # Java 支付微服务
+  - alipay_package/**
+  - setup-alipay.sh
+
+forbidden_globs:
+  - _local_secrets/**           # 只读引用证书，不写
+  - MODstore_deploy/market/src/**
+  - MODstore_deploy/modstore_server/employee_*.py
+  - vibe-coding/**
+
+triggers:
+  on_error: true
+  on_quality_fail: true
+  on_coverage_miss: false
+  max_patch_budget_tokens: 4000
+  max_patch_steps: 4
+
+sla:
+  timeout_seconds: 120
+  retry_max: 2
+  escalate_to_human: true     # 支付相关必须人工确认
+
+llm_default: "auto"
+llm_reasoning: "auto"
+
+capabilities:
+  - payment.reconcile
+
+skills:
+  - skills/skill-payment-reconcile.md
+
+actions:
+  handlers: ["agent"]
+  agent:
+    workspace:
+      read_only: true
+      requires_project_root: true
+
+depends_on:
+  - security-secrets-guard
+
+examples:
+  - title: "支付账单对账员岗位验收"
+    description: "以最小、无副作用输入验证岗位输出包含真实证据、风险与下一步。"
+    input:
+      task: "执行一次支付账单对账员职责范围内的只读检查，并返回证据、风险和下一步。"
+      dry_run: true
+
+changelog:
+  - version: "1.0.1"
+    date: "2026-05-08"
+    note: "scope 纳入 reconciliation.py；对齐只读预览 API"
+  - version: "1.0.0"
+    date: "2026-05-06"
+    note: "初始创建"

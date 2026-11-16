@@ -1,0 +1,391 @@
+import asyncio
+import logging
+import os
+import time
+from typing import Any, cast
+
+from app.domain.shared_services.conversation.context import ContextMixin, ConversationContext
+from app.domain.shared_services.conversation.prompts import PromptsMixin
+from app.utils.operational_errors import RECOVERABLE_ERRORS
+
+logger = logging.getLogger(__name__)
+
+# 内存对话历史滚动上限（原硬编码 20，现为可配置）
+_DEFAULT_HISTORY_MAX = 50
+
+
+def _resolve_history_max() -> int:
+    """从环境变量 ``FHD_CONVERSATION_HISTORY_MAX`` 读取内存历史上限。
+
+    Returns:
+        历史上限（``int``，≥ 10）。无效值或未设置时返回默认 50。
+    """
+    raw = os.environ.get("FHD_CONVERSATION_HISTORY_MAX", "")
+    try:
+        value = int(raw) if raw else _DEFAULT_HISTORY_MAX
+    except (TypeError, ValueError):
+        return _DEFAULT_HISTORY_MAX
+    return max(10, value)
+
+
+class AIConversationService(ContextMixin, PromptsMixin):
+    """Model-provider configuration and context adapter for the unified chat service."""
+
+    def __init__(self):
+        self.contexts: dict[str, ConversationContext] = {}
+
+        # ========== LLM调用架构初始化（三级优先级）==========
+        self.llm_adapter = None
+        self.modstore_adapter = None
+        llm_init_mode = "none"
+
+        try:
+            # 优先级1: 平台代理模式（修茈市场统一接口）
+            from app.domain.shared_services.conversation.modstore_adapter import (
+                create_modstore_adapter_from_env,
+            )
+
+            modstore = create_modstore_adapter_from_env()
+            if modstore and modstore.is_configured:
+                self.modstore_adapter = modstore
+                llm_init_mode = "platform"
+                logger.info(
+                    "🌐 [优先级1] 启用修茈市场平台代理模式\n"
+                    "   平台地址: %s\n"
+                    "   默认模型: %s/%s\n"
+                    "   用户ID: %s\n"
+                    "   ✅ 所有LLM请求将通过平台统一路由",
+                    modstore.platform_url,
+                    modstore.default_provider,
+                    modstore.default_model,
+                    modstore.user_id,
+                )
+            else:
+                logger.debug("未检测到修茈市场平台配置，尝试直连模式...")
+
+            # 优先级2: 直连模式（OpenAI兼容适配器）
+            if not self.modstore_adapter:
+                from app.domain.shared_services.conversation.llm_adapter import (
+                    OpenAICompatibleAdapter,
+                )
+                from app.infrastructure.llm.providers.credentials import (
+                    resolve_default_chat_model,
+                    resolve_default_openai_provider,
+                    resolve_openai_env_credentials,
+                )
+
+                llm_provider = resolve_default_openai_provider()
+                llm_model = resolve_default_chat_model()
+                llm_api_key, llm_base_url = resolve_openai_env_credentials()
+
+                self.llm_adapter = OpenAICompatibleAdapter(
+                    provider=llm_provider,
+                    model=llm_model,
+                    api_key=llm_api_key,
+                    base_url=llm_base_url,
+                )
+
+                if self.llm_adapter.is_configured:
+                    llm_init_mode = "direct"
+                    logger.info(
+                        "⚡ [优先级2] 启用直连模式: %s/%s (Key已配置)",
+                        self.llm_adapter.provider_name,
+                        self.llm_adapter.model_name,
+                    )
+                else:
+                    logger.warning("⚠️ 直连适配器已创建但 [%s] API Key未配置", llm_provider)
+
+        except RECOVERABLE_ERRORS as adapter_err:
+            logger.error("❌ LLM适配器初始化失败: %s", adapter_err)
+            self.llm_adapter = None
+            self.modstore_adapter = None
+
+        # ========== 保留原有DeepSeek配置（向后兼容降级 - 优先级3）==========
+        self.api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+        if not self.api_key:
+            try:
+                from app.utils.path_io.path_utils import get_resource_path
+
+                config_path = get_resource_path("config", "deepseek_config.py")
+                if os.path.exists(config_path):
+                    import importlib.util
+
+                    spec = importlib.util.spec_from_file_location(
+                        "xcagi_deepseek_config", config_path
+                    )
+                    if spec and spec.loader:
+                        config_module = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(config_module)
+                        self.api_key = getattr(config_module, "DEEPSEEK_API_KEY", "") or ""
+            except RECOVERABLE_ERRORS as e:
+                logger.warning("无法读取 resources/config/deepseek_config.py: %s", e)
+
+        if self.api_key and llm_init_mode == "none":
+            llm_init_mode = "legacy"
+            logger.info(
+                "📦 [优先级3/降级] 使用旧版DeepSeek直连模式 (Key长度: %s)", len(self.api_key)
+            )
+        elif self.api_key:
+            logger.info("DeepSeek API Key 已配置（长度: %s）(作为降级备选)", len(self.api_key))
+        else:
+            logger.warning("DeepSeek API Key 未配置（降级路径不可用）")
+
+        from app.infrastructure.llm.providers.credentials import (
+            default_chat_completions_url,
+            resolve_default_chat_model,
+        )
+
+        self.api_url = default_chat_completions_url()
+        self.model = resolve_default_chat_model()
+
+        # 记录最终使用的模式
+        self._llm_mode = llm_init_mode
+        logger.info("🎯 LLM初始化完成，运行模式: %s", llm_init_mode)
+
+        from app.domain.shared_services.user_memory_service import get_user_memory_service
+
+        self.user_memory = get_user_memory_service()
+        self.persona_service = None  # 默认 None，由外部注入
+
+    def add_to_history(self, user_id: str, role: str, content: str) -> bool:
+        context = self.contexts.get(user_id)
+        if not context:
+            context = self.create_context(user_id)
+
+        context.conversation_history.append({"role": role, "content": content})
+
+        # 内存历史滚动上限可配置（默认 50，原硬编码 20）
+        # 全量历史仍可保留在 DB（AIConversation 表），内存只保留近期窗口
+        # 实际 token 预算裁剪由 ContextWindowManager 在 call_llm_api 内统一处理
+        history_max = _resolve_history_max()
+        if len(context.conversation_history) > history_max:
+            removed = len(context.conversation_history) - history_max
+            context.conversation_history = context.conversation_history[-history_max:]
+            context.summary_covered_until = max(-1, context.summary_covered_until - removed)
+            from app.application.agent_orchestrator.context_window_manager import (
+                summary_fingerprint,
+            )
+
+            context.summary_fingerprint = summary_fingerprint(
+                context.conversation_history[: context.summary_covered_until + 1]
+            )
+
+        # 刷新 token 估算缓存
+        context.estimate_history_tokens()
+        context.updated_at = time.time()
+        return True
+
+    def add_intent_feedback(
+        self,
+        user_id: str,
+        message: str,
+        recognized_intent: str,
+        feedback: str,
+        corrected_intent: str | None = None,
+        slots: dict[str, Any] | None = None,
+    ) -> None:
+        try:
+            self.user_memory.add_feedback(
+                user_id=user_id,
+                message=message,
+                recognized_intent=recognized_intent,
+                feedback=feedback,
+                corrected_intent=corrected_intent,
+                slots=slots or {},
+            )
+        except RECOVERABLE_ERRORS as e:
+            logger.error("添加意图反馈失败: %s", e)
+
+    def record_user_action(
+        self,
+        user_id: str,
+        intent: str,
+        slots: dict[str, Any],
+        message: str,
+    ) -> None:
+        try:
+            self.user_memory.record_action(
+                user_id=user_id,
+                intent=intent,
+                slots=slots,
+                message=message,
+            )
+        except RECOVERABLE_ERRORS as e:
+            logger.error("记录用户操作失败: %s", e)
+
+    def apply_memory_preferences(
+        self, user_id: str, intent: str, slots: dict[str, Any]
+    ) -> dict[str, Any]:
+        try:
+            return cast(
+                "dict[str, Any]", self.user_memory.apply_preference_to_slots(user_id, intent, slots)
+            )
+        except RECOVERABLE_ERRORS as e:
+            logger.error("应用用户偏好失败: %s", e)
+            return slots
+
+    def get_memory_similar_action(
+        self, user_id: str, intent: str, slots: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        try:
+            return cast(
+                "dict[str, Any] | None",
+                self.user_memory.get_similar_pattern(user_id, intent, slots),
+            )
+        except RECOVERABLE_ERRORS as e:
+            logger.error("获取相似操作失败: %s", e)
+            return None
+
+    def get_habit_suggestions(self, user_id: str) -> list[dict[str, Any]]:
+        try:
+            return cast("list[dict[str, Any]]", self.user_memory.get_habit_suggestions(user_id))
+        except RECOVERABLE_ERRORS as e:
+            logger.error("获取习惯建议失败: %s", e)
+            return []
+
+    def get_context_for_recognition(
+        self, user_id: str, conv_context: ConversationContext
+    ) -> dict[str, Any]:
+        context = {
+            "user_id": user_id,
+            "current_intent": conv_context.current_intent,
+            "current_tool_key": conv_context.current_tool_key,
+            "last_intent": conv_context.current_intent,
+            "last_tool_key": conv_context.current_tool_key,
+            "last_slots": (
+                conv_context.last_intent_result.get("slots", {})
+                if conv_context.last_intent_result
+                else {}
+            ),
+            "pending_confirmation": conv_context.pending_confirmation,
+        }
+
+        recent_actions = self.user_memory.get_recent_actions(user_id, limit=3)
+        if recent_actions:
+            context["recent_intents"] = [a.get("intent") for a in recent_actions]
+
+        preferences = self.user_memory.get_all_preferences(user_id)
+        if preferences:
+            context["user_preferences"] = preferences
+
+        return context
+
+    def _check_habit_suggestion(
+        self, user_id: str, current_intent: str, slots: dict[str, Any]
+    ) -> str | None:
+        try:
+            habits = self.get_habit_suggestions(user_id)
+
+            for habit in habits:
+                actions = habit.get("actions", [])
+                confidence = habit.get("confidence", 0)
+
+                if confidence < 0.8:
+                    continue
+
+                for action in actions:
+                    if action.get("intent") == current_intent:
+                        return f"💡 根据您的习惯，您可能还需要：{action.get('description', '')}"
+        except RECOVERABLE_ERRORS as e:
+            logger.error("检查习惯建议失败: %s", e)
+
+        return None
+
+    async def chat(
+        self,
+        user_id: str,
+        message: str,
+        context: dict[str, Any] | None = None,
+        source: str | None = None,
+    ) -> dict[str, Any]:
+        try:
+            from app.application import get_ai_chat_app_service
+
+            request_context = dict(context or {})
+            payload = await asyncio.to_thread(
+                get_ai_chat_app_service().process_chat,
+                user_id,
+                message,
+                request_context,
+                source,
+                request_context.get("file_context")
+                if isinstance(request_context.get("file_context"), dict)
+                else {},
+            )
+            if not isinstance(payload, dict):
+                return {"success": False, "text": "统一聊天服务没有返回有效结果", "action": "error"}
+            data = payload.get("data") or {}
+            if not isinstance(data, dict):
+                data = {}
+            return {
+                **payload,
+                "text": str(payload.get("response") or payload.get("message") or ""),
+                "action": str(data.get("action") or "chat_reply"),
+            }
+
+        except RECOVERABLE_ERRORS as e:
+            logger.error("统一聊天服务处理消息失败：%s", e)
+            return {
+                "text": f"抱歉，处理消息时出现问题：{str(e)}",
+                "action": "error",
+                "data": {"message": str(e)},
+            }
+
+
+_ai_conversation_service: AIConversationService | None = None
+
+
+_persona_factory = None
+
+
+def set_persona_factory(factory):
+    """Register the composition-root factory before constructing the singleton."""
+    global _persona_factory
+    _persona_factory = factory
+    if _ai_conversation_service is not None and _ai_conversation_service.persona_service is None:
+        _ai_conversation_service.persona_service = factory()
+
+
+def get_ai_conversation_service() -> AIConversationService:
+    global _ai_conversation_service
+    if _ai_conversation_service is None:
+        _ai_conversation_service = AIConversationService()
+        _ai_conversation_service.persona_service = _persona_factory() if _persona_factory else None
+    return _ai_conversation_service
+
+
+def get_ai_conversation_service_if_ready() -> AIConversationService | None:
+    """返回已初始化的对话服务单例，未初始化时不强制构造（返回 ``None``）。
+
+    供 LLMPort 等轻量只读路径探测当前真实可路由的 provider，避免健康检查
+    触发重型对话服务初始化产生副作用。
+    """
+    return _ai_conversation_service
+
+
+def init_ai_conversation_service() -> AIConversationService:
+    global _ai_conversation_service
+    _ai_conversation_service = AIConversationService()
+    _ai_conversation_service.persona_service = _persona_factory() if _persona_factory else None
+    logger.info("AI 对话服务已初始化（已注入 PersonaService）")
+    return _ai_conversation_service
+
+
+async def close_ai_conversation_service() -> None:
+    """Close all cached HTTP clients owned by the conversation singleton."""
+    global _ai_conversation_service
+    service = _ai_conversation_service
+    _ai_conversation_service = None
+    if service is not None:
+        from app.domain.shared_services.conversation.resource_cleanup import (
+            close_conversation_service_clients,
+        )
+
+        await close_conversation_service_clients(service)
+
+
+from app.neuro_bus.neuro_service_instrumentation import instrument_service_layer_class
+
+instrument_service_layer_class(
+    AIConversationService, "app.domain.shared_services.ai_conversation_service"
+)

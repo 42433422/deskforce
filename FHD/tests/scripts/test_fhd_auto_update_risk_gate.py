@@ -1,0 +1,192 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+FHD_ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = FHD_ROOT / "scripts" / "deploy" / "fhd-auto-update.sh"
+AUTONOMY_BRIDGE = FHD_ROOT / "scripts" / "deploy" / "lib" / "autonomy_gate.sh"
+
+
+def _runtime(tmp_path: Path) -> tuple[Path, Path, dict[str, str]]:
+    deploy_root = tmp_path / "deploy"
+    (deploy_root / ".venv" / "bin").mkdir(parents=True)
+    (deploy_root / "app").symlink_to(FHD_ROOT / "app", target_is_directory=True)
+    (deploy_root / "config").symlink_to(FHD_ROOT / "config", target_is_directory=True)
+    (deploy_root / "resources").symlink_to(FHD_ROOT / "resources", target_is_directory=True)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    flock = bin_dir / "flock"
+    flock.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    flock.chmod(0o755)
+    manifest = tmp_path / "fhd-manifest.json"
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+        "FHD_DEPLOY_ROOT": str(deploy_root),
+        "FHD_MANIFEST_PATH": str(manifest),
+        "FHD_DEPLOY_LOG": str(tmp_path / "deploy.log"),
+        "FHD_AUTO_UPDATE_LOCK": str(tmp_path / "update.lock"),
+        "FHD_AUTONOMY_PYTHON": sys.executable,
+        "XCAGI_AUTONOMY_DATA_DIR": str(tmp_path / "autonomy"),
+        "XCAGI_AUTONOMY_AUDIT_LOG_PATH": str(tmp_path / "autonomy" / "autonomy-audit-log.jsonl"),
+    }
+    return deploy_root, manifest, env
+
+
+def test_deploy_bridge_hard_blocks_prohibited_migration(tmp_path: Path) -> None:
+    deploy_root = tmp_path / "deploy"
+    deploy_root.mkdir()
+    (deploy_root / "app").symlink_to(FHD_ROOT / "app", target_is_directory=True)
+    (deploy_root / "config").symlink_to(FHD_ROOT / "config", target_is_directory=True)
+    data_dir = tmp_path / "autonomy"
+    command = f". {AUTONOMY_BRIDGE!s}; autonomy_evaluate_action db_migration migration:test-bridge"
+    result = subprocess.run(
+        ["bash", "-c", command],
+        env={
+            **os.environ,
+            "FHD_DEPLOY_ROOT": str(deploy_root),
+            "FHD_AUTONOMY_PYTHON": sys.executable,
+            "XCAGI_AUTONOMY_DATA_DIR": str(data_dir),
+            "XCAGI_AUTONOMY_AUDIT_LOG_PATH": str(data_dir / "autonomy-audit-log.jsonl"),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    audit = (data_dir / "autonomy-audit-log.jsonl").read_text(encoding="utf-8")
+    assert '"action": "db_migration"' in audit
+    assert '"decision": "prohibited"' in audit
+
+
+def _manifest(*, approved: bool) -> dict:
+    doc = {
+        "artifact": "missing.tar.gz",
+        "channel": "stable",
+        "deploy_mode": "tarball",
+        "git_sha": "abc123",
+        "sha256": "0" * 64,
+        "admin_console_sha256": "1" * 64,
+        "archive_verifier_sha256": hashlib.sha256(
+            (FHD_ROOT / "scripts/deploy/lib/verify_release_archive.py").read_bytes()
+        ).hexdigest(),
+        "version": "test",
+    }
+    if approved:
+        doc["autonomy_approval"] = {
+            "approved_by": "reviewer",
+            "approval_id": "run-1",
+            "environment": "production",
+            "source": "github_environment",
+        }
+    return doc
+
+
+def test_stable_auto_update_requires_human_approval(tmp_path: Path) -> None:
+    _, manifest, env = _runtime(tmp_path)
+    manifest.write_text(json.dumps(_manifest(approved=False)), encoding="utf-8")
+    result = subprocess.run(["bash", str(SCRIPT)], env=env, text=True, capture_output=True)
+    assert result.returncode == 77
+    log = (tmp_path / "deploy.log").read_text(encoding="utf-8")
+    assert "autonomy_guard 拒绝稳定通道发布" in log
+    assert "artifact 不存在" not in log
+
+
+def test_auto_update_trusts_only_ledger_approval_not_env_or_manifest() -> None:
+    auto_update = SCRIPT.read_text(encoding="utf-8")
+    bridge = AUTONOMY_BRIDGE.read_text(encoding="utf-8")
+
+    for source in (auto_update, bridge):
+        assert "FHD_AUTONOMY_APPROVED_BY" not in source
+        assert "FHD_AUTONOMY_APPROVAL_ID" not in source
+    assert 'doc.get("autonomy_approval")' not in auto_update
+    assert "get_action_state(action_id)" in auto_update
+    assert 'approval.get("state") == "approved"' in auto_update
+    assert '"approval_source": "autonomy_approval_ledger"' in auto_update
+    assert "complete_action(" in auto_update
+    assert 'success=outcome == "executed"' in auto_update
+
+
+def test_stable_auto_update_accepts_exact_ledger_approval(tmp_path: Path) -> None:
+    _, manifest, env = _runtime(tmp_path)
+    manifest.write_text(json.dumps(_manifest(approved=False)), encoding="utf-8")
+    approval = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from app.application.autonomy.approval_resume import request_action, resume_action; "
+                "request_action('apply_release_to_cvm', action_id='release:abc123'); "
+                "resume_action('release:abc123', approver='42433422', "
+                "approval_id='run-42', defer_execution=True)"
+            ),
+        ],
+        cwd=FHD_ROOT,
+        env={**env, "PYTHONPATH": str(FHD_ROOT)},
+        text=True,
+        capture_output=True,
+    )
+    assert approval.returncode == 0, approval.stderr
+
+    result = subprocess.run(["bash", str(SCRIPT)], env=env, text=True, capture_output=True)
+
+    assert result.returncode == 1
+    log = (tmp_path / "deploy.log").read_text(encoding="utf-8")
+    assert "autonomy_guard 已批准稳定通道发布" in log
+    assert "artifact 不存在" in log
+
+
+def test_auto_update_prefers_bundled_dr_sync_for_immutable_release(
+    tmp_path: Path,
+) -> None:
+    deploy_root, manifest, env = _runtime(tmp_path)
+    sync_script = deploy_root / "scripts" / "deploy" / "xcmax-release-sync.sh"
+    sync_script.parent.mkdir(parents=True)
+    sync_script.write_text(
+        '#!/bin/sh\nprintf "%s\\n" "$*" > "$SYNC_MARKER"\n',
+        encoding="utf-8",
+    )
+    sync_script.chmod(0o755)
+    marker = tmp_path / "sync-marker"
+    artifact_sha = "0" * 64
+    git_sha = "a" * 40
+    (deploy_root / ".deploy-sha256").write_text(artifact_sha, encoding="utf-8")
+    manifest.write_text(
+        json.dumps(
+            {
+                "admin_console_sha256": "1" * 64,
+                "artifact": "already-live.tar.gz",
+                "channel": "stable",
+                "deploy_mode": "tarball",
+                "git_sha": git_sha,
+                "sha256": artifact_sha,
+                "version": "test",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT)],
+        env={**env, "SYNC_MARKER": str(marker)},
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text(encoding="utf-8").strip() == (f"--component fhd --sha {git_sha}")
+
+
+def test_stable_auto_update_rejects_untrusted_manifest_approval(tmp_path: Path) -> None:
+    _, manifest, env = _runtime(tmp_path)
+    manifest.write_text(json.dumps(_manifest(approved=True)), encoding="utf-8")
+    result = subprocess.run(["bash", str(SCRIPT)], env=env, text=True, capture_output=True)
+    assert result.returncode == 77
+    log = (tmp_path / "deploy.log").read_text(encoding="utf-8")
+    assert "autonomy_guard 拒绝稳定通道发布" in log
+    assert "artifact 不存在" not in log

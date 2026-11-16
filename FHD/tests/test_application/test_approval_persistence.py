@@ -1,0 +1,1031 @@
+"""Real-persistence tests for ``app.application.workflow.approval_persistence``.
+
+These tests prove the durable workflow snapshot guards against a **real** SQLite
+database (in-memory, bound to the actual ORM ``Base``). They do **not** mock
+``load_durable_workflow_snapshot`` / ``mark_durable_request_approved_and_load``;
+they exercise the real loader against genuinely persisted ``approval_requests``
+rows, so the tenant / plan_id / params / terminal / replay guards are verified
+end-to-end.
+
+Covered per the review:
+- Snapshot tenant guard: valid current tenant + valid snapshot tenant equality;
+  snapshot tenant ``null`` / invalid / mismatch → fail-closed.
+- Restored ``plan_id`` equality and exact ``dict`` params.
+- ``mark_durable_request_approved_and_load``: pending → approved (no ``NameError``
+  from ``datetime``), terminal status → fail-closed.
+- ``mark_durable_outcome``: success → ``approved``; failure → ``cancelled``,
+  bounded ``workflow_execution_failed`` code, no raw exception leak.
+- Terminal / no-replay semantics for both statuses.
+"""
+
+from __future__ import annotations
+
+import json
+from unittest.mock import patch
+
+import pytest
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+from app.application.workflow.approval_persistence import (
+    SNAPSHOT_KEY,
+    SNAPSHOT_VERSION,
+    WORKFLOW_EXECUTION_FAILED_CODE,
+    WORKFLOW_EXECUTION_SUCCESS_CODE,
+    _contract_digest,
+    load_durable_workflow_snapshot,
+    mark_durable_outcome,
+    mark_durable_request_approved_and_load,
+)
+from app.application.workflow.workflow_types import plan_fingerprint, plan_from_dict
+from app.db.db_base import Base
+from app.db.models.approval import ApprovalRequest, ApprovalStatus
+
+
+@pytest.fixture(params=["sqlite", "postgresql"])
+def locking_engine(request, tmp_path):
+    import os
+    import uuid
+
+    from sqlalchemy import text
+
+    if request.param == "sqlite":
+        engine = create_engine(
+            f"sqlite:///{tmp_path / 'locking.db'}", connect_args={"check_same_thread": False}
+        )
+        yield engine
+        engine.dispose()
+        return
+    url = os.environ.get("XCAGI_TEST_AGENT_POSTGRES_URL")
+    if not url:
+        pytest.skip("isolated PostgreSQL test database not configured")
+    schema = "bulk_test_" + uuid.uuid4().hex
+    admin = create_engine(url)
+    with admin.begin() as connection:
+        connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+    engine = create_engine(url, connect_args={"options": f"-csearch_path={schema}"})
+    try:
+        yield engine
+    finally:
+        engine.dispose()
+        with admin.begin() as connection:
+            connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+        admin.dispose()
+
+
+def test_guarded_delete_serializes_concurrent_writes(locking_engine, monkeypatch):
+    from threading import Event, Thread
+
+    from sqlalchemy import event, text
+
+    from app.application.chat_turn_guard import scope_snapshot
+    from app.application.workflow.guarded_batch_delete import execute_guarded_batch_delete
+    from app.db.models import Product
+    from app.db.models.product import UomCategory, UomUnit
+    from app.db.models.purchase_unit import PurchaseUnit
+    from app.db.models.shipment import ShipmentRecord
+    from app.infrastructure.tenant_scope import tenant_scope
+
+    engine = locking_engine
+    Base.metadata.create_all(
+        engine,
+        tables=[
+            UomCategory.__table__,
+            UomUnit.__table__,
+            Product.__table__,
+            PurchaseUnit.__table__,
+            ShipmentRecord.__table__,
+        ],
+    )
+    factory = sessionmaker(bind=engine)
+    monkeypatch.setattr("app.db.session.SessionLocal", factory)
+    monkeypatch.setattr(
+        "app.infrastructure.auth.agent_mod_scope._bound_actor", lambda ctx: object()
+    )
+    monkeypatch.setattr(
+        "app.application.agent_orchestrator.tool_permission.actor_tool_denial", lambda *args: None
+    )
+    started, finished = Event(), Event()
+    workers = []
+    with tenant_scope(1):
+        with factory.begin() as session:
+            session.add(Product(id=1, name="preview", tenant_id=1))
+        context = {"tenant_id": 1}
+        context["_bulk_preview_scope"] = {"tool": "products", "digest": scope_snapshot(context)[3]}
+
+        def writer():
+            started.set()
+            with engine.begin() as connection:
+                connection.execute(text("UPDATE products SET name='changed' WHERE id=1"))
+            finished.set()
+
+        def before_sql(_conn, _cursor, statement, _params, _context, _many):
+            if (
+                statement.lstrip().upper().startswith("SELECT")
+                and "FROM products" in statement
+                and not workers
+            ):
+                worker = Thread(target=writer)
+                workers.append(worker)
+                worker.start()
+                assert started.wait(2) and not finished.wait(0.2)
+
+        event.listen(engine, "before_cursor_execute", before_sql)
+        try:
+            result = execute_guarded_batch_delete(
+                tool_id="products",
+                action="batch_delete",
+                params={"ids": [1], "_runtime_context": context},
+            )
+        finally:
+            event.remove(engine, "before_cursor_execute", before_sql)
+        workers[0].join(5)
+        assert result["success"] and finished.is_set()
+        with factory() as session:
+            assert session.get(Product, 1) is None
+
+
+def test_batch_readback_uses_fresh_tenant_scoped_business_data(db, monkeypatch):
+    from app.application.approval_workspace.workflow_bridge import _batch_absent
+    from app.application.chat_turn_guard import scope_snapshot
+    from app.application.workflow.guarded_batch_delete import execute_guarded_batch_delete
+    from app.application.workflow.workflow_types import WorkflowNode
+    from app.db.models import Product
+    from app.db.models.purchase_unit import PurchaseUnit
+    from app.infrastructure.tenant_scope import tenant_scope
+
+    with tenant_scope(1):
+        with db.begin() as session:
+            session.add_all(
+                [
+                    Product(id=1, name="product", unit="件", tenant_id=1),
+                    PurchaseUnit(id=2, unit_name="customer", tenant_id=1),
+                    Product(id=3, name="other tenant", unit="件", tenant_id=2),
+                ]
+            )
+        product = WorkflowNode("p", "products", "batch_delete", {"ids": [1]})
+        customer = WorkflowNode("c", "customers", "batch_delete", {"ids": [2]})
+        assert not _batch_absent(product, 1) and not _batch_absent(customer, 1)
+        monkeypatch.setattr(
+            "app.infrastructure.auth.agent_mod_scope._bound_actor", lambda ctx: object()
+        )
+        monkeypatch.setattr(
+            "app.application.agent_orchestrator.tool_permission.actor_tool_denial",
+            lambda *args: None,
+        )
+        context = {"tenant_id": 1}
+        context["_bulk_preview_scope"] = {"tool": "products", "digest": scope_snapshot(context)[3]}
+        with db.begin() as session:
+            session.get(Product, 1).name = "changed"
+
+        def delete():
+            return execute_guarded_batch_delete(
+                tool_id="products",
+                action="batch_delete",
+                params={"ids": [1], "_runtime_context": context},
+            )
+
+        assert not delete()["success"]
+        assert not _batch_absent(product, 1)
+        context["_bulk_preview_scope"]["digest"] = scope_snapshot(context)[3]
+        assert delete()["deleted_count"] == 1
+        assert _batch_absent(product, 1) and not _batch_absent(customer, 1)
+        assert not _batch_absent(product, 2)
+    with tenant_scope(2), db() as session:
+        assert session.get(Product, 3) is not None
+
+
+def test_uncertain_execution_is_not_reported_as_failed_or_retried():
+    from app.application.approval_workspace.outcomes import execution_outcome
+
+    result = execution_outcome({"code": "outcome_unknown", "success": False})
+    assert result["status"] == "approved"
+    assert result["code"] == "outcome_unknown"
+    assert result["workflow_executed"] is False
+    assert "核对" in result["message"]
+
+
+def test_existing_approval_reuse_requires_same_pending_operation_and_applicant(db):
+    from datetime import datetime
+
+    from app.application.workflow.approval_persistence import persist_agent_run_link
+    from app.application.workflow.approval_persistence_writes import persist_workflow_approval
+    from app.application.workflow.workflow_types import (
+        ApprovalRequest as WorkflowRequest,
+    )
+    from app.application.workflow.workflow_types import (
+        ApprovalStatus as WorkflowStatus,
+    )
+    from app.application.workflow.workflow_types import (
+        PlanGraph,
+        WorkflowNode,
+    )
+    from app.db.models.user import User
+    from app.infrastructure.tenant_scope import tenant_scope
+
+    with tenant_scope(1):
+        with db.begin() as session:
+            session.add_all(
+                [
+                    User(id=1, username="first", password="x", tenant_id=1, is_active=True),
+                    User(id=2, username="second", password="x", tenant_id=1, is_active=True),
+                ]
+            )
+        node = WorkflowNode("n", "products", "batch_delete", {"ids": [1]}, risk="high")
+        plan = PlanGraph("plan", "delete", nodes=[node])
+        request = WorkflowRequest(
+            "same",
+            "plan",
+            "n",
+            "products",
+            "batch_delete",
+            {"ids": [1]},
+            WorkflowStatus.PENDING,
+            datetime.now(),
+            tenant_id=1,
+        )
+        context = {"local_user_id": 1, "tenant_id": 1}
+
+        def persist():
+            return persist_workflow_approval(request, context, flow_key="test", plan=plan)
+
+        assert persist() is not None
+        assert persist() is not None
+        assert persist_agent_run_link("same", agent_run_id="run-a", approved_step_id="n")
+        assert persist() is not None
+        assert persist_agent_run_link("same", agent_run_id="run-a", approved_step_id="n")
+        assert not persist_agent_run_link("same", agent_run_id="run-b", approved_step_id="n")
+        context["local_user_id"] = 2
+        assert persist() is None
+        context["local_user_id"] = 1
+        request.params = {"ids": [2]}
+        assert persist() is None
+        request.params = {"ids": [1]}
+        with db.begin() as session:
+            session.query(ApprovalRequest).filter_by(request_no="same").one().status = "approved"
+        assert persist() is None
+        with db() as session:
+            assert session.query(ApprovalRequest).count() == 1
+
+
+def test_batch_approval_deduplicates_across_service_restarts(db, monkeypatch):
+    from datetime import timedelta
+
+    from app.application.tools.registered_capabilities import execute_registered_capability
+    from app.application.workflow.approval_persistence import (
+        claim_batch_dispatch,
+        mark_durable_request_approved_and_load,
+    )
+    from app.application.workflow.approval_service import ApprovalService
+    from app.db.models.user import Session as UserSession
+    from app.db.models.user import User
+    from app.infrastructure.auth.agent_mod_scope import bind_agent_actor_scope
+    from app.infrastructure.tenant_scope import tenant_scope
+    from app.utils.time import utc_now_naive
+
+    monkeypatch.setattr("app.db.HostSessionLocal", db)
+    monkeypatch.setattr("app.application.workflow.get_approval_service", ApprovalService)
+    context = {"local_user_id": 1, "user_id": "1", "tenant_id": 1, "turn_id": "turn-1"}
+    with tenant_scope(1):
+        with db.begin() as session:
+            session.add(
+                User(
+                    id=1, username="first", password="x", role="admin", tenant_id=1, is_active=True
+                )
+            )
+            session.add(
+                UserSession(
+                    session_id="session", user_id=1, expires_at=utc_now_naive() + timedelta(hours=1)
+                )
+            )
+        context["_actor_authorization"] = bind_agent_actor_scope(session_id="session", user_id="1")
+
+        def call(ids):
+            return json.loads(
+                execute_registered_capability(
+                    {"tool_id": "products", "action": "batch_delete", "params": {"ids": ids}},
+                    runtime_context=context,
+                )
+            )
+
+        first, second, changed = call([1]), call([1]), call([2])
+        assert first.get("pending_approval") and second.get("pending_approval")
+        assert first["approval_request_id"] == second["approval_request_id"]
+        assert not changed.get("pending_approval") and not changed["success"]
+        request_no = first["approval_request_id"]
+        with monkeypatch.context() as failure:
+            failure.setattr(ApprovalService, "attach_pending_agent_run", lambda *a, **k: False)
+            assert not call([1]).get("pending_approval")
+        with db() as session:
+            assert (
+                session.query(ApprovalRequest).filter_by(request_no=request_no).one().status
+                == "pending"
+            )
+        snapshot = mark_durable_request_approved_and_load(request_no)
+        assert snapshot is not None
+        assert claim_batch_dispatch(request_no, snapshot["plan"], snapshot["runtime_context"])
+        assert not claim_batch_dispatch(request_no, snapshot["plan"], snapshot["runtime_context"])
+        with db.begin() as session:
+            session.query(UserSession).filter_by(session_id="session").one().expires_at = (
+                utc_now_naive() - timedelta(seconds=1)
+            )
+        assert not call([1]).get("pending_approval")
+        with db() as session:
+            assert session.query(ApprovalRequest).count() == 1
+
+
+def _valid_business_data(tenant_id=1, plan_id="plan-1", params=None):
+    params = dict(params or {"unit_name": "Acme"})
+    plan = {
+        "plan_id": plan_id,
+        "intent": "business_db_write",
+        "todo_steps": [],
+        "risk_level": "low",
+        "metadata": {},
+        "nodes": [
+            {
+                "node_id": "write_customer",
+                "tool_id": "business_db",
+                "action": "write",
+                "params": params,
+                "risk": "low",
+                "idempotent": False,
+                "description": "",
+                "depends_on": [],
+                "next": None,
+                "branches": [],
+            }
+        ],
+    }
+    restored_plan = plan_from_dict(plan)
+    snapshot = {
+        "version": SNAPSHOT_VERSION,
+        "plan_id": plan_id,
+        "tenant_id": tenant_id,
+        "node": {
+            "node_id": "write_customer",
+            "tool_id": "business_db",
+            "action": "write",
+            "params": params,
+        },
+        "plan": plan,
+        "plan_sha256": plan_fingerprint(restored_plan),
+        "contract_sha256": _contract_digest(restored_plan),
+        "runtime_context": {"message": "write customer"},
+        "agent_run_id": "",
+        "approved_step_id": "",
+    }
+    return {
+        "plan_id": plan_id,
+        "node_id": "write_customer",
+        "tool_id": "business_db",
+        "action": "write",
+        "params": params,
+        SNAPSHOT_KEY: snapshot,
+    }
+
+
+@pytest.fixture
+def db():
+    """Real in-memory SQLAlchemy session isolated through ``SessionLocal``.
+
+    Patching the context-manager symbol itself can be captured by another module's
+    ``from app.db.session import get_db`` while this fixture is active and leak the
+    disposed in-memory database into later tests.  ``get_db`` resolves
+    ``SessionLocal`` at call time, so replacing only that factory preserves the
+    production session boundary without leaving an imported stale alias behind.
+    """
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+
+    @event.listens_for(engine, "connect")
+    def _disable_foreign_keys(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=OFF")
+        cursor.close()
+
+    Base.metadata.create_all(engine)
+    TestingSession = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+    with patch("app.db.session.SessionLocal", TestingSession):
+        yield TestingSession
+
+
+def _insert_request(
+    db,
+    *,
+    request_no,
+    business_data,
+    status=ApprovalStatus.PENDING.value,
+    business_type="workflow_tool",
+):
+    row = ApprovalRequest(
+        request_no=request_no,
+        flow_id=1,
+        business_type=business_type,
+        business_data=json.dumps(business_data, ensure_ascii=False),
+        applicant_id=1,
+        applicant_name="tester",
+        title="AI 工作流写库",
+        status=status,
+        priority="normal",
+    )
+    session = db()
+    try:
+        session.add(row)
+        session.commit()
+        return row.id
+    finally:
+        session.close()
+
+
+def _read_status(db, request_no):
+    session = db()
+    try:
+        return (
+            session.query(ApprovalRequest).filter(ApprovalRequest.request_no == request_no).first()
+        )
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
+# load_durable_workflow_snapshot — tenant guard / plan_id / params
+# ---------------------------------------------------------------------------
+
+
+class TestLoaderTenantGuard:
+    def test_matching_tenant_returns_snapshot(self, db):
+        _insert_request(db, request_no="req-ok", business_data=_valid_business_data(tenant_id=1))
+        snapshot = load_durable_workflow_snapshot("req-ok", allow_terminal=False)
+        assert snapshot is not None
+        assert snapshot["plan_id"] == "plan-1"
+
+    def test_null_snapshot_tenant_fail_closed(self, db):
+        data = _valid_business_data(tenant_id=None)
+        _insert_request(db, request_no="req-null", business_data=data)
+        assert load_durable_workflow_snapshot("req-null", allow_terminal=False) is None
+
+    def test_non_numeric_snapshot_tenant_fail_closed(self, db):
+        data = _valid_business_data(tenant_id="not-a-number")
+        _insert_request(db, request_no="req-bad", business_data=data)
+        assert load_durable_workflow_snapshot("req-bad", allow_terminal=False) is None
+
+    def test_tenant_mismatch_fail_closed(self, db):
+        # Snapshot tenant 2, current tenant 1 (default test scope) → must fail.
+        data = _valid_business_data(tenant_id=2)
+        _insert_request(db, request_no="req-mismatch", business_data=data)
+        assert load_durable_workflow_snapshot("req-mismatch", allow_terminal=False) is None
+
+
+class TestLoaderPlanIdAndParams:
+    def test_plan_id_mismatch_fail_closed(self, db):
+        data = _valid_business_data(plan_id="plan-1")
+        # Top-level business_data plan_id differs from snapshot plan_id.
+        data["plan_id"] = "plan-evil"
+        _insert_request(db, request_no="req-plan-mismatch", business_data=data)
+        assert load_durable_workflow_snapshot("req-plan-mismatch", allow_terminal=False) is None
+
+    def test_restored_plan_plan_id_mismatch_fail_closed(self, db):
+        data = _valid_business_data(plan_id="plan-1")
+        # Snapshot plan block plan_id differs from snapshot plan_id.
+        data[SNAPSHOT_KEY]["plan"]["plan_id"] = "plan-other"
+        _insert_request(db, request_no="req-restored-mismatch", business_data=data)
+        assert load_durable_workflow_snapshot("req-restored-mismatch", allow_terminal=False) is None
+
+    def test_legacy_single_node_derived_plan_id_remains_loadable(self, db):
+        data = _valid_business_data(plan_id="plan-parent")
+        data[SNAPSHOT_KEY]["plan"]["plan_id"] = "plan-parent:write_customer"
+        plan = plan_from_dict(data[SNAPSHOT_KEY]["plan"])
+        data[SNAPSHOT_KEY]["plan_sha256"] = plan_fingerprint(plan)
+        data[SNAPSHOT_KEY]["contract_sha256"] = _contract_digest(plan)
+        _insert_request(db, request_no="req-legacy-derived", business_data=data)
+
+        snapshot = load_durable_workflow_snapshot("req-legacy-derived", allow_terminal=False)
+
+        assert snapshot is not None
+        assert snapshot["plan"].plan_id == "plan-parent:write_customer"
+
+    def test_legacy_derived_plan_id_rejects_multi_node_plan(self, db):
+        data = _valid_business_data(plan_id="plan-parent")
+        data[SNAPSHOT_KEY]["plan"]["plan_id"] = "plan-parent:write_customer"
+        data[SNAPSHOT_KEY]["plan"]["nodes"].append(
+            {
+                **data[SNAPSHOT_KEY]["plan"]["nodes"][0],
+                "node_id": "unexpected_second_node",
+            }
+        )
+        _insert_request(db, request_no="req-legacy-multi", business_data=data)
+
+        assert load_durable_workflow_snapshot("req-legacy-multi", allow_terminal=False) is None
+
+    def test_non_dict_params_fail_closed(self, db):
+        data = _valid_business_data()
+        data["params"] = "not-a-dict"
+        _insert_request(db, request_no="req-params-str", business_data=data)
+        assert load_durable_workflow_snapshot("req-params-str", allow_terminal=False) is None
+
+    def test_params_mismatch_between_biz_and_node_fail_closed(self, db):
+        data = _valid_business_data(params={"unit_name": "Acme"})
+        data[SNAPSHOT_KEY]["node"]["params"] = {"unit_name": "OtherCo"}
+        _insert_request(db, request_no="req-node-params-mismatch", business_data=data)
+        assert (
+            load_durable_workflow_snapshot("req-node-params-mismatch", allow_terminal=False) is None
+        )
+
+
+class TestLoaderTerminalAndReplay:
+    def test_pending_loadable_for_preapproval(self, db):
+        _insert_request(db, request_no="req-pending", business_data=_valid_business_data())
+        assert load_durable_workflow_snapshot("req-pending", allow_terminal=False) is not None
+
+    def test_approved_loadable_for_execution_resume(self, db):
+        _insert_request(
+            db,
+            request_no="req-approved",
+            business_data=_valid_business_data(),
+            status=ApprovalStatus.APPROVED.value,
+        )
+        assert load_durable_workflow_snapshot("req-approved", allow_terminal=True) is not None
+
+    def test_terminal_status_rejected_for_preapproval(self, db):
+        _insert_request(
+            db,
+            request_no="req-terminal",
+            business_data=_valid_business_data(),
+            status=ApprovalStatus.CANCELLED.value,
+        )
+        assert load_durable_workflow_snapshot("req-terminal", allow_terminal=False) is None
+
+    def test_pending_rejected_for_execution_resume(self, db):
+        _insert_request(db, request_no="req-pending2", business_data=_valid_business_data())
+        assert load_durable_workflow_snapshot("req-pending2", allow_terminal=True) is None
+
+    def test_replay_rejected_when_workflow_execution_present(self, db):
+        data = _valid_business_data()
+        data["workflow_execution"] = {"status": "approved", "success": True}
+        _insert_request(db, request_no="req-replay", business_data=data)
+        assert load_durable_workflow_snapshot("req-replay", allow_terminal=False) is None
+        assert load_durable_workflow_snapshot("req-replay", allow_terminal=True) is None
+
+
+# ---------------------------------------------------------------------------
+# mark_durable_request_approved_and_load — pending → approved, no NameError
+# ---------------------------------------------------------------------------
+
+
+class TestMarkApprovedAndLoad:
+    def test_pending_transitions_to_approved(self, db):
+        _insert_request(db, request_no="req-mark", business_data=_valid_business_data())
+        snapshot = mark_durable_request_approved_and_load("req-mark")
+        assert snapshot is not None
+        row = _read_status(db, "req-mark")
+        assert row.status == ApprovalStatus.APPROVED.value
+        assert row.approved_at is not None
+
+    def test_terminal_status_fail_closed_no_change(self, db):
+        _insert_request(
+            db,
+            request_no="req-mark-cancelled",
+            business_data=_valid_business_data(),
+            status=ApprovalStatus.CANCELLED.value,
+        )
+        assert mark_durable_request_approved_and_load("req-mark-cancelled") is None
+        row = _read_status(db, "req-mark-cancelled")
+        assert row.status == ApprovalStatus.CANCELLED.value
+
+    def test_no_name_error_datetime_import(self, db):
+        # Regression: the function must not raise NameError for datetime.
+        _insert_request(db, request_no="req-mark-dt", business_data=_valid_business_data())
+        assert mark_durable_request_approved_and_load("req-mark-dt") is not None
+
+
+# ---------------------------------------------------------------------------
+# mark_durable_outcome — approved / cancelled no-replay, bounded message
+# ---------------------------------------------------------------------------
+
+
+class TestMarkOutcome:
+    def test_success_yields_approved(self, db):
+        _insert_request(db, request_no="req-out-ok", business_data=_valid_business_data())
+        mark_durable_outcome("req-out-ok", success=True)
+        row = _read_status(db, "req-out-ok")
+        assert row.status == ApprovalStatus.APPROVED.value
+        exec_data = json.loads(row.business_data)["workflow_execution"]
+        assert exec_data["status"] == ApprovalStatus.APPROVED.value
+        assert exec_data["success"] is True
+        assert exec_data["code"] == WORKFLOW_EXECUTION_SUCCESS_CODE
+
+    def test_failure_yields_cancelled_with_bounded_code(self, db):
+        _insert_request(db, request_no="req-out-fail", business_data=_valid_business_data())
+        mark_durable_outcome("req-out-fail", success=False)
+        row = _read_status(db, "req-out-fail")
+        assert row.status == ApprovalStatus.CANCELLED.value
+        assert row.rejection_reason == WORKFLOW_EXECUTION_FAILED_CODE
+        exec_data = json.loads(row.business_data)["workflow_execution"]
+        assert exec_data["status"] == ApprovalStatus.CANCELLED.value
+        assert exec_data["success"] is False
+        assert exec_data["code"] == WORKFLOW_EXECUTION_FAILED_CODE
+
+    def test_message_is_bounded_and_truncated(self, db):
+        # mark_durable_outcome bounds caller-supplied text (strip newlines, cap length).
+        raw = "raw-secret-" + "x" * 500
+        _insert_request(db, request_no="req-out-bounded", business_data=_valid_business_data())
+        mark_durable_outcome("req-out-bounded", success=False, message=raw)
+        row = _read_status(db, "req-out-bounded")
+        exec_data = json.loads(row.business_data)["workflow_execution"]
+        assert len(exec_data["message"]) <= 200
+        assert "\n" not in exec_data["message"]
+
+    def test_no_replay_after_outcome(self, db):
+        _insert_request(db, request_no="req-out-replay", business_data=_valid_business_data())
+        mark_durable_outcome("req-out-replay", success=True)
+        # Terminal approved → not loadable for pre-approval or re-execution.
+        assert load_durable_workflow_snapshot("req-out-replay", allow_terminal=False) is None
+        assert load_durable_workflow_snapshot("req-out-replay", allow_terminal=True) is None
+
+
+class TestResumePathNoRawLeakReal:
+    """审批通过后恢复执行 → 纯执行不落库、不泄漏原始异常；终态由调用方统一写入。"""
+
+    def test_failed_resume_persists_cancelled_and_bounded_message(self, db):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock, patch
+
+        from app.application.approval_workspace_app_service import (
+            _resume_pending_ai_workflow_after_approval,
+        )
+
+        _insert_request(db, request_no="req-resume-leak", business_data=_valid_business_data())
+        plan = SimpleNamespace(plan_id="plan-1", intent="t", nodes=[object()])
+        svc = MagicMock()
+        svc.approve.return_value = True
+        svc.get_pending_workflow.return_value = {"plan": plan, "runtime_context": {}}
+        run_result = SimpleNamespace(
+            success=False,
+            message="boom-secret-raw-exception-xyz",
+            node_results=[],
+        )
+        engine = MagicMock()
+        engine.run.return_value = run_result
+        with (
+            patch("app.application.workflow.get_approval_service", return_value=svc),
+            patch(
+                "app.infrastructure.workflow.langgraph_runtime.XCAGILangGraphRuntime",
+                return_value=engine,
+            ),
+            patch("app.fastapi_routes.domains.misc.helpers._dispatch_tool_for_approval"),
+        ):
+            out = _resume_pending_ai_workflow_after_approval(
+                request_no="req-resume-leak", opinion="同意"
+            )
+
+        # 纯执行契约：恢复器不落库、不写终态；终态由调用方在自身事务统一写入。
+        assert out is not None
+        assert out["success"] is False
+        assert out["message"] == "Agent Run 不可用"
+        assert "boom-secret-raw-exception-xyz" not in str(out)
+        row = _read_status(db, "req-resume-leak")
+        assert row.status == ApprovalStatus.PENDING.value
+        assert "workflow_execution" not in json.loads(row.business_data or "{}")
+
+
+class TestAtomicTerminalStateNotOverwrittenByStaleSession:
+    """真实 SQLite：审批终态在调用方单事务内原子落库，绝不被陈旧会话覆盖。
+
+    恢复器只返回安全结果、不落库；终态（cancelled/approved + 有界 outcome + 审计）由
+    ``_approve_ai_workflow_request_without_node`` 在调用方会话统一提交。用独立的新会话
+    复读，证明 DB 中只有单一真实终态，且陈旧会话持有的 pending 视图不会把终态覆盖回去。
+    """
+
+    def _seed_pending(self, db, request_no, session):
+        # _insert_request 用独立会话落库（pytest 会话工厂），随后在调用方会话内复读，
+        # 使返回的 ``req`` 绑定到调用方事务，保证同事务原子提交。
+        _insert_request(db, request_no=request_no, business_data=_valid_business_data())
+        return (
+            session.query(ApprovalRequest).filter(ApprovalRequest.request_no == request_no).first()
+        )
+
+    def _run_approve(self, session, req, resume_result):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from app.application.approval_workspace_app_service import (
+            _approve_ai_workflow_request_without_node,
+        )
+
+        with (
+            patch(
+                "app.application.approval_workspace_app_service._can_review_ai_workflow_request",
+                return_value=True,
+            ),
+            patch(
+                "app.application.approval_workspace_app_service._has_pending_ai_workflow",
+                return_value=True,
+            ),
+            patch(
+                "app.application.approval_workspace_app_service._ai_workflow_audit_node",
+                return_value=SimpleNamespace(id=1, node_name="AI 工作流审批留痕", node_order=1),
+            ),
+            patch(
+                "app.application.approval_workspace_app_service._resume_pending_ai_workflow_after_approval",
+                return_value=resume_result,
+            ),
+            patch("app.application.approval_workspace_app_service.notify_mobile_user"),
+        ):
+            return _approve_ai_workflow_request_without_node(
+                session, req=req, actor=1, approver_name="admin", opinion="同意"
+            )
+
+    def test_failure_commits_cancelled_single_truthful_state(self, db):
+        """失败 → 陈旧会话（pending 视图）提交后，新会话只读到 cancelled 终态，绝不回写 pending/approved。"""
+        from app.application.workflow.approval_persistence import (
+            load_durable_workflow_snapshot,
+        )
+
+        # 用会话 A 持有陈旧 pending 视图，作为调用方事务。
+        session_a = db()
+        try:
+            req = self._seed_pending(db, "req-atomic-fail", session_a)
+            stale_status_view = req.status
+            assert stale_status_view == ApprovalStatus.PENDING.value
+            result = self._run_approve(
+                session_a,
+                req,
+                {
+                    "workflow_executed": True,
+                    "success": False,
+                    "code": "raw-secret-code",
+                    "message": "raw-secret-message",
+                },
+            )
+            # 失败 → 409 安全响应，请求置为 cancelled 终态。
+            assert result.status_code == 409
+            assert json.loads(result.body)["success"] is False
+            # 独立新会话复读：单一真实终态 = cancelled，且带安全 bound 的 workflow_execution。
+            fresh = _read_status(db, "req-atomic-fail")
+            assert fresh.status == ApprovalStatus.CANCELLED.value
+            assert fresh.rejection_reason == WORKFLOW_EXECUTION_FAILED_CODE
+            exec_data = json.loads(fresh.business_data)["workflow_execution"]
+            assert exec_data["status"] == ApprovalStatus.CANCELLED.value
+            assert exec_data["success"] is False
+            assert exec_data["code"] == WORKFLOW_EXECUTION_FAILED_CODE
+            assert "raw-secret" not in json.dumps(fresh.business_data, ensure_ascii=False)
+            # 终态不被任何加载器接受（预审批仅 pending、执行恢复仅 approved）→ 无重放。
+            assert load_durable_workflow_snapshot("req-atomic-fail", allow_terminal=False) is None
+            assert load_durable_workflow_snapshot("req-atomic-fail", allow_terminal=True) is None
+        finally:
+            session_a.close()
+
+    def test_success_commits_approved_single_truthful_state(self, db):
+        """成功 → 新会话只读到 approved 终态，且不再被陈旧 pending 会话覆盖。"""
+        from app.application.workflow.approval_persistence import (
+            load_durable_workflow_snapshot,
+        )
+
+        session_a = db()
+        try:
+            req = self._seed_pending(db, "req-atomic-ok", session_a)
+            result = self._run_approve(
+                session_a,
+                req,
+                {"workflow_executed": True, "success": True, "code": "", "message": ""},
+            )
+            assert result["success"] is True
+            fresh = _read_status(db, "req-atomic-ok")
+            assert fresh.status == ApprovalStatus.APPROVED.value
+            assert fresh.approved_at is not None
+            exec_data = json.loads(fresh.business_data)["workflow_execution"]
+            assert exec_data["status"] == ApprovalStatus.APPROVED.value
+            assert exec_data["success"] is True
+            assert exec_data["code"] == WORKFLOW_EXECUTION_SUCCESS_CODE
+            # approved 是可执行获批态，但预审批加载器拒绝（避免重复审批重新进入）。
+            assert load_durable_workflow_snapshot("req-atomic-ok", allow_terminal=False) is None
+        finally:
+            session_a.close()
+
+
+@pytest.mark.parametrize("reject_second", [False, True])
+def test_full_plan_survives_restart_between_two_approvals(db, monkeypatch, reject_second):
+    import logging
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from app.application.agent_orchestrator import AgentOrchestrator
+    from app.application.agent_orchestrator.run_sql_repository import SQLAlchemyAgentRunRepository
+    from app.application.agent_orchestrator.tool_executor import AgentToolExecutor
+    from app.application.ai_chat_app_service import AIChatApplicationService
+    from app.application.approval_workspace.protocols import WorkflowBackends
+    from app.application.approval_workspace.workflow_bridge import WorkflowApprovalBridge
+    from app.application.workflow.approval_persistence import load_workflow_snapshot_for_execution
+    from app.application.workflow.approval_service import ApprovalService
+    from app.application.workflow.workflow_types import (
+        PlanGraph,
+        WorkflowNode,
+        plan_fingerprint,
+        plan_from_dict,
+    )
+    from app.db.models import User
+    from app.infrastructure.tenant_scope import tenant_scope
+
+    with db() as session:
+        session.add(User(id=41, username="synthetic-approval-user", password="test", tenant_id=1))
+        session.commit()
+    monkeypatch.setattr(
+        "app.application.agent_orchestrator.orchestrator.AgentToolExecutor",
+        lambda: SimpleNamespace(execute=AgentToolExecutor().execute),
+    )
+    # This test exercises durable plan resumption with a synthetic actor and a
+    # mocked dispatcher; real tool authorization has its own isolation tests.
+    monkeypatch.setattr(
+        "app.application.agent_orchestrator.tool_executor._reviewed_query_tenant",
+        lambda *_args: (None, None),
+    )
+    repo = SQLAlchemyAgentRunRepository(session_factory=db)
+    plan = PlanGraph(
+        plan_id=f"durable-two-approvals-{int(reject_second)}",
+        intent="test",
+        nodes=[
+            WorkflowNode(
+                "first",
+                "business_db",
+                "read",
+                params={"entity": "products"},
+                risk="low",
+                idempotent=True,
+            ),
+            WorkflowNode(
+                "second",
+                "business_db",
+                "read",
+                params={"entity": "customers"},
+                risk="low",
+                idempotent=True,
+                depends_on=["first"],
+            ),
+            WorkflowNode(
+                "third",
+                "business_db",
+                "read",
+                params={"entity": "products"},
+                risk="low",
+                idempotent=True,
+                depends_on=["second"],
+            ),
+        ],
+    )
+    approvals = ApprovalService()
+    service = object.__new__(AIChatApplicationService)
+    service._pending_workflows = {
+        "41": {
+            "plan": plan,
+            "runtime_context": {"local_user_id": 41, "tenant_id": 1, "message": "依次查询"},
+            "approval_required": True,
+            "approval_nodes": [{"node_id": "first"}, {"node_id": "second"}],
+        }
+    }
+    service.approval_service = approvals
+    calls = []
+
+    def execute(_tool, _action, params):
+        calls.append(params["_runtime_context"]["node_id"])
+        return {"success": True, "data": []}
+
+    def bridge_for(service):
+        return WorkflowApprovalBridge(
+            WorkflowBackends(
+                approvals=lambda: service,
+                pending_snapshot=load_durable_workflow_snapshot,
+                execution_snapshot=load_workflow_snapshot_for_execution,
+                agent=lambda: AgentOrchestrator(
+                    repository=SQLAlchemyAgentRunRepository(session_factory=db)
+                ),
+                load_run=repo.get,
+            ),
+            (RuntimeError,),
+            logging.getLogger(__name__),
+        )
+
+    with (
+        tenant_scope(1),
+        patch(
+            "app.application.agent_orchestrator.AgentOrchestrator",
+            return_value=AgentOrchestrator(repository=repo),
+        ),
+        patch(
+            "app.application.facades.tools_facade.execute_registered_workflow_tool",
+            side_effect=execute,
+        ),
+    ):
+        handled, result = service._resume_pending_dynamic_workflow("41", "确认", "确认")
+        assert handled and result["success"] is True, result
+        first = result["data"]["data"]["approval_request_ids"][0]
+        durable = load_workflow_snapshot_for_execution(first)
+        waiting_run = repo.get(result["data"]["data"]["agent_run_id"])
+        assert durable is not None, (first, result)
+        assert waiting_run is not None and waiting_run.status == "waiting_user"
+        persisted_plan = plan_from_dict(waiting_run.metadata.get("plan"))
+        assert persisted_plan is not None
+        assert plan_fingerprint(durable["plan"]) == plan_fingerprint(persisted_plan), (
+            durable["plan"].to_dict() if hasattr(durable["plan"], "to_dict") else durable["plan"],
+            persisted_plan,
+        )
+        # Recreate the service and repository to model a backend restart.
+        bridge = bridge_for(ApprovalService())
+        first_result = bridge.resume(request_no=first, opinion="同意", approved_by="41")
+        assert first_result.get("waiting_approval") is True, first_result
+        resumed = repo.get(first_result.get("agent_run_id") or "")
+        assert calls == ["first"], (
+            first_result.get("message"),
+            first_result.get("nodes_executed"),
+            [
+                (step.node_id, step.status, step.error)
+                for step in (resumed.steps if resumed else [])
+            ],
+            [event.event_type for event in (resumed.events[-6:] if resumed else [])],
+            len(resumed.tool_calls) if resumed else None,
+        )
+        second = first_result["next_approval_request_id"]
+        replay = bridge_for(ApprovalService()).resume(
+            request_no=first, opinion="同意", approved_by="41"
+        )
+        assert replay["success"] is False
+        assert calls == ["first"]
+        bridge = bridge_for(ApprovalService())
+        if reject_second:
+            with db() as session:
+                row = session.query(ApprovalRequest).filter_by(request_no=second).one()
+                row.status = ApprovalStatus.REJECTED.value
+                session.commit()
+            final = bridge.reject(request_no=second, reason="不同意")
+            assert final["code"] == "approval_rejected"
+            assert repo.get(first_result["agent_run_id"]).status == "cancelled"
+            assert calls == ["first"]
+        else:
+            final = bridge.resume(request_no=second, opinion="同意", approved_by="41")
+            assert final["success"] is True, final
+            assert calls == ["first", "second", "third"]
+
+
+@pytest.mark.parametrize("preapproved", [False, True])
+def test_only_one_concurrent_reviewer_can_claim_approval(locking_engine, monkeypatch, preapproved):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from app.application.workflow.approval_persistence import (
+        claim_agent_approval,
+        load_workflow_snapshot_for_execution,
+        mark_durable_request_approved_and_load,
+    )
+    from app.application.workflow.approval_service import ApprovalService
+    from app.application.workflow.workflow_types import PlanGraph, WorkflowNode
+    from app.db.models import User
+    from app.infrastructure.tenant_scope import tenant_scope
+
+    Base.metadata.create_all(locking_engine)
+    factory = sessionmaker(bind=locking_engine)
+    monkeypatch.setattr("app.db.session.SessionLocal", factory)
+    with factory() as session:
+        session.add(User(id=41, username="claim-test", password="test", tenant_id=1))
+        session.commit()
+    node = WorkflowNode(
+        "first", "business_db", "read", params={"entity": "products"}, idempotent=True
+    )
+    plan = PlanGraph(plan_id="claim-test", intent="test", nodes=[node])
+    service = ApprovalService()
+    with tenant_scope(1):
+        request = service.create_approval_request(
+            plan_id=plan.plan_id,
+            node=node,
+            plan=plan,
+            require_persistence=True,
+            runtime_context={
+                "local_user_id": 41,
+                "tenant_id": 1,
+                "_approval_agent_run_required": True,
+            },
+        )
+        assert service.attach_pending_agent_run(
+            request.request_id, agent_run_id="run-test", approved_step_id="first"
+        )
+        if preapproved:
+            assert mark_durable_request_approved_and_load(request.request_id)
+            assert load_workflow_snapshot_for_execution(request.request_id) is None
+    barrier = Barrier(2)
+
+    def claim():
+        with tenant_scope(1):
+            barrier.wait()
+            return claim_agent_approval(
+                request.request_id, agent_run_id="run-test", approved_step_id="first"
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: claim(), range(2)))
+    assert sorted(results) == [False, True]
+    with tenant_scope(1):
+        assert load_workflow_snapshot_for_execution(request.request_id) is not None

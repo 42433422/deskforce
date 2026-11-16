@@ -1,0 +1,111 @@
+import { ADMIN_OPERATOR_VISIBLE_CORE_KEYS } from '@/constants/adminOperatorNav'
+import { isAdminConsoleSpa } from '@/utils/adminConsoleUrl'
+
+export type RoleMenuKind = 'enterprise-user' | 'local-admin' | 'personal-user'
+
+export type RoleMenuProfile = {
+  role: RoleMenuKind
+  canSeeAdminMenus: boolean
+  canSeeDeveloperMenus: boolean
+  visibleCoreKeys: Set<string> | null
+}
+
+export type AccountRoleSource = {
+  accountKind?: string
+  marketIsAdmin?: boolean
+  marketIsEnterprise?: boolean
+  isAdminAccount?: boolean
+  localRole?: string
+  permissions?: readonly string[]
+  tenantId?: number | null
+}
+
+/** Host routes above are not tenant-scoped. Enterprise tenants land on these Mod pages instead of settings. */
+export const TENANT_SCOPED_BUSINESS_PATHS: Record<string, string> = {
+  products: '/mod/xcagi-erp-domain-bridge/products',
+  customers: '/mod/xcagi-erp-domain-bridge/customers',
+  orders: '/mod/xcagi-erp-domain-bridge/orders',
+  'orders-create': '/mod/xcagi-erp-domain-bridge/orders/create',
+  'shipment-records': '/mod/xcagi-erp-domain-bridge/shipment-records',
+  materials: '/mod/xcagi-erp-domain-bridge/materials',
+  inventory: '/mod/xcagi-erp-domain-bridge/inventory',
+  purchase: '/mod/xcagi-erp-domain-bridge/purchase',
+  print: '/mod/xcagi-erp-domain-bridge/print',
+  'printer-list': '/mod/xcagi-erp-domain-bridge/printer-list',
+  'template-preview': '/mod/xcagi-erp-domain-bridge/template-preview',
+  'traditional-mode': '/mod/xcagi-erp-domain-bridge/traditional-mode',
+  'approval-hub': '/mod/xcagi-approval-bridge/approval-hub/workspace',
+  tools: '/mod/xcagi-office-employee-pack-bridge/tools',
+}
+
+export const UNSCOPED_HOST_BUSINESS_KEYS = new Set(Object.keys(TENANT_SCOPED_BUSINESS_PATHS))
+
+export function tenantScopedBusinessPath(routeName: string): string | null {
+  return TENANT_SCOPED_BUSINESS_PATHS[routeName] || null
+}
+
+const ENTERPRISE_GENERIC_CORE_KEYS = new Set([
+  'chat',
+  'im',
+  'ai-groups',
+  'ai-ecosystem',
+  'persy-knowledge',
+  'employee-workflow',
+  'workflow-employee-space',
+  'mod-store',
+  'settings',
+  'desktop-runtime',
+  'data-sources',
+  'business-docking',
+  'printer-list',
+  'template-preview',
+  'tools',
+  'orders-create',
+])
+
+const ENTERPRISE_BUSINESS_CORE_KEYS = new Set([...UNSCOPED_HOST_BUSINESS_KEYS].filter(key => !ENTERPRISE_GENERIC_CORE_KEYS.has(key)))
+
+export function buildRoleMenuProfile(source: AccountRoleSource, hasIndustryBusinessMod = false): RoleMenuProfile {
+  const isAdmin = source.isAdminAccount === true || (source.accountKind === 'admin' && source.marketIsAdmin === true)
+  if (isAdmin) {
+    return {
+      role: 'local-admin',
+      canSeeAdminMenus: true,
+      canSeeDeveloperMenus: true,
+      visibleCoreKeys: isAdminConsoleSpa() ? new Set(ADMIN_OPERATOR_VISIBLE_CORE_KEYS) : null,
+    }
+  }
+
+  const isEnterprise = source.accountKind === 'enterprise' || source.marketIsEnterprise === true
+  if (!isEnterprise) {
+    return {
+      role: 'personal-user',
+      canSeeAdminMenus: false,
+      canSeeDeveloperMenus: false,
+      visibleCoreKeys: null,
+    }
+  }
+
+  if (source.localRole?.startsWith('tenant:')) {
+    const visibleCoreKeys = new Set(['settings'])
+    if (source.permissions?.includes('etl.read')) visibleCoreKeys.add('business-docking')
+    return { role: 'enterprise-user', canSeeAdminMenus: false, canSeeDeveloperMenus: false, visibleCoreKeys }
+  }
+
+  const visibleCoreKeys = new Set(ENTERPRISE_GENERIC_CORE_KEYS)
+  if (hasIndustryBusinessMod) {
+    for (const key of ENTERPRISE_BUSINESS_CORE_KEYS) visibleCoreKeys.add(key)
+  }
+  return {
+    role: 'enterprise-user',
+    canSeeAdminMenus: false,
+    canSeeDeveloperMenus: false,
+    visibleCoreKeys,
+  }
+}
+
+export function canShowCoreMenuKey(profile: RoleMenuProfile, key: string): boolean {
+  const allowed = profile.visibleCoreKeys
+  if (!allowed) return true
+  return allowed.has(String(key || '').trim())
+}

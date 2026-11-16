@@ -1,0 +1,762 @@
+import type { Ref } from 'vue'
+import { extractAgentRunId, type useAgentRunEventSync } from '../useAgentRunEvents'
+import type { useChatDbTokenGate } from '../useChatDbTokenGate'
+import type { useChatExcelContext } from '../useChatExcelContext'
+import type { useChatMessages } from '../useChatMessages'
+import type { useChatRequest, ChatRequestScope } from '../useChatRequest'
+import type { useChatResponseAttach } from '../useChatResponseAttach'
+import { readPlannerBusinessResult } from '@/utils/readPlannerBusinessResult'
+import type { useChatSessionActivity } from '../useChatSessionActivity'
+import type { ShipmentTask } from '../useShipmentTask'
+import type { ChatPlannerPayload, ChatRequest } from '@/types/chat'
+import chatApi, { parseChatStreamErrorResponse } from '@/api/chat'
+import productsApi from '@/api/products'
+import { isAdminConsoleSpa } from '@/utils/adminConsoleUrl'
+import { useModsStore } from '@/stores/mods'
+import { resolveChatIdentity } from '@/utils/chatStorageKeys'
+import { readPlannerSseResponse, isChatStreamEnabled, isWorkflowControlMessage, IncompletePlannerSseError, type PlannerSseEvent } from '@/utils/chatSseStream'
+import { collapseExactDuplicateReply } from '@/utils/chatReplyNormalization'
+import { stripPlannerDisplayMarkers } from '@/utils/chatBubbleDisplay'
+import { asArray, asRecord, asString } from '@/utils/typeGuards'
+import { extractLikelyProductQueryKeyword } from '../useChatPersistence'
+import { persistDetachedPlannerResult, recordProductFastPathTask } from '../useChatSessionActivity'
+import { asPlannerPayload, errorMessage, requiresTurnReconciliation } from './chatOrchestrationShared'
+import { classifyRawError } from '@/utils/networkStability'
+import { droppedRoundFromHistory, droppedRoundPresentation } from '@/utils/droppedRoundPresentation'
+import { aiModBriefFromChat, generateAndInstallAiMod } from '@/utils/aiModDeliveryApi'
+import type { UiChatMessageExtras } from '@/types/chat-ui'
+import { readChatModelRoute, recordChatModelRoute } from '@/utils/chatModelRoute'
+import { captureAuthSession, probeEnterpriseSession } from '@/utils/authSessionCache'
+import { noteModelPath } from '@/components/sidebar/modelPathHealth'
+import { modelOutcomeFromText, readChatExecution } from '@/components/chat/chatFailureRecovery'
+import type { PlannerChatOptions } from '../useChatRequest'
+import { isOfficeEltToolMessage } from '@/domain/optionalTemplateSelection'
+
+/** Bound the initial model wait; once content or a tool marker arrives, use the reply budget. */
+export const CHAT_STREAM_STALL_MS = 40_000
+
+type ChatMessagesApi = ReturnType<typeof useChatMessages>
+
+export interface ChatOrchestrationRemoteRoundDeps {
+  sessionId: Ref<string>
+  messages: ChatMessagesApi['messages']
+  addMessage: ChatMessagesApi['addMessage']
+  saveMessage: ChatMessagesApi['saveMessage']
+  queueVoice: ChatMessagesApi['queueVoice']
+  pushStreamingAiShell: ChatMessagesApi['pushStreamingAiShell']
+  applyPlainTextToMessageIndex: ChatMessagesApi['applyPlainTextToMessageIndex']
+  flushMessagesCache: ChatMessagesApi['flushMessagesCache']
+  ttsEnabled: Ref<boolean>
+  chatSessionActivity: ReturnType<typeof useChatSessionActivity>
+  pendingDbWriteChatRetryMessages: Ref<string[] | null>
+  plannerWriteUnlockResumeDraft: Ref<string>
+  chatRequest: ReturnType<typeof useChatRequest>
+  handleChatRequiresToken: ReturnType<typeof useChatDbTokenGate>['handleChatRequiresToken']
+  resolveExcelAnalysisContextForRequest: ReturnType<typeof useChatExcelContext>['resolveExcelAnalysisContextForRequest']
+  multimodalPendingCount: ReturnType<typeof useChatExcelContext>['multimodalPendingCount']
+  stateSteps: Ref<Array<{ node_id: string; status: 'succeeded' | 'failed'; output_summary: string }>>
+  currentTask: Ref<ShipmentTask | null>
+  syncTaskFromChatResponse: ReturnType<typeof useChatResponseAttach>['syncTaskFromChatResponse']
+  attachThinkingStepsToLastAiMessage: ReturnType<typeof useChatResponseAttach>['attachThinkingStepsToLastAiMessage']
+  attachTodoStepsToLastAiMessage: ReturnType<typeof useChatResponseAttach>['attachTodoStepsToLastAiMessage']
+  attachWorkflowTraceToLastAiMessage: ReturnType<typeof useChatResponseAttach>['attachWorkflowTraceToLastAiMessage']
+  attachApprovalCardToLastAiMessage: ReturnType<typeof useChatResponseAttach>['attachApprovalCardToLastAiMessage']
+  attachBusinessResultToLastAiMessage: ReturnType<typeof useChatResponseAttach>['attachBusinessResultToLastAiMessage']
+  attachAgentRunTraceToLastAiMessage: ReturnType<typeof useChatResponseAttach>['attachAgentRunTraceToLastAiMessage']
+  attachContextSummaryToLastAiMessage: ReturnType<typeof useChatResponseAttach>['attachContextSummaryToLastAiMessage']
+  syncAgentRunFromPayload: ReturnType<typeof useAgentRunEventSync>['syncAgentRunFromPayload']
+  showTaskConfirm: (task: unknown) => void
+  maybeCloseAssistantFloatForShipmentTask: (task: unknown, autoAction: unknown) => void
+  emitAssistantPush: (payload?: unknown) => void
+  handleAutoAction: (action: unknown, userMessage?: string) => void
+}
+
+export function useChatOrchestrationRemoteRound(deps: ChatOrchestrationRemoteRoundDeps) {
+  const modsStore = useModsStore()
+  const {
+    sessionId,
+    messages,
+    addMessage,
+    queueVoice,
+    pushStreamingAiShell,
+    applyPlainTextToMessageIndex,
+    ttsEnabled,
+    chatSessionActivity,
+    pendingDbWriteChatRetryMessages,
+    plannerWriteUnlockResumeDraft,
+    chatRequest,
+    handleChatRequiresToken,
+    resolveExcelAnalysisContextForRequest,
+    multimodalPendingCount,
+    stateSteps,
+    currentTask,
+    syncTaskFromChatResponse,
+    attachThinkingStepsToLastAiMessage,
+    attachTodoStepsToLastAiMessage,
+    attachWorkflowTraceToLastAiMessage,
+    attachApprovalCardToLastAiMessage,
+    attachBusinessResultToLastAiMessage,
+    attachAgentRunTraceToLastAiMessage,
+    attachContextSummaryToLastAiMessage,
+    syncAgentRunFromPayload,
+    showTaskConfirm,
+    maybeCloseAssistantFloatForShipmentTask,
+    emitAssistantPush,
+    handleAutoAction,
+  } = deps
+  const {
+    setLoadingProgress,
+    startWaitProgressTimer,
+    buildPlannerChatRequestPayload,
+    stopLoadingProgress,
+    requestChatByModeWithTimeout,
+    requestChatByModeBatchWithTimeout,
+    resolveChatTimeoutMs,
+  } = chatRequest
+
+  function responseCameFromCache(payload: unknown): boolean {
+    const row = asRecord(payload)
+    const data = asRecord(row.data)
+    const inner = asRecord(data.data)
+    return row.cached === true || data.cached === true || inner.cached === true
+  }
+  function responseExtras(payload: ChatPlannerPayload, failed = false): UiChatMessageExtras | undefined {
+    const routeMetadata = readChatModelRoute(payload.route_metadata)
+    const execution = readChatExecution(payload)
+    const businessResult = readPlannerBusinessResult(payload)
+    const extras = {
+      ...(routeMetadata ? { routeMetadata } : {}),
+      ...(requiresTurnReconciliation(payload) ? { workflowAction: 'unknown' } : failed ? { workflowAction: 'failed' } : {}),
+      ...(responseCameFromCache(payload) ? { sameAsPrevious: true } : {}),
+      ...(execution ? { execution } : {}),
+      ...(businessResult ? { businessResult } : {}),
+    }
+    return Object.keys(extras).length ? extras : undefined
+  }
+
+  function observeModelOutcome(text: string, payload?: ChatPlannerPayload) {
+    const execution = readChatExecution(payload)
+    if (execution?.effect === 'preview') return
+    const outcome = modelOutcomeFromText(text)
+    if (outcome === 'degraded' || payload?.success === false) noteModelPath('degraded')
+    else if (outcome === 'healthy') noteModelPath('healthy')
+  }
+
+  /** 消费后端 state.update 事件（payload.data.data.state_updates），维护「步骤进度」UI 状态 */
+  function consumeStateUpdates(payload: ChatPlannerPayload): void {
+    const row = asRecord(payload)
+    const data = asRecord(row.data)
+    const inner = asRecord(data.data ?? data)
+    const updates = asArray<Record<string, unknown>>(inner.state_updates ?? row.state_updates)
+    if (!updates.length) return
+    for (const u of updates) {
+      if (String(u.type || '') !== 'state.update') continue
+      const nodeId = String(u.node_id || '')
+      if (!nodeId) continue
+      const entry = {
+        node_id: nodeId,
+        status: String(u.status || 'succeeded') === 'failed' ? ('failed' as const) : ('succeeded' as const),
+        output_summary: String(u.output_summary || ''),
+      }
+      const idx = stateSteps.value.findIndex((s) => s.node_id === nodeId)
+      if (idx >= 0) {
+        stateSteps.value[idx] = entry
+      } else {
+        stateSteps.value.push(entry)
+      }
+    }
+  }
+
+  function maybePrefetchProductAssistantFloat(userText: string) {
+    // 教程进行中也需要与聊天请求并行预开产品副窗；否则会出现「不开教程立刻出副窗、走了教程反而要等 AI」的体验差。
+    // 副窗切到「协助/产品查询」若与某步高亮冲突，用户仍可用教程卡片「下一步」或退出教程。
+    const kw = extractLikelyProductQueryKeyword(userText)
+    if (!kw) return
+    window.dispatchEvent(
+      new CustomEvent('xcagi:open-assistant-float', {
+        detail: { feature: 'products', query: kw, forceOpen: true },
+      }),
+    )
+  }
+
+  async function executeRemoteChatRound(remoteMessages: string[], opts?: PlannerChatOptions, scope?: ChatRequestScope) {
+    if (!remoteMessages.length) return
+    const requestScope = scope || { sessionId: sessionId.value, messages: [...messages.value] }
+    if (!requestScope.isCurrent) Object.assign(requestScope, chatSessionActivity.beginRound(requestScope.sessionId))
+    const identity = requestScope.identity ?? resolveChatIdentity(String(modsStore.activeModId || ''))
+    const isAuthCurrent = captureAuthSession()
+    const isOwnerCurrent = () => isAuthCurrent() && requestScope.isCurrent?.() !== false && identity === resolveChatIdentity(String(modsStore.activeModId || ''))
+    if (!isOwnerCurrent()) return
+    const activity = chatSessionActivity.forSession(requestScope.sessionId)
+    const round = {
+      isActive: () => isOwnerCurrent() && activity.isActive(),
+      setLoading: (value: boolean) => { if (isOwnerCurrent()) activity.setLoading(value) },
+      setStreaming: (value: boolean) => { if (isOwnerCurrent()) activity.setStreaming(value) },
+    }
+    const saveMessage: ChatMessagesApi['saveMessage'] = async (...args) => {
+      if (isOwnerCurrent()) await deps.saveMessage(...args)
+    }
+    const addRoundMessage = async (text: string, extras?: UiChatMessageExtras) => {
+      if (round.isActive()) addMessage(text, 'ai', { turnId: requestScope.turnId, ...extras }, { speak: ttsEnabled.value })
+    }
+    if (!opts?.fromWriteUnlock) {
+      pendingDbWriteChatRetryMessages.value = null
+      plannerWriteUnlockResumeDraft.value = ''
+    }
+    const primaryText = remoteMessages[0] || ''
+    const aiModBrief = remoteMessages.length === 1 && !isAdminConsoleSpa() ? aiModBriefFromChat(primaryText) : ''
+
+    if (aiModBrief) {
+      round.setLoading(true)
+      setLoadingProgress('正在创建自用 MOD…', requestScope.sessionId)
+      startWaitProgressTimer(requestScope.sessionId)
+      try {
+        const result = await generateAndInstallAiMod(aiModBrief, {
+          isCurrent: isOwnerCurrent,
+          onProgress: (progress) => { if (isOwnerCurrent()) setLoadingProgress(progress.label, requestScope.sessionId) },
+        })
+        if (!isOwnerCurrent()) return
+        const responseText = `已生成并安装自用 MOD「${result.modId}」。${result.installMessage}`
+        const extras: UiChatMessageExtras = {
+          workflowAction: 'mod_generated_and_installed',
+          nodeResults: [
+            { node_id: 'generate', tool_id: 'workbench', action: 'generate_mod', success: true },
+            { node_id: 'validate', tool_id: 'workbench', action: 'validate_mod', success: true },
+            { node_id: 'install', tool_id: 'mod_store', action: 'install_self_use', success: true },
+          ],
+        }
+        await addRoundMessage(responseText, extras)
+        await Promise.all([
+          saveMessage('user', primaryText, requestScope.sessionId),
+          saveMessage('ai', responseText, requestScope.sessionId, extras),
+        ])
+      } catch (err) {
+        const responseText = `MOD 生成或安装失败：${errorMessage(err, '未知错误')}`
+        await addRoundMessage(responseText)
+        await Promise.all([
+          saveMessage('user', primaryText, requestScope.sessionId),
+          saveMessage('ai', responseText, requestScope.sessionId),
+        ])
+      } finally {
+        round.setLoading(false)
+        if (isOwnerCurrent()) stopLoadingProgress(requestScope.sessionId)
+      }
+      return
+    }
+
+    /** 查产品类话术可不必等 /ai/chat 或连通性探测，直接走产品列表接口 */
+    /** 管理端（admin-console）无产品库业务，不走产品快路径，避免「查询…」话术被误判为产品检索 */
+    const kwFast =
+      remoteMessages.length === 1 && !isAdminConsoleSpa() && !resolveExcelAnalysisContextForRequest() && multimodalPendingCount.value === 0
+        ? extractLikelyProductQueryKeyword(primaryText)
+        : null
+
+    // 快路径会自己拉产品列表并注水副窗；再 prefetch 会多打一遍相同接口，徒增等待
+    if (!kwFast) {
+      maybePrefetchProductAssistantFloat(primaryText)
+    }
+
+    if (kwFast) {
+      round.setLoading(true)
+      setLoadingProgress('正在查询产品库…', requestScope.sessionId)
+      startWaitProgressTimer(requestScope.sessionId)
+      try {
+        const resp = await productsApi.searchProducts(kwFast)
+        if (!isOwnerCurrent()) return
+        const respRow = asRecord(resp)
+        if (resp && resp.success === false) {
+          throw new Error(String(resp.message || '产品库查询失败'))
+        }
+        const raw = resp.data ?? respRow.products ?? respRow.items
+        const rows = asArray<Record<string, unknown>>(raw)
+        const lines = rows.slice(0, 3).map((row) => {
+          const m = String(row.model_number || '').trim()
+          const n = String(row.name || row.product_name || '-').trim()
+          const p = Number(row.price || 0)
+          const pf = Number.isFinite(p) ? p.toFixed(2) : '0.00'
+          return `- ${m || '-'} / ${n} / ￥${pf}`
+        })
+        const previewSuffix = lines.length ? `\n预览命中 ${rows.length} 条：\n${lines.join('\n')}` : ''
+        const hasResults = lines.length > 0
+        const responseText = hasResults
+          ? `已帮你打开产品副窗并带入「${kwFast}」。可在卡片中查看与修改。${previewSuffix}`
+          : `未在产品库中找到「${kwFast}」，请确认型号或关键词后重试。`
+        const payload: ChatPlannerPayload = {
+          success: true,
+          response: responseText,
+          ...(hasResults ? { autoAction: { type: 'show_products_float', query: kwFast } } : {}),
+        }
+        const mappedRows = rows.slice(0, 20).map((r) => ({
+          id: r.id,
+          model_number: r.model_number || '',
+          name: r.name || r.product_name || '',
+          price: Number(r.price || 0),
+          unit: r.unit || '',
+        }))
+        const totalFromApi = typeof respRow.total === 'number' ? respRow.total : rows.length
+        await recordProductFastPathTask(requestScope.sessionId, primaryText, kwFast, mappedRows, totalFromApi, responseText)
+        await addRoundMessage(payload.response || '')
+        await Promise.all([
+          saveMessage('user', primaryText, requestScope.sessionId),
+          saveMessage('ai', payload.response || '', requestScope.sessionId),
+        ])
+        if (!round.isActive()) return
+        syncTaskFromChatResponse(payload, primaryText)
+        attachContextSummaryToLastAiMessage()
+        attachThinkingStepsToLastAiMessage(payload)
+        attachTodoStepsToLastAiMessage(payload)
+        attachWorkflowTraceToLastAiMessage(payload)
+        attachApprovalCardToLastAiMessage(payload)
+        attachBusinessResultToLastAiMessage(payload)
+        if (!payload.task && (payload.autoAction?.type === 'show_products_float' || payload.autoAction?.type === 'show_products')) {
+          currentTask.value = null
+        }
+        if (payload.autoAction) {
+          handleAutoAction(
+            {
+              ...payload.autoAction,
+              hydrateProductSearch: { rows: mappedRows, total: totalFromApi },
+            },
+            primaryText,
+          )
+        }
+        return
+      } catch {
+        /* 回退到下方 unified / chat 全链路 */
+      } finally {
+        round.setLoading(false)
+        if (isOwnerCurrent()) stopLoadingProgress(requestScope.sessionId)
+      }
+    }
+
+    if (!isOwnerCurrent()) return
+    recordChatModelRoute(requestScope.sessionId, null, identity)
+    if (remoteMessages.length === 1 && isChatStreamEnabled()) {
+      const primaryForStream = remoteMessages[0] || ''
+      round.setStreaming(true)
+      round.setLoading(true)
+      setLoadingProgress('正在流式生成回复…', requestScope.sessionId)
+      startWaitProgressTimer(requestScope.sessionId)
+      const baseS = resolveChatTimeoutMs(primaryForStream)
+      const timeoutMsS = Math.min(120000, baseS)
+      const controller = new AbortController()
+      const streamState = { stalled: false }
+      const officeToolRun = isOfficeEltToolMessage(primaryForStream)
+      const workflowControl = isWorkflowControlMessage(primaryForStream)
+      const abort = () => controller.abort()
+      if (!officeToolRun) {
+        requestScope.signal?.addEventListener('abort', abort, { once: true })
+        if (requestScope.signal?.aborted) abort()
+      }
+      let killTimer = 0
+      const stallTimer = officeToolRun || workflowControl ? 0 : window.setTimeout(() => {
+        streamState.stalled = true
+        controller.abort()
+      }, CHAT_STREAM_STALL_MS)
+      const armDeadline = () => {
+        if (officeToolRun) return
+        window.clearTimeout(killTimer)
+        killTimer = window.setTimeout(() => {
+          controller.abort()
+        }, timeoutMsS)
+      }
+      armDeadline()
+      const msgIndex = pushStreamingAiShell()
+      const streamMessage = messages.value[msgIndex]
+      if (streamMessage) streamMessage.turnId = requestScope.turnId
+      const consumeRoute = (value: unknown) => {
+        if (!round.isActive()) return
+        const route = readChatModelRoute(value)
+        if (!route) return
+        recordChatModelRoute(requestScope.sessionId, route, identity)
+        if (streamMessage) streamMessage.routeMetadata = route
+      }
+      const syncStreamRun = (payload: unknown, attachTrace = false) => {
+        const runId = extractAgentRunId(payload) || streamRunId
+        if (!round.isActive() || !runId) return
+        void syncAgentRunFromPayload({ ...asRecord(payload), run_id: runId }, primaryText, round.isActive).then(() => {
+          if (attachTrace && round.isActive() && messages.value[msgIndex] === streamMessage
+            && !messages.value.slice(msgIndex + 1).some(message => message?.role === 'ai')) {
+            attachAgentRunTraceToLastAiMessage(runId)
+          }
+        }).catch(() => undefined)
+      }
+      let streamPlain = ''
+      let doneResult: unknown = null
+      let awaitingAuthorization = false
+      let sseError: string | null = null
+      let failureExecution: ReturnType<typeof readChatExecution> = undefined
+      let sseOutcomeUnknown = false
+      let streamRunId = ''
+      const ttsShouldSpeakThisMessage = ttsEnabled.value
+      let receivedDone = false
+      try {
+        const { body } = buildPlannerChatRequestPayload(primaryForStream, opts, requestScope)
+        const res = await chatApi.sendChatStream(
+          { ...body, message: String(body.message || primaryForStream) } as ChatRequest & Record<string, unknown>,
+          { signal: controller.signal },
+        )
+        if (!isOwnerCurrent()) { controller.abort(); return }
+        if (!res.ok) {
+          throw Object.assign(new Error(await parseChatStreamErrorResponse(res, consumeRoute)), { status: res.status })
+        }
+        await readPlannerSseResponse(res, (ev: PlannerSseEvent) => {
+          if (!isOwnerCurrent()) { controller.abort(); return }
+          const heartbeat = (ev.type === 'token' && ev.ephemeral === true)
+            || (ev.type === 'tool_progress' && ev.phase === 'accepted')
+          if ((ev.type === 'token' || ev.type === 'tool_progress' || ev.type === 'model_activity') && !heartbeat) {
+            // Legacy tools send a visible call marker, then can execute silently
+            // for minutes. Run creation alone is not evidence of model progress.
+            if (ev.type === 'model_activity' || (ev.type === 'token' && ev.text.trim())
+              || (ev.type === 'tool_progress' && ev.phase !== 'started')) {
+              window.clearTimeout(stallTimer)
+            }
+            armDeadline()
+          }
+          if (ev.type === 'route_metadata') {
+            consumeRoute(ev.route_metadata)
+          } else if (ev.type === 'tool_progress') {
+            streamRunId = ev.run_id || streamRunId
+            const hint = String(ev.text || ev.label || '').trim()
+            if (round.isActive() && streamMessage && hint) streamMessage.waitingHint = hint
+            setLoadingProgress(hint || '正在执行任务…', requestScope.sessionId)
+            if (streamRunId) syncStreamRun({ run_id: streamRunId })
+          } else if (ev.type === 'token') {
+            if (ev.ephemeral) {
+              const hint = String(ev.text || '').replace(/\s+/g, ' ').trim()
+              if (round.isActive() && streamMessage && hint) streamMessage.waitingHint = hint
+              setLoadingProgress(hint || '仍在等待模型响应…', requestScope.sessionId)
+            } else {
+              streamPlain += ev.text || ''
+              if (round.isActive()) {
+                applyPlainTextToMessageIndex(msgIndex, streamPlain)
+                if (streamMessage) delete streamMessage.waitingHint
+              }
+              setLoadingProgress('正在生成回复…', requestScope.sessionId)
+            }
+          } else if (ev.type === 'done') {
+            doneResult = ev.result
+            receivedDone = true
+            awaitingAuthorization = false
+          } else if (ev.type === 'error') {
+            consumeRoute(ev.route_metadata)
+            streamRunId = ev.run_id || streamRunId
+            if (streamRunId) syncStreamRun({ run_id: streamRunId })
+            sseOutcomeUnknown = Boolean(ev.requires_reconciliation || ev.execution_outcome === 'unknown')
+            sseError = String(ev.message || '流式接口错误')
+            failureExecution = readChatExecution(ev.result || ev) || failureExecution
+          } else if (ev.type === 'requires_token') {
+            awaitingAuthorization = true
+            streamRunId = ev.run_id || streamRunId
+            if (!round.isActive()) return
+            const tokenName = ev.token_name || ''
+            const tokenDesc = ev.token_description || ''
+            handleChatRequiresToken(tokenName, tokenDesc, remoteMessages)
+            streamPlain += `\n[需要授权：${tokenDesc || tokenName || '授权信息'}]\n`
+            if (round.isActive()) applyPlainTextToMessageIndex(msgIndex, streamPlain)
+            const upTok = String(tokenName || '').toUpperCase()
+            if (upTok.includes('WRITE') || /写入|导入|入库|二级|数据库写入|DB_WRITE/i.test(String(tokenDesc || ''))) {
+              plannerWriteUnlockResumeDraft.value = streamPlain
+            }
+          }
+        }, controller.signal)
+        if (!isOwnerCurrent()) return
+        if (sseError) {
+          throw new Error(sseError)
+        }
+        if (awaitingAuthorization) {
+          if (streamRunId) syncStreamRun({ run_id: streamRunId })
+          return
+        }
+        if (!receivedDone) throw new IncompletePlannerSseError()
+        const donePayload = asPlannerPayload(doneResult)
+        consumeRoute(donePayload.route_metadata)
+        const finalText = collapseExactDuplicateReply(String(donePayload.response ?? streamPlain).trim() || streamPlain || '（无内容）')
+        if (round.isActive()) {
+          const extras = responseExtras(donePayload) || {}
+          if (responseCameFromCache(donePayload)) extras.sameAsPrevious = true
+          if (extras && Object.keys(extras).length) applyPlainTextToMessageIndex(msgIndex, finalText, extras)
+          else applyPlainTextToMessageIndex(msgIndex, finalText)
+          observeModelOutcome(finalText, donePayload)
+          if (streamMessage && requiresTurnReconciliation(donePayload)) {
+            streamMessage.workflowAction = 'unknown'
+          }
+        }
+        if (round.isActive() && ttsShouldSpeakThisMessage && ttsEnabled.value && donePayload.success !== false) {
+          const clean = stripPlannerDisplayMarkers(finalText.replace(/（正在(?:将 Excel 导入数据库|生成 Word 文档|生成 Excel 工作簿|生成可下载文件)(?:[^（）]|（[^（）]*）)*）/g, '\n')).trim()
+          if (clean && clean !== '（无内容）') queueVoice(clean)
+        }
+        if (!round.isActive()) return
+        const wrap: ChatPlannerPayload = doneResult && typeof doneResult === 'object' ? donePayload : { success: true, response: finalText }
+        syncTaskFromChatResponse(wrap, primaryText)
+        syncStreamRun(wrap, true)
+        consumeStateUpdates(wrap)
+        attachContextSummaryToLastAiMessage()
+        attachThinkingStepsToLastAiMessage(wrap)
+        attachTodoStepsToLastAiMessage(wrap)
+        attachWorkflowTraceToLastAiMessage(wrap)
+        attachApprovalCardToLastAiMessage(wrap)
+        attachBusinessResultToLastAiMessage(wrap)
+        if (requiresTurnReconciliation(wrap)) return
+        if (wrap.task) {
+          showTaskConfirm(wrap.task)
+          emitAssistantPush({
+            title: asString(asRecord(wrap.task).title || '新任务'),
+            description: asString(asRecord(wrap.task).description || '收到一条任务，请处理'),
+          })
+        }
+        if (!wrap.task && (wrap?.autoAction?.type === 'show_products_float' || wrap?.autoAction?.type === 'show_products')) {
+          currentTask.value = null
+        }
+        if (wrap.autoAction) {
+          handleAutoAction(wrap.autoAction, primaryText)
+        }
+        if (wrap.task) {
+          maybeCloseAssistantFloatForShipmentTask(wrap.task, wrap.autoAction)
+        }
+      } catch (err: unknown) {
+        if (Number(asRecord(err).status) === 401 && round.isActive()) void probeEnterpriseSession()
+        const timedOut = asRecord(err).name === 'AbortError'
+        const stallText = `请求超时（>${Math.floor(CHAT_STREAM_STALL_MS / 1000)}s）。本轮尚未收到完成回执。`
+        const errText =
+          timedOut
+            ? streamRunId
+              ? '对话连接已超时，任务可能仍在执行。请到任务工作区核对结果，勿重复提交。'
+              : streamState.stalled
+                ? stallText
+                : `请求超时（>${Math.floor(timeoutMsS / 1000)}s）或已中断`
+            : errorMessage(err, '流式对话失败')
+        const dropped = !sseError && (timedOut || err instanceof IncompletePlannerSseError
+          || [408, 502, 503, 504].includes(Number(asRecord(err).status))
+          || /failed to fetch|networkerror|econnrefused|econnreset|err_connection|socket hang up|load failed|网络中断|连接中断/i.test(errText))
+        if (dropped && round.isActive()) {
+          let presentation = droppedRoundPresentation({ reachable: false })
+          try {
+            const convo = await chatApi.getConversation(String(requestScope.sessionId || ''))
+            presentation = droppedRoundFromHistory(convo, String(requestScope.turnId || ''))
+          } catch {
+            presentation = droppedRoundPresentation({ reachable: false })
+          }
+          if (!round.isActive()) return
+          const pendingText = err instanceof IncompletePlannerSseError
+            ? `${streamPlain.trim()}${streamPlain.trim() ? '\n\n' : ''}[回复未完成] `
+            : timedOut ? `${errText}\n` : ''
+          const shown = `${presentation.status === 'unknown' ? pendingText : ''}${presentation.text}`
+          if (failureExecution) applyPlainTextToMessageIndex(msgIndex, shown, { execution: failureExecution })
+          else applyPlainTextToMessageIndex(msgIndex, shown)
+          observeModelOutcome(shown, failureExecution ? { execution: failureExecution } : undefined)
+          if (streamMessage) {
+            streamMessage.workflowAction = presentation.workflowAction
+            delete streamMessage.streamingShell
+            delete streamMessage.waitingHint
+          }
+        } else if (round.isActive()) {
+          const transport = /failed to fetch|networkerror|econnrefused|offline/i.test(errText) ? classifyRawError(errText) : null
+          const visibleError = err instanceof IncompletePlannerSseError
+            ? `${streamPlain.trim()}${streamPlain.trim() ? '\n\n' : ''}[回复未完成] ${errText}`
+            : transport || (timedOut && streamRunId ? errText : `处理失败：${errText}`)
+          if (failureExecution) applyPlainTextToMessageIndex(msgIndex, visibleError, { execution: failureExecution })
+          else applyPlainTextToMessageIndex(msgIndex, visibleError)
+          observeModelOutcome(visibleError, failureExecution ? { execution: failureExecution } : undefined)
+          if (streamMessage) {
+            streamMessage.workflowAction = sseOutcomeUnknown ? 'unknown' : 'failed'
+            delete streamMessage.streamingShell
+            delete streamMessage.waitingHint
+          }
+        }
+        if (streamRunId) syncStreamRun({ run_id: streamRunId })
+      } finally {
+        if (round.isActive() && streamMessage) delete streamMessage.waitingHint
+        if (round.isActive() && streamMessage?.streamingShell) {
+          const leftover = streamPlain.trim()
+          const unfinished = leftover
+            ? `${leftover}\n\n[回复未完成] 本轮回复已结束，但没有完成回执。请重试。`
+            : '处理失败：本轮回复已结束，但没有收到正文。请重试。'
+          if (failureExecution) applyPlainTextToMessageIndex(msgIndex, unfinished, { execution: failureExecution })
+          else applyPlainTextToMessageIndex(msgIndex, unfinished)
+          observeModelOutcome(unfinished, failureExecution ? { execution: failureExecution } : undefined)
+          streamMessage.workflowAction = 'failed'
+          delete streamMessage.streamingShell
+          delete streamMessage.waitingHint
+        }
+        if (round.isActive()) deps.flushMessagesCache?.()
+        round.setStreaming(false)
+        window.clearTimeout(stallTimer)
+        window.clearTimeout(killTimer)
+        requestScope.signal?.removeEventListener('abort', abort)
+        round.setLoading(false)
+        if (isOwnerCurrent()) stopLoadingProgress(requestScope.sessionId)
+      }
+      return
+    }
+
+    round.setLoading(true)
+    round.setStreaming(false)
+    setLoadingProgress('正在理解你的问题...', requestScope.sessionId)
+    let data: ChatPlannerPayload = {}
+    try {
+      // 不再在发聊天前阻塞等待 /api/ai/test（最多 3s），否则「慢」往往来自这里而非 AI
+      setLoadingProgress(
+        remoteMessages.length > 1 ? `正在批量处理 ${remoteMessages.length} 条消息...` : '正在整理上下文...',
+        requestScope.sessionId,
+      )
+      startWaitProgressTimer(requestScope.sessionId)
+      const base = resolveChatTimeoutMs(primaryText)
+      const timeoutMs = Math.min(120000, remoteMessages.length <= 1 ? base : base * remoteMessages.length)
+      let rawData: unknown
+      if (remoteMessages.length === 1) {
+        rawData = await requestChatByModeWithTimeout(remoteMessages[0], timeoutMs, opts, requestScope)
+      } else {
+        rawData = await requestChatByModeBatchWithTimeout(remoteMessages, timeoutMs, requestScope)
+      }
+      if (!isOwnerCurrent()) return
+      data = asPlannerPayload(rawData)
+      const head = remoteMessages.length === 1 ? data : asPlannerPayload(data.results?.[0])
+      const headData = asRecord(head.data)
+      setLoadingProgress('已收到响应，正在解析执行计划...', requestScope.sessionId)
+      if (headData.action === 'workflow_confirmation_required') {
+        setLoadingProgress('已生成计划，等待你确认执行...', requestScope.sessionId)
+      } else if (headData.action === 'workflow_done') {
+        setLoadingProgress('执行完成，正在整理结果...', requestScope.sessionId)
+      } else if (headData.action === 'workflow_failed') {
+        setLoadingProgress('执行失败，正在整理错误信息...', requestScope.sessionId)
+      }
+    } catch (err: unknown) {
+      const errorData = asRecord(asRecord(err).data)
+      const route = readChatModelRoute(errorData.route_metadata || asRecord(errorData.detail).route_metadata)
+      data = {
+        success: false,
+        message: errorMessage(err, '请求失败'),
+        ...(route ? { route_metadata: route } : {}),
+      }
+    } finally {
+      round.setStreaming(false)
+      round.setLoading(false)
+      if (isOwnerCurrent()) stopLoadingProgress(requestScope.sessionId)
+    }
+
+    if (!isOwnerCurrent()) return
+    if (!round.isActive()) return persistDetachedPlannerResult(data, requestScope.sessionId, saveMessage)
+    const receipt = data.batch && Array.isArray(data.results) ? data.results[data.results.length - 1] : data
+    recordChatModelRoute(requestScope.sessionId, receipt?.route_metadata, identity)
+    if (data.batch && Array.isArray(data.results)) {
+      const results = data.results.map((part) => asPlannerPayload(part))
+      if (data.success) {
+        for (const part of results) {
+          if (part && part.success) {
+            if (part.requires_token) {
+              handleChatRequiresToken(part.token_name || '', part.token_description || '', remoteMessages)
+            }
+            await addRoundMessage(part.response || '', responseExtras(part))
+            attachBusinessResultToLastAiMessage(part)
+            if (!round.isActive()) return
+            syncTaskFromChatResponse(part, primaryText)
+            await syncAgentRunFromPayload(part, primaryText, isOwnerCurrent)
+            if (!round.isActive()) return
+            attachAgentRunTraceToLastAiMessage(extractAgentRunId(part))
+          } else {
+            await addRoundMessage('处理失败: ' + (part.message || '未知错误'), responseExtras(part, true))
+            attachBusinessResultToLastAiMessage(part)
+            if (requiresTurnReconciliation(part)) {
+              await syncAgentRunFromPayload(part, primaryText, isOwnerCurrent)
+              if (!round.isActive()) return
+              attachAgentRunTraceToLastAiMessage(extractAgentRunId(part))
+            }
+          }
+        }
+        attachContextSummaryToLastAiMessage()
+        const lastOk = [...results].reverse().find((p) => p && p.success)
+        if (lastOk) {
+          consumeStateUpdates(lastOk)
+          attachThinkingStepsToLastAiMessage(lastOk)
+          attachTodoStepsToLastAiMessage(lastOk)
+          attachWorkflowTraceToLastAiMessage(lastOk)
+          attachApprovalCardToLastAiMessage(lastOk)
+        }
+        if (results.some(requiresTurnReconciliation)) return
+        const lastTask = [...results].reverse().find((p) => p.task)
+        if (lastTask?.task) {
+          showTaskConfirm(lastTask.task)
+          const taskRow = asRecord(lastTask.task)
+          emitAssistantPush({
+            title: taskRow.title || '新任务',
+            description: taskRow.description || '收到一条任务，请处理',
+          })
+        }
+        const lastFloat = [...results]
+          .reverse()
+          .find((p) => p.autoAction?.type === 'show_products_float' || p.autoAction?.type === 'show_products')
+        if (!lastTask?.task && lastFloat?.autoAction) {
+          currentTask.value = null
+        }
+        const lastAction = [...results].reverse().find((p) => p.autoAction)
+        if (lastAction?.autoAction) {
+          handleAutoAction(lastAction.autoAction, remoteMessages[remoteMessages.length - 1] || '')
+        }
+        if (lastTask?.task) {
+          maybeCloseAssistantFloatForShipmentTask(lastTask.task, lastAction?.autoAction)
+        }
+      } else {
+        await addRoundMessage('处理失败: ' + (data.message || '批量请求失败'), responseExtras(data, true))
+        attachBusinessResultToLastAiMessage(data)
+      }
+      return
+    }
+
+    if (data.success) {
+      if (data?.requires_token) {
+        handleChatRequiresToken(data.token_name || '', data.token_description || '', remoteMessages)
+      }
+      await addRoundMessage(data.response || '', responseExtras(data))
+      observeModelOutcome(String(data.response || data.message || ''), data)
+      if (!round.isActive()) return
+      syncTaskFromChatResponse(data, primaryText)
+      await syncAgentRunFromPayload(data, primaryText, isOwnerCurrent)
+      if (!round.isActive()) return
+      attachAgentRunTraceToLastAiMessage(extractAgentRunId(data))
+      consumeStateUpdates(data)
+      attachContextSummaryToLastAiMessage()
+      attachThinkingStepsToLastAiMessage(data)
+      attachTodoStepsToLastAiMessage(data)
+      attachWorkflowTraceToLastAiMessage(data)
+      attachApprovalCardToLastAiMessage(data)
+      attachBusinessResultToLastAiMessage(data)
+      if (requiresTurnReconciliation(data)) return
+
+      if (data.task) {
+        showTaskConfirm(data.task)
+        const taskRow = asRecord(data.task)
+        emitAssistantPush({
+          title: taskRow.title || '新任务',
+          description: taskRow.description || '收到一条任务，请处理',
+        })
+      }
+      if (!data.task && (data?.autoAction?.type === 'show_products_float' || data?.autoAction?.type === 'show_products')) {
+        currentTask.value = null
+      }
+
+      if (data.autoAction) {
+        handleAutoAction(data.autoAction, primaryText)
+      }
+      if (data.task) {
+        maybeCloseAssistantFloatForShipmentTask(data.task, data.autoAction)
+      }
+    } else {
+      const failedText = '处理失败: ' + (data.message || '未知错误')
+      await addRoundMessage(failedText, responseExtras(data, true))
+      attachBusinessResultToLastAiMessage(data)
+      observeModelOutcome(failedText, data)
+      if (requiresTurnReconciliation(data)) {
+        await syncAgentRunFromPayload(data, primaryText, isOwnerCurrent)
+        if (!round.isActive()) return
+        attachAgentRunTraceToLastAiMessage(extractAgentRunId(data))
+      }
+    }
+  }
+
+  return {
+    consumeStateUpdates,
+    maybePrefetchProductAssistantFloat,
+    executeRemoteChatRound,
+  }
+}

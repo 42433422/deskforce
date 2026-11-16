@@ -1,0 +1,10 @@
+{
+  "username": "xcagi-enterprise-demo",
+  "display_name": "企业版演示",
+  "company_brand": "修茈演示企业",
+  "email": "enterprise-demo@xiu-ci.com",
+  "market_user_id": 33,
+  "market_base_url_official": "https://xiu-ci.com",
+  "market_token": "xcagi-local-surface-audit-demo",
+  "_note": "演示认证默认关闭；显式设置 SURFACE_AUDIT_DEMO_PASSWORD（兼容 SURFACE_AUDIT_ENTERPRISE_PASSWORD 或私有配置 password）。不修改官网账号或既有数据库。"
+}

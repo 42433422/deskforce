@@ -1,0 +1,735 @@
+{
+  "blind_third_party_adjudication": {
+    "adjudications": [
+      {
+        "absorbed_signal": "security_ranked_pr_review",
+        "accepted": true,
+        "blind_baseline_capability": 20,
+        "blind_recomputed_delta": 80,
+        "blind_retort_capability": 100,
+        "case_id": "pr-agent-secret-context",
+        "checks": {
+          "context_evidence": true,
+          "delta_at_least_65": true,
+          "publishable_evidence": true,
+          "score_fields_not_required": true,
+          "severity_evidence": true
+        },
+        "source_project": "qodo-ai/pr-agent"
+      },
+      {
+        "absorbed_signal": "ci_review_publisher_safety",
+        "accepted": true,
+        "blind_baseline_capability": 20,
+        "blind_recomputed_delta": 80,
+        "blind_retort_capability": 100,
+        "case_id": "reviewdog-workflow-token",
+        "checks": {
+          "context_evidence": true,
+          "delta_at_least_65": true,
+          "publishable_evidence": true,
+          "score_fields_not_required": true,
+          "severity_evidence": true
+        },
+        "source_project": "reviewdog/reviewdog"
+      },
+      {
+        "absorbed_signal": "evaluation_harness_oracle",
+        "accepted": true,
+        "blind_baseline_capability": 20,
+        "blind_recomputed_delta": 80,
+        "blind_retort_capability": 100,
+        "case_id": "swe-bench-oracle-placeholder",
+        "checks": {
+          "context_evidence": true,
+          "delta_at_least_65": true,
+          "publishable_evidence": true,
+          "score_fields_not_required": true,
+          "severity_evidence": true
+        },
+        "source_project": "swe-bench/SWE-bench"
+      },
+      {
+        "absorbed_signal": "architecture_contract_guard",
+        "accepted": true,
+        "blind_baseline_capability": 20,
+        "blind_recomputed_delta": 80,
+        "blind_retort_capability": 100,
+        "case_id": "import-linter-contract-bypass",
+        "checks": {
+          "context_evidence": true,
+          "delta_at_least_65": true,
+          "publishable_evidence": true,
+          "score_fields_not_required": true,
+          "severity_evidence": true
+        },
+        "source_project": "seddonym/import-linter"
+      },
+      {
+        "absorbed_signal": "context_packaging_noise_control",
+        "accepted": true,
+        "blind_baseline_capability": 20,
+        "blind_recomputed_delta": 80,
+        "blind_retort_capability": 100,
+        "case_id": "repomix-context-package-clean",
+        "checks": {
+          "context_evidence": true,
+          "delta_at_least_65": true,
+          "publishable_evidence": true,
+          "score_fields_not_required": true,
+          "severity_evidence": true
+        },
+        "source_project": "yamadashy/repomix"
+      },
+      {
+        "absorbed_signal": "typescript_diff_hunk_review",
+        "accepted": true,
+        "blind_baseline_capability": 20,
+        "blind_recomputed_delta": 80,
+        "blind_retort_capability": 100,
+        "case_id": "mopemope-typescript-diff-review",
+        "checks": {
+          "context_evidence": true,
+          "delta_at_least_65": true,
+          "publishable_evidence": true,
+          "score_fields_not_required": true,
+          "severity_evidence": true
+        },
+        "source_project": "mopemope/pr-ai-review-bot"
+      }
+    ],
+    "evidence": {
+      "acceptance_delta_floor": 65,
+      "adjudicator": "retort_engine.external_advantage_adjudicator.blind_third_party_adjudicate_external_advantages",
+      "independence_boundary": "redacted_structural_facts_only_no_baseline_or_retort_score_fields"
+    },
+    "status": "ready",
+    "summary": {
+      "accepted_case_count": 6,
+      "adjudicated_case_count": 6,
+      "all_cases_accepted": true,
+      "all_delta_at_least_65": true,
+      "average_blind_recomputed_delta": 80.0,
+      "minimum_blind_recomputed_delta": 80,
+      "score_fields_consumed": false
+    }
+  },
+  "evidence": {
+    "absorbed_signals": [
+      "architecture_contract_guard",
+      "ci_review_publisher_safety",
+      "context_packaging_noise_control",
+      "evaluation_harness_oracle",
+      "security_ranked_pr_review",
+      "typescript_diff_hunk_review"
+    ],
+    "baseline_model": "pre_absorption_keyword_review_without_context_groups_publish_anchors_or_extension_policy",
+    "blind_third_party_adjudicator": "retort_engine.external_advantage_adjudicator.blind_third_party_adjudicate_external_advantages",
+    "blind_third_party_boundary": "redacted_structural_facts_only_no_baseline_or_retort_score_fields",
+    "comparison": "same_external_advantage_cases_replayed_before_after_absorption",
+    "independent_adjudicator": "retort_engine.external_advantage_adjudicator.adjudicate_external_advantage_rows",
+    "regression_model": "executable_input_output_diff_replay",
+    "regression_runtime": "retort_engine.pr_review.review_diff",
+    "regression_test_module": "tests/test_external_advantage_regression.py",
+    "regression_verifier": "retort_engine.external_advantage_regression.verify_external_advantage_rows",
+    "retort_model": "retort_engine.pr_review.review_diff",
+    "source_projects": [
+      "mopemope/pr-ai-review-bot",
+      "qodo-ai/pr-agent",
+      "reviewdog/reviewdog",
+      "seddonym/import-linter",
+      "swe-bench/SWE-bench",
+      "yamadashy/repomix"
+    ]
+  },
+  "independent_adjudication": {
+    "adjudications": [
+      {
+        "accepted": true,
+        "baseline_recomputed_score": 35,
+        "case_id": "pr-agent-secret-context",
+        "checks": {
+          "extension_policy_or_context": true,
+          "positive_delta": true,
+          "severity_context_publishability": true
+        },
+        "recomputed_delta": 65,
+        "retort_recomputed_score": 100,
+        "source_project": "qodo-ai/pr-agent"
+      },
+      {
+        "accepted": true,
+        "baseline_recomputed_score": 35,
+        "case_id": "reviewdog-workflow-token",
+        "checks": {
+          "extension_policy_or_context": true,
+          "positive_delta": true,
+          "severity_context_publishability": true
+        },
+        "recomputed_delta": 65,
+        "retort_recomputed_score": 100,
+        "source_project": "reviewdog/reviewdog"
+      },
+      {
+        "accepted": true,
+        "baseline_recomputed_score": 35,
+        "case_id": "swe-bench-oracle-placeholder",
+        "checks": {
+          "extension_policy_or_context": true,
+          "positive_delta": true,
+          "severity_context_publishability": true
+        },
+        "recomputed_delta": 65,
+        "retort_recomputed_score": 100,
+        "source_project": "swe-bench/SWE-bench"
+      },
+      {
+        "accepted": true,
+        "baseline_recomputed_score": 35,
+        "case_id": "import-linter-contract-bypass",
+        "checks": {
+          "extension_policy_or_context": true,
+          "positive_delta": true,
+          "severity_context_publishability": true
+        },
+        "recomputed_delta": 65,
+        "retort_recomputed_score": 100,
+        "source_project": "seddonym/import-linter"
+      },
+      {
+        "accepted": true,
+        "baseline_recomputed_score": 35,
+        "case_id": "repomix-context-package-clean",
+        "checks": {
+          "extension_policy_or_context": true,
+          "positive_delta": true,
+          "severity_context_publishability": true
+        },
+        "recomputed_delta": 65,
+        "retort_recomputed_score": 100,
+        "source_project": "yamadashy/repomix"
+      },
+      {
+        "accepted": true,
+        "baseline_recomputed_score": 35,
+        "case_id": "mopemope-typescript-diff-review",
+        "checks": {
+          "extension_policy_or_context": true,
+          "positive_delta": true,
+          "severity_context_publishability": true
+        },
+        "recomputed_delta": 65,
+        "retort_recomputed_score": 100,
+        "source_project": "mopemope/pr-ai-review-bot"
+      }
+    ],
+    "evidence": {
+      "adjudicator": "retort_engine.external_advantage_adjudicator",
+      "independence_boundary": "consumes_serialized_matrix_rows_without_calling_review_diff_or_matrix_scoring"
+    },
+    "status": "ready",
+    "summary": {
+      "accepted_case_count": 6,
+      "adjudicated_case_count": 6,
+      "all_cases_accepted": true,
+      "average_recomputed_delta": 65.0,
+      "minimum_recomputed_delta": 65,
+      "severity_context_publishability_all_verified": true
+    }
+  },
+  "matrix": [
+    {
+      "absorbed_signal": "security_ranked_pr_review",
+      "baseline": {
+        "context_matched": false,
+        "detected_severity": "high",
+        "extension_policy_known_count": 0,
+        "model": "keyword_only_pre_absorption",
+        "publishable_comment_count": 0,
+        "score": 40,
+        "severity_matched": true,
+        "task_group_count": 0
+      },
+      "behavior_delta": 55,
+      "case_id": "pr-agent-secret-context",
+      "diff": "diff --git a/pr_agent/settings.py b/pr_agent/settings.py\n--- a/pr_agent/settings.py\n+++ b/pr_agent/settings.py\n@@ -0,0 +1,1 @@\n+OPENAI_API_TOKEN = \"live-secret-value\"\n",
+      "expected_context": "security",
+      "expected_severity": "high",
+      "external_advantage": "PR agent style secret review should surface credential leaks as publishable blockers.",
+      "ready": true,
+      "retort": {
+        "comment_count": 2,
+        "context_matched": true,
+        "extension_policy_contexts": [
+          "runtime"
+        ],
+        "extension_policy_known_count": 1,
+        "model": "retort_current_review_diff",
+        "observed_contexts": [
+          "config",
+          "security"
+        ],
+        "observed_severities": [
+          "high",
+          "medium"
+        ],
+        "publishable_comment_count": 2,
+        "score": 95,
+        "severity_matched": true,
+        "task_group_count": 3
+      },
+      "source_project": "qodo-ai/pr-agent"
+    },
+    {
+      "absorbed_signal": "ci_review_publisher_safety",
+      "baseline": {
+        "context_matched": false,
+        "detected_severity": "high",
+        "extension_policy_known_count": 0,
+        "model": "keyword_only_pre_absorption",
+        "publishable_comment_count": 0,
+        "score": 40,
+        "severity_matched": true,
+        "task_group_count": 0
+      },
+      "behavior_delta": 55,
+      "case_id": "reviewdog-workflow-token",
+      "diff": "diff --git a/.github/workflows/review.yml b/.github/workflows/review.yml\n--- a/.github/workflows/review.yml\n+++ b/.github/workflows/review.yml\n@@ -0,0 +1,1 @@\n+REVIEWDOG_TOKEN: \"review-token-value\"\n",
+      "expected_context": "ci_config",
+      "expected_severity": "high",
+      "external_advantage": "Review publisher workflows need CI context and credential safety at the same time.",
+      "ready": true,
+      "retort": {
+        "comment_count": 1,
+        "context_matched": true,
+        "extension_policy_contexts": [
+          "ci_config"
+        ],
+        "extension_policy_known_count": 1,
+        "model": "retort_current_review_diff",
+        "observed_contexts": [
+          "ci_config"
+        ],
+        "observed_severities": [
+          "high"
+        ],
+        "publishable_comment_count": 1,
+        "score": 95,
+        "severity_matched": true,
+        "task_group_count": 1
+      },
+      "source_project": "reviewdog/reviewdog"
+    },
+    {
+      "absorbed_signal": "evaluation_harness_oracle",
+      "baseline": {
+        "context_matched": false,
+        "detected_severity": "medium",
+        "extension_policy_known_count": 0,
+        "model": "keyword_only_pre_absorption",
+        "publishable_comment_count": 0,
+        "score": 40,
+        "severity_matched": true,
+        "task_group_count": 0
+      },
+      "behavior_delta": 55,
+      "case_id": "swe-bench-oracle-placeholder",
+      "diff": "diff --git a/swebench/harness/run_evaluation.py b/swebench/harness/run_evaluation.py\n--- a/swebench/harness/run_evaluation.py\n+++ b/swebench/harness/run_evaluation.py\n@@ -0,0 +1,1 @@\n+# TODO: replace oracle stub before benchmark publication\n",
+      "expected_context": "runtime",
+      "expected_severity": "medium",
+      "external_advantage": "Benchmark harness changes must reject placeholder oracles before claiming quality.",
+      "ready": true,
+      "retort": {
+        "comment_count": 2,
+        "context_matched": true,
+        "extension_policy_contexts": [
+          "runtime"
+        ],
+        "extension_policy_known_count": 1,
+        "model": "retort_current_review_diff",
+        "observed_contexts": [
+          "runtime",
+          "tests"
+        ],
+        "observed_severities": [
+          "medium",
+          "low"
+        ],
+        "publishable_comment_count": 2,
+        "score": 95,
+        "severity_matched": true,
+        "task_group_count": 2
+      },
+      "source_project": "swe-bench/SWE-bench"
+    },
+    {
+      "absorbed_signal": "architecture_contract_guard",
+      "baseline": {
+        "context_matched": false,
+        "detected_severity": "medium",
+        "extension_policy_known_count": 0,
+        "model": "keyword_only_pre_absorption",
+        "publishable_comment_count": 0,
+        "score": 40,
+        "severity_matched": true,
+        "task_group_count": 0
+      },
+      "behavior_delta": 55,
+      "case_id": "import-linter-contract-bypass",
+      "diff": "diff --git a/importlinter/contracts/layers.py b/importlinter/contracts/layers.py\n--- a/importlinter/contracts/layers.py\n+++ b/importlinter/contracts/layers.py\n@@ -0,0 +1,1 @@\n+# FIXME: bypass contract violation until next release\n",
+      "expected_context": "runtime",
+      "expected_severity": "medium",
+      "external_advantage": "Architecture governance projects should detect contract bypasses as behavior risk.",
+      "ready": true,
+      "retort": {
+        "comment_count": 1,
+        "context_matched": true,
+        "extension_policy_contexts": [
+          "runtime"
+        ],
+        "extension_policy_known_count": 1,
+        "model": "retort_current_review_diff",
+        "observed_contexts": [
+          "runtime"
+        ],
+        "observed_severities": [
+          "medium"
+        ],
+        "publishable_comment_count": 1,
+        "score": 95,
+        "severity_matched": true,
+        "task_group_count": 1
+      },
+      "source_project": "seddonym/import-linter"
+    },
+    {
+      "absorbed_signal": "context_packaging_noise_control",
+      "baseline": {
+        "context_matched": false,
+        "detected_severity": "info",
+        "extension_policy_known_count": 0,
+        "model": "keyword_only_pre_absorption",
+        "publishable_comment_count": 0,
+        "score": 40,
+        "severity_matched": true,
+        "task_group_count": 0
+      },
+      "behavior_delta": 55,
+      "case_id": "repomix-context-package-clean",
+      "diff": "diff --git a/docs/context-pack.md b/docs/context-pack.md\n--- a/docs/context-pack.md\n+++ b/docs/context-pack.md\n@@ -0,0 +1,1 @@\n+Document deterministic context packaging inputs and output hashes.\n",
+      "expected_context": "docs",
+      "expected_severity": "info",
+      "external_advantage": "Context packagers should avoid false blockers on clean docs-only packaging updates.",
+      "ready": true,
+      "retort": {
+        "comment_count": 1,
+        "context_matched": true,
+        "extension_policy_contexts": [
+          "docs"
+        ],
+        "extension_policy_known_count": 1,
+        "model": "retort_current_review_diff",
+        "observed_contexts": [
+          "docs"
+        ],
+        "observed_severities": [
+          "info"
+        ],
+        "publishable_comment_count": 1,
+        "score": 95,
+        "severity_matched": true,
+        "task_group_count": 1
+      },
+      "source_project": "yamadashy/repomix"
+    },
+    {
+      "absorbed_signal": "typescript_diff_hunk_review",
+      "baseline": {
+        "context_matched": false,
+        "detected_severity": "medium",
+        "extension_policy_known_count": 0,
+        "model": "keyword_only_pre_absorption",
+        "publishable_comment_count": 0,
+        "score": 40,
+        "severity_matched": true,
+        "task_group_count": 0
+      },
+      "behavior_delta": 55,
+      "case_id": "mopemope-typescript-diff-review",
+      "diff": "diff --git a/src/reviewer.ts b/src/reviewer.ts\n--- a/src/reviewer.ts\n+++ b/src/reviewer.ts\n@@ -0,0 +1,1 @@\n+// TODO: retry review dispatch without duplicate comments\n",
+      "expected_context": "runtime",
+      "expected_severity": "medium",
+      "external_advantage": "TypeScript PR bots need extension-aware review for async review flows.",
+      "ready": true,
+      "retort": {
+        "comment_count": 1,
+        "context_matched": true,
+        "extension_policy_contexts": [
+          "runtime"
+        ],
+        "extension_policy_known_count": 1,
+        "model": "retort_current_review_diff",
+        "observed_contexts": [
+          "runtime"
+        ],
+        "observed_severities": [
+          "medium"
+        ],
+        "publishable_comment_count": 1,
+        "score": 95,
+        "severity_matched": true,
+        "task_group_count": 1
+      },
+      "source_project": "mopemope/pr-ai-review-bot"
+    }
+  ],
+  "project": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine",
+  "regression": {
+    "cases": [
+      {
+        "absorbed_signal": "security_ranked_pr_review",
+        "baseline_score": 40,
+        "behavior_delta": 55,
+        "case_id": "pr-agent-secret-context",
+        "checks": {
+          "before_after_scores": true,
+          "direct_review_execution": true,
+          "expected_context": true,
+          "expected_severity": true,
+          "positive_delta": true,
+          "publishable_output": true
+        },
+        "direct_review_assertions": {
+          "comment_count": 2,
+          "context_matched": true,
+          "executed": true,
+          "observed_contexts": [
+            "config",
+            "runtime",
+            "security"
+          ],
+          "observed_severities": [
+            "high",
+            "medium"
+          ],
+          "publishable_comment_count": 2,
+          "publishable_output": true,
+          "severity_matched": true
+        },
+        "passed": true,
+        "retort_score": 95,
+        "source_project": "qodo-ai/pr-agent"
+      },
+      {
+        "absorbed_signal": "ci_review_publisher_safety",
+        "baseline_score": 40,
+        "behavior_delta": 55,
+        "case_id": "reviewdog-workflow-token",
+        "checks": {
+          "before_after_scores": true,
+          "direct_review_execution": true,
+          "expected_context": true,
+          "expected_severity": true,
+          "positive_delta": true,
+          "publishable_output": true
+        },
+        "direct_review_assertions": {
+          "comment_count": 1,
+          "context_matched": true,
+          "executed": true,
+          "observed_contexts": [
+            "ci_config"
+          ],
+          "observed_severities": [
+            "high"
+          ],
+          "publishable_comment_count": 1,
+          "publishable_output": true,
+          "severity_matched": true
+        },
+        "passed": true,
+        "retort_score": 95,
+        "source_project": "reviewdog/reviewdog"
+      },
+      {
+        "absorbed_signal": "evaluation_harness_oracle",
+        "baseline_score": 40,
+        "behavior_delta": 55,
+        "case_id": "swe-bench-oracle-placeholder",
+        "checks": {
+          "before_after_scores": true,
+          "direct_review_execution": true,
+          "expected_context": true,
+          "expected_severity": true,
+          "positive_delta": true,
+          "publishable_output": true
+        },
+        "direct_review_assertions": {
+          "comment_count": 2,
+          "context_matched": true,
+          "executed": true,
+          "observed_contexts": [
+            "runtime",
+            "tests"
+          ],
+          "observed_severities": [
+            "low",
+            "medium"
+          ],
+          "publishable_comment_count": 2,
+          "publishable_output": true,
+          "severity_matched": true
+        },
+        "passed": true,
+        "retort_score": 95,
+        "source_project": "swe-bench/SWE-bench"
+      },
+      {
+        "absorbed_signal": "architecture_contract_guard",
+        "baseline_score": 40,
+        "behavior_delta": 55,
+        "case_id": "import-linter-contract-bypass",
+        "checks": {
+          "before_after_scores": true,
+          "direct_review_execution": true,
+          "expected_context": true,
+          "expected_severity": true,
+          "positive_delta": true,
+          "publishable_output": true
+        },
+        "direct_review_assertions": {
+          "comment_count": 1,
+          "context_matched": true,
+          "executed": true,
+          "observed_contexts": [
+            "runtime"
+          ],
+          "observed_severities": [
+            "medium"
+          ],
+          "publishable_comment_count": 1,
+          "publishable_output": true,
+          "severity_matched": true
+        },
+        "passed": true,
+        "retort_score": 95,
+        "source_project": "seddonym/import-linter"
+      },
+      {
+        "absorbed_signal": "context_packaging_noise_control",
+        "baseline_score": 40,
+        "behavior_delta": 55,
+        "case_id": "repomix-context-package-clean",
+        "checks": {
+          "before_after_scores": true,
+          "direct_review_execution": true,
+          "expected_context": true,
+          "expected_severity": true,
+          "positive_delta": true,
+          "publishable_output": true
+        },
+        "direct_review_assertions": {
+          "comment_count": 1,
+          "context_matched": true,
+          "executed": true,
+          "observed_contexts": [
+            "docs"
+          ],
+          "observed_severities": [
+            "info"
+          ],
+          "publishable_comment_count": 1,
+          "publishable_output": true,
+          "severity_matched": true
+        },
+        "passed": true,
+        "retort_score": 95,
+        "source_project": "yamadashy/repomix"
+      },
+      {
+        "absorbed_signal": "typescript_diff_hunk_review",
+        "baseline_score": 40,
+        "behavior_delta": 55,
+        "case_id": "mopemope-typescript-diff-review",
+        "checks": {
+          "before_after_scores": true,
+          "direct_review_execution": true,
+          "expected_context": true,
+          "expected_severity": true,
+          "positive_delta": true,
+          "publishable_output": true
+        },
+        "direct_review_assertions": {
+          "comment_count": 1,
+          "context_matched": true,
+          "executed": true,
+          "observed_contexts": [
+            "runtime"
+          ],
+          "observed_severities": [
+            "medium"
+          ],
+          "publishable_comment_count": 1,
+          "publishable_output": true,
+          "severity_matched": true
+        },
+        "passed": true,
+        "retort_score": 95,
+        "source_project": "mopemope/pr-ai-review-bot"
+      }
+    ],
+    "evidence": {
+      "direct_runtime": "retort_engine.pr_review.review_diff",
+      "model": "same_external_diffs_replayed_through_review_diff_runtime",
+      "verifier": "retort_engine.external_advantage_regression.verify_external_advantage_rows"
+    },
+    "status": "ready",
+    "summary": {
+      "all_delta_regressions_verified": true,
+      "all_have_before_after_scores": true,
+      "all_have_positive_delta": true,
+      "all_have_publishable_output": true,
+      "all_match_expected_context": true,
+      "all_match_expected_severity": true,
+      "all_use_direct_review_execution": true,
+      "direct_execution_case_count": 6,
+      "passed_regression_case_count": 6,
+      "regression_case_count": 6
+    }
+  },
+  "status": "ready",
+  "summary": {
+    "absorbed_signal_count": 6,
+    "all_advantages_improved": true,
+    "all_delta_regressions_verified": true,
+    "all_use_direct_review_execution": true,
+    "baseline_average_score": 40.0,
+    "behavior_delta_count": 6,
+    "blind_third_party_accepted_case_count": 6,
+    "blind_third_party_adjudicated_case_count": 6,
+    "blind_third_party_all_cases_accepted": true,
+    "blind_third_party_average_delta": 80.0,
+    "blind_third_party_delta_floor_passed": true,
+    "blind_third_party_minimum_delta": 80,
+    "blind_third_party_score_fields_consumed": false,
+    "blind_third_party_status": "ready",
+    "case_count": 6,
+    "direct_regression_case_count": 6,
+    "extension_policy_case_count": 6,
+    "independent_accepted_case_count": 6,
+    "independent_adjudicated_case_count": 6,
+    "independent_adjudication_status": "ready",
+    "independent_all_cases_accepted": true,
+    "independent_minimum_recomputed_delta": 65,
+    "min_case_count": 6,
+    "passed_regression_case_count": 6,
+    "per_case_before_after": true,
+    "publishable_case_count": 6,
+    "ready_case_count": 6,
+    "regression_case_count": 6,
+    "regression_status": "ready",
+    "retort_average_score": 95.0,
+    "score_delta": 55.0,
+    "source_project_count": 6
+  }
+}

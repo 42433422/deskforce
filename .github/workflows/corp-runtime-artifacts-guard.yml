@@ -1,0 +1,51 @@
+# CI SSOT: generated from 成都修茈科技有限公司/.github/workflows/ci-runtime-artifacts-guard.yml — DO NOT edit here.
+# Edit that source, then run: python scripts/dev/publish_ci_workflows_to_root.py
+# 运行期产物提交门禁：阻止 outbox JSONL、webhook 投递 JSON、payment_orders 等
+# 运行期数据文件被 git add / git commit。
+#
+# 这是"先治理后拆仓"的最后一道提交期门禁。拆仓后 modstore-backend 仓库需要同样
+# 的 guard（模板见 docs/migration/new-repo-templates/modstore-backend/.github/...）。
+
+name: CI - Runtime Artifacts Guard
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  forbid-runtime-artifacts:
+    name: Forbid committed runtime artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # 当前树检查不需要下载全部历史；PR 的 base 提交在下方按 SHA 精确拉取。
+          # 仓库历史较大时 fetch-depth: 0 会耗尽本任务的 5 分钟限额。
+          fetch-depth: 1
+
+      - name: Evidence source and generated media guard
+        env:
+          EVIDENCE_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          evidence_script="成都修茈科技有限公司/scripts/evidence_assets.py"
+          args=()
+          if [ -n "${EVIDENCE_BASE_SHA}" ] && [[ ! "${EVIDENCE_BASE_SHA}" =~ ^0+$ ]]; then
+            git fetch origin "${EVIDENCE_BASE_SHA}" --depth=1
+            args=(--base "${EVIDENCE_BASE_SHA}")
+          fi
+          python3 "${evidence_script}" check
+          python3 "${evidence_script}" guard "${args[@]}"
+
+      - name: Test runtime artifact guard
+        run: python3 -m unittest discover -s scripts/ci -p test_guard_customer_data.py
+
+      - name: Reject customer and runtime data in the proposed Git index
+        run: python3 scripts/ci/guard_customer_data.py

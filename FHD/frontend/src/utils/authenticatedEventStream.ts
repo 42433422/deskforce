@@ -1,0 +1,90 @@
+import { getRuntimeTenantStorageScopeInput } from '@/utils/tenantStorageScopeRuntime'
+import { getActiveExtensionModHeaders } from '@/utils/apiBase'
+import { clientShellRequestHeaders } from '@/utils/clientShell'
+import { createTraceId, sseConnections } from '@/utils/networkStability'
+
+/** Credentialed SSE transport. Reconnection belongs to the owning view/store. */
+export class AuthenticatedEventStream extends EventTarget {
+  onerror: (() => void) | null = null
+  private controller = new AbortController()
+  private released = false
+  private readonly connId = createTraceId()
+
+  constructor(url: string) {
+    super()
+    sseConnections.open(this.connId)
+    void this.read(url)
+  }
+
+  close(): void {
+    this.controller.abort()
+    this.release()
+  }
+
+  private release(): void {
+    if (this.released) return
+    this.released = true
+    sseConnections.close(this.connId)
+  }
+
+  private async read(url: string): Promise<void> {
+    const scope = () => JSON.stringify([getRuntimeTenantStorageScopeInput(), clientShellRequestHeaders(), getActiveExtensionModHeaders(url)])
+    const initialScope = scope()
+    const scopeMatches = () => {
+      if (scope() === initialScope) return true
+      this.close()
+      this.onerror?.()
+      return false
+    }
+    try {
+      const response = await fetch(url, {
+        credentials: 'include',
+        headers: {
+          Accept: 'text/event-stream',
+          'X-Request-ID': this.connId,
+          ...clientShellRequestHeaders(),
+          ...getActiveExtensionModHeaders(url),
+        },
+        signal: this.controller.signal,
+      })
+      if (response.status === 401 || response.status === 403) {
+        this.dispatchEvent(new CustomEvent('stream.unauthorized', { detail: response.status }))
+        return
+      }
+      if (!response.ok || !response.body) throw new Error('Task stream unavailable')
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let event = 'message'
+      let data: string[] = []
+      try {
+        while (!this.controller.signal.aborted) {
+          const chunk = await reader.read()
+          if (this.controller.signal.aborted || !scopeMatches() || chunk.done) break
+          buffer += decoder.decode(chunk.value, { stream: true })
+          let newline: number
+          while ((newline = buffer.indexOf('\n')) >= 0) {
+            const line = buffer.slice(0, newline).replace(/\r$/, '')
+            buffer = buffer.slice(newline + 1)
+            if (!line) {
+              if (data.length && !this.controller.signal.aborted && scopeMatches()) {
+                this.dispatchEvent(new MessageEvent(event, { data: data.join('\n') }))
+              }
+              event = 'message'
+              data = []
+            } else if (line.startsWith('event:')) event = line.slice(6).replace(/^ /, '')
+            else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''))
+          }
+        }
+      } finally {
+        await reader.cancel().catch(() => undefined)
+        reader.releaseLock()
+      }
+      if (!this.controller.signal.aborted) this.onerror?.()
+    } catch {
+      if (!this.controller.signal.aborted) this.onerror?.()
+    } finally {
+      this.release()
+    }
+  }
+}

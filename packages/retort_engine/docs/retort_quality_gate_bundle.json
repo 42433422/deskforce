@@ -1,0 +1,100 @@
+{
+  "evidence": {
+    "failure_names": [],
+    "gate_names": [
+      "lint",
+      "pytest",
+      "test_density",
+      "contract"
+    ],
+    "python": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/FHD/.venv/bin/python",
+    "runner": "retort_quality_gate_bundle"
+  },
+  "gates": [
+    {
+      "command": [
+        "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/FHD/.venv/bin/python",
+        "-m",
+        "ruff",
+        "check",
+        "."
+      ],
+      "kind": "subprocess",
+      "name": "lint",
+      "ok": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "All checks passed!\n"
+    },
+    {
+      "command": [
+        "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/FHD/.venv/bin/python",
+        "-m",
+        "pytest",
+        "tests",
+        "-q"
+      ],
+      "kind": "subprocess",
+      "name": "pytest",
+      "ok": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "........................................................................ [  8%]\n........................................................................ [ 16%]\n........................................................................ [ 24%]\n........................................................................ [ 32%]\n........................................................................ [ 40%]\n........................................................................ [ 48%]\n........................................................................ [ 56%]\n........................................................................ [ 65%]\n........................................................................ [ 73%]\n........................................................................ [ 81%]\n........................................................................ [ 89%]\n........................................................................ [ 97%]\n......................                                                   [100%]\n886 passed in 36.16s\n"
+    },
+    {
+      "command": [
+        "retort",
+        "test-density"
+      ],
+      "floor": 0.4,
+      "kind": "in_process",
+      "missing_test_lines_to_target": 0,
+      "name": "test_density",
+      "ok": true,
+      "returncode": 0,
+      "source_line_count": 23669,
+      "stderr_tail": "",
+      "stdout_tail": "test_to_source_ratio=0.821; target=0.8; missing_test_lines_to_target=0",
+      "target": 0.8,
+      "target_met": true,
+      "test_line_count": 19435,
+      "test_to_source_ratio": 0.821
+    },
+    {
+      "command": [
+        "retort",
+        "contract-sanity"
+      ],
+      "failed": [],
+      "kind": "in_process",
+      "name": "contract",
+      "ok": true,
+      "returncode": 0,
+      "schema_count": 52,
+      "stderr_tail": "",
+      "stdout_tail": "validated 52 Retort contracts"
+    }
+  ],
+  "project": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine",
+  "status": "ready",
+  "summary": {
+    "all_gates_passed": true,
+    "command_name": "quality-gates",
+    "contract_passed": true,
+    "contract_schema_count": 52,
+    "duration_sec": 37.238,
+    "gate_count": 4,
+    "lint_passed": true,
+    "passed_count": 4,
+    "pytest_passed": true,
+    "single_command_surface": true,
+    "source_line_count": 23669,
+    "test_density_floor": 0.4,
+    "test_density_missing_lines_to_target": 0,
+    "test_density_passed": true,
+    "test_density_target": 0.8,
+    "test_density_target_met": true,
+    "test_line_count": 19435,
+    "test_to_source_ratio": 0.821
+  }
+}

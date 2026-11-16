@@ -1,0 +1,331 @@
+﻿param(
+  [string]$Version = '',
+  [switch]$SkipBackend,
+  # 复用 build-frontend.sh 产出的共享 templates/vue-dist，不再重建前端（统一 Web/桌面构建源）
+  [switch]$SkipFrontend,
+  [Parameter(Mandatory = $true)]
+  [ValidateSet('personal', 'enterprise')]
+  [string]$ProductSku,
+  [string]$SunbirdSeedZipPath = '',
+  [string]$InstallerOutputSubdir = '',
+  [string]$InstallerFileName = ''
+)
+
+$ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot 'product-version.ps1')
+$Version = Resolve-ProductVersion -Version $Version
+if ($SunbirdSeedZipPath) {
+  throw "Customer seed embedding is retired. Use the standard main host and account-authorized Mod delivery."
+}
+$Root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
+Set-Location $Root
+$Version = $Version.TrimStart("v", "V")
+if ($Version -notmatch '^\d+\.\d+\.\d+(\.\d+)?$') {
+  throw "Invalid stable product version '$Version'; expected x.y.z or x.y.z.w"
+}
+$ToolchainVersion = (($Version -split '\.')[0..2] -join '.')
+
+$skuLabels = @{
+  personal   = 'Personal'
+  enterprise = 'Enterprise'
+}
+$skuAppIds = @{
+  personal   = 'com.xcagi.desktop.personal'
+  enterprise = 'com.xcagi.desktop.enterprise'
+}
+$skuUpdateUrls = @{
+  personal   = 'https://xiu-ci.com/releases/stable/personal/'
+  enterprise = 'https://xiu-ci.com/releases/stable/enterprise/'
+}
+
+function Assert-TextFileContains {
+  param(
+    [Parameter(Mandatory = $true)][string]$Path,
+    [Parameter(Mandatory = $true)][string[]]$Markers,
+    [Parameter(Mandatory = $true)][string]$Label
+  )
+  if (-not (Test-Path $Path)) {
+    throw "$Label missing: $Path"
+  }
+  $content = Get-Content $Path -Raw
+  foreach ($marker in $Markers) {
+    if (-not $content.Contains($marker)) {
+      throw "$Label is stale or incomplete; missing marker '$marker' in $Path"
+    }
+  }
+}
+
+function Assert-FileExists {
+  param(
+    [Parameter(Mandatory = $true)][string]$Path,
+    [Parameter(Mandatory = $true)][string]$Label
+  )
+  if (-not (Test-Path $Path)) {
+    throw "$Label missing: $Path"
+  }
+}
+
+function Write-SkuJson {
+  param(
+    [Parameter(Mandatory = $true)][string]$Path,
+    [Parameter(Mandatory = $true)][string]$Sku
+  )
+  $json = @{ sku = $Sku; schema_version = 1 } | ConvertTo-Json -Compress
+  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+  [System.IO.File]::WriteAllText($Path, "$json`n", $utf8NoBom)
+}
+
+$label = $skuLabels[$ProductSku]
+$releaseRoot = Join-Path $Root "release\xcagi-v$Version"
+$outSubdir = if ($InstallerOutputSubdir) { $InstallerOutputSubdir } else { $ProductSku }
+$outDir = Join-Path $releaseRoot $outSubdir
+if ($InstallerFileName) {
+  $finalSetupName = $InstallerFileName
+} else {
+  $finalSetupName = "XCAGI-$label-Setup-$Version-x64.exe"
+}
+$finalSetupPath = Join-Path $outDir $finalSetupName
+$licenseSrc = Join-Path $Root "tools\XcagiInstaller\Assets\LICENSE.zh-CN.txt"
+if (-not (Test-Path $licenseSrc)) {
+  $licenseSrc = Join-Path $Root "LICENSE"
+}
+
+New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+
+if (-not $SkipBackend) {
+  & "$PSScriptRoot\build-backend.ps1" -Version $Version -ProductSku $ProductSku -SkipFrontend:$SkipFrontend
+} else {
+  python -m pip install "Pillow>=10.2.0" -q
+}
+
+$backendExe = Join-Path $Root "dist\xcagi-backend\xcagi-backend.exe"
+Assert-FileExists $backendExe "Windows backend executable"
+
+$desktopSku = Join-Path $Root "desktop\resources\product-sku.json"
+Write-SkuJson -Path $desktopSku -Sku $ProductSku
+$buildSha = $env:XCAGI_BUILD_SHA
+if (-not $buildSha) {
+  $buildSha = $env:GITHUB_SHA
+}
+if (-not $buildSha) {
+  try {
+    $buildSha = (git -C $Root rev-parse HEAD).Trim()
+  } catch {
+    $buildSha = ''
+  }
+}
+if ($buildSha -notmatch '^[0-9a-fA-F]{40}$') {
+  throw "Windows installer requires an exact 40-character Git SHA, got '$buildSha'"
+}
+$buildSha = $buildSha.ToLowerInvariant()
+$env:XCAGI_BUILD_SHA = $buildSha
+$releaseId = "xcagi-$Version-$buildSha"
+$buildInfoPath = Join-Path $Root "desktop\resources\build-info.json"
+$buildInfo = @{
+  schema_version = 1
+  gitSha = $buildSha
+  version = $Version
+  releaseId = $releaseId
+}
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($buildInfoPath, (($buildInfo | ConvertTo-Json -Compress) + "`n"), $utf8NoBom)
+# A public notice record is a separate verified build material, added after the
+# backend build; its digest never replaces the backend/source identity.
+& python (Join-Path $PSScriptRoot 'notice_publication_material.py') stage `
+  --backend-root (Join-Path $Root 'dist\xcagi-backend') --build-info $buildInfoPath --source-sha $buildSha
+if ($LASTEXITCODE -ne 0) { throw 'Notice publication material staging failed' }
+$backendSku = Join-Path $Root "dist\xcagi-backend\_internal\product-sku.json"
+$backendSkuDir = Split-Path $backendSku -Parent
+if (Test-Path $backendSkuDir) {
+  Write-SkuJson -Path $backendSku -Sku $ProductSku
+}
+
+& "$PSScriptRoot\create-installer-assets.ps1"
+
+Push-Location (Join-Path $Root "desktop")
+if (-not (Test-Path "node_modules")) {
+  npm install
+  if ($LASTEXITCODE -ne 0) { throw "desktop npm install failed" }
+}
+npm run build
+if ($LASTEXITCODE -ne 0) { throw "desktop npm run build failed" }
+# main.ts 已模块化拆分，标记分布在 dist/*.js（desktop-config/backend-process/runtime-state）。
+# 合并全部编译产物后再校验，避免只查 main.js 误报「stale or incomplete」。
+$distBundlePath = Join-Path $Root "desktop\dist\.bundle-markers.tmp.js"
+Get-ChildItem (Join-Path $Root "desktop\dist") -Filter "*.js" -File |
+  Sort-Object Name |
+  ForEach-Object { Get-Content $_.FullName -Raw } |
+  Set-Content -Path $distBundlePath -Encoding UTF8
+try {
+  Assert-TextFileContains `
+    -Path $distBundlePath `
+    -Label "Electron main bundle" `
+    -Markers @(
+      "packagedBackendCandidates",
+      "electron-backend.log",
+      "backend', '_internal'",
+      "return 17500",
+      "backendHealthMs",
+      "180_000"
+    )
+} finally {
+  Remove-Item $distBundlePath -Force -ErrorAction SilentlyContinue
+}
+npm version $ToolchainVersion --no-git-tag-version --allow-same-version
+$ebAppId = $skuAppIds[$ProductSku]
+$ebPublishUrl = $skuUpdateUrls[$ProductSku]
+$ebArtifact = "XCAGI-$label-Setup-$Version-`${arch}.`${ext}"
+$installerNsh = Join-Path $Root "desktop\build\installer.nsh"
+$nshText = [System.IO.File]::ReadAllText($installerNsh)
+if ($nshText -notmatch '(?m)^!define XCAGI_PRODUCT_DISPLAY_VERSION "') {
+  throw "desktop/build/installer.nsh is missing XCAGI_PRODUCT_DISPLAY_VERSION"
+}
+$nshUpdated = [regex]::Replace(
+  $nshText,
+  '(?m)^!define XCAGI_PRODUCT_DISPLAY_VERSION ".*"',
+  "!define XCAGI_PRODUCT_DISPLAY_VERSION `"$Version`""
+)
+[System.IO.File]::WriteAllText($installerNsh, $nshUpdated)
+
+$electronBuilderArgs = @(
+  'electron-builder',
+  '--win', 'nsis', 'zip',
+  '--x64',
+  '--publish', 'never',
+  "--config.directories.output=../release/xcagi-v$Version/$outSubdir",
+  "--config.appId=$ebAppId",
+  "--config.publish.url=$ebPublishUrl",
+  "--config.nsis.artifactName=$ebArtifact",
+  "--config.buildVersion=$Version",
+  "--config.extraMetadata.shortVersionWindows=$Version",
+  "--config.extraMetadata.productSku=$ProductSku"
+)
+
+if ($env:XCAGI_REQUIRE_WINDOWS_SIGNING -eq '1') {
+  $signingProvider = $env:XCAGI_WINDOWS_SIGNING_PROVIDER
+  if (-not $signingProvider) {
+    $signingProvider = 'sslcom'
+  }
+  if ($signingProvider -ne 'sslcom') {
+    throw "Unsupported Windows signing provider '$signingProvider'; stable releases require sslcom"
+  }
+
+  $requiredSigningVars = @(
+    'ES_USERNAME',
+    'ES_PASSWORD',
+    'CREDENTIAL_ID',
+    'ES_TOTP_SECRET',
+    'CODE_SIGN_TOOL_PATH',
+    'JAVA_HOME',
+    'XCAGI_WINDOWS_PUBLISHER_NAME'
+  )
+  $missingSigningVars = @($requiredSigningVars | Where-Object {
+    -not (Get-Item "Env:$_" -ErrorAction SilentlyContinue).Value
+  })
+  if ($missingSigningVars.Count -gt 0) {
+    throw "Windows signing is required, but these variables are missing: $($missingSigningVars -join ', ')"
+  }
+
+  $publisherName = $env:XCAGI_WINDOWS_PUBLISHER_NAME
+  Write-Host "Windows Authenticode signing required (SSL.com eSigner; publisher=$publisherName)"
+  $electronBuilderArgs += @(
+    '--config.forceCodeSigning=true',
+    "--config.win.publisherName=$publisherName",
+    '--config.win.signtoolOptions.sign=build/windows-sign.cjs',
+    '--config.win.signtoolOptions.signingHashAlgorithms=sha256'
+  )
+}
+
+
+# Pin the NSIS payload to BCJ so Nsis7z can extract executables (electron-builder#9983).
+$env:ELECTRON_BUILDER_7Z_FILTER = 'BCJ'
+Write-Host "NSIS payload 7z filter pinned to BCJ"
+& npx @electronBuilderArgs
+if ($LASTEXITCODE -ne 0) { throw "electron-builder failed with exit code $LASTEXITCODE" }
+Pop-Location
+
+Assert-FileExists (Join-Path $outDir "win-unpacked\resources\app.asar") "Electron app.asar"
+Assert-FileExists (Join-Path $outDir "win-unpacked\resources\backend\xcagi-backend.exe") "Packaged backend executable"
+Assert-FileExists (Join-Path $outDir "win-unpacked\resources\product-sku.json") "Packaged product-sku.json"
+& python (Join-Path $PSScriptRoot 'notice_publication_material.py') verify `
+  --resources-root (Join-Path $outDir 'win-unpacked\resources') --source-sha $buildSha
+if ($LASTEXITCODE -ne 0) { throw 'Packaged notice publication material verification failed' }
+
+$nsisExe = Get-Item -LiteralPath (Join-Path $outDir "XCAGI-$label-Setup-$Version-x64.exe")
+
+& (Join-Path $PSScriptRoot 'assert-nsis-7z-filter.ps1') -PayloadPath $nsisExe.FullName
+if ($LASTEXITCODE -ne 0) { throw "NSIS payload uses a 7z filter the installer cannot extract" }
+& {
+  $stagingNsis = Join-Path $outDir 'nsis-payload.tmp.exe'
+  Copy-Item $nsisExe.FullName $stagingNsis -Force
+
+  $uiProj = Join-Path $Root "tools\XcagiInstaller\XcagiInstaller.csproj"
+  & node (Join-Path $PSScriptRoot 'generate-windows-rollback-helper.mjs')
+  if ($LASTEXITCODE -ne 0) { throw "Shared Windows rollback helper generation failed" }
+  $uiOut = Join-Path $outDir "ui-build"
+  New-Item -ItemType Directory -Force -Path $uiOut | Out-Null
+
+  $publishArgs = @(
+    "publish", $uiProj,
+    "-c", "Release",
+    "-r", "win-x64",
+    "--self-contained", "true",
+    "-p:PublishSingleFile=true",
+    "-p:IncludeNativeLibrariesForSelfExtract=true",
+    "-p:EnableCompressionInSingleFile=true",
+    "-p:Version=$Version",
+    "-p:InformationalVersion=$Version+$env:XCAGI_BUILD_SHA",
+    "-p:IncludeSourceRevisionInInformationalVersion=false",
+    "-p:SetupPayloadPath=$stagingNsis",
+    "-o", $uiOut
+  )
+  if (Test-Path $licenseSrc) {
+    $publishArgs += "-p:LicenseFilePath=$licenseSrc"
+  }
+  & dotnet @publishArgs
+  if ($LASTEXITCODE -ne 0) { throw "WPF installer publish failed with exit code $LASTEXITCODE" }
+
+  $uiExe = Get-ChildItem $uiOut -Filter "XcagiInstaller.exe" | Select-Object -First 1
+  if (-not $uiExe) {
+    throw "WPF installer publish failed."
+  }
+
+  if (Test-Path $finalSetupPath) {
+    Remove-Item $finalSetupPath -Force
+  }
+  Move-Item $uiExe.FullName $finalSetupPath -Force
+  if ($env:XCAGI_REQUIRE_WINDOWS_SIGNING -eq '1') {
+    & node -e "require(process.argv[1]).default({path:process.argv[2]}).catch(error=>{console.error(error.message);process.exitCode=1})" (Join-Path $Root 'desktop/build/windows-sign.cjs') $finalSetupPath
+    if ($LASTEXITCODE -ne 0) { throw "Final WPF installer signing failed with exit code $LASTEXITCODE" }
+    & (Join-Path $PSScriptRoot 'verify-windows-signature.ps1') -Path $finalSetupPath -ExpectedPublisher $env:XCAGI_WINDOWS_PUBLISHER_NAME
+  }
+  Remove-Item $uiOut -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-Item $stagingNsis -Force -ErrorAction SilentlyContinue
+  if ($nsisExe -and (Test-Path $nsisExe.FullName) -and $nsisExe.FullName -ne $finalSetupPath) {
+    Remove-Item $nsisExe.FullName -Force
+  }
+
+  $legacyPayload = Join-Path $outDir "_payload"
+  if (Test-Path $legacyPayload) {
+    Remove-Item $legacyPayload -Recurse -Force
+  }
+  Get-ChildItem $outDir -Filter "XCAGI-*-*.exe" -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -like '*安装程序*' } |
+    Remove-Item -Force -ErrorAction SilentlyContinue
+
+  $env:XCAGI_BUILD_SHA = $buildSha
+  $env:XCAGI_PRODUCT_VERSION = $Version
+  node (Join-Path $Root "scripts\package\generate-update-metadata.mjs") $finalSetupPath $ToolchainVersion win
+}
+
+$dlProj = Join-Path $Root "tools\XcagiDownloader\XcagiDownloader.csproj"
+$dlOut = Join-Path $outDir "tools"
+New-Item -ItemType Directory -Force -Path $dlOut | Out-Null
+dotnet publish $dlProj -c Release -r win-x64 --self-contained true `
+  -p:PublishSingleFile=true `
+  -p:IncludeNativeLibrariesForSelfExtract=true `
+  -p:EnableCompressionInSingleFile=true `
+  -o $dlOut
+
+Write-Host ""
+Write-Host "Done: release\xcagi-v$Version\$outSubdir\$finalSetupName"

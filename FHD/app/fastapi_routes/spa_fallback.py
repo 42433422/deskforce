@@ -1,0 +1,170 @@
+"""Vue SPA History fallback。
+
+Phase 2C 从 :mod:`app.fastapi_routes.archive_gap_batch2` 拆分而出。
+
+关键不变量: ``register_spa_history_fallback`` 必须在所有 API 路由注册之后
+调用,以避免 ``GET /{fallback:path}`` 捕获并遮蔽真实 ``/api/...`` 路由。
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+
+from fastapi import FastAPI
+from fastapi.responses import FileResponse, JSONResponse
+
+from app.utils.operational_errors import RECOVERABLE_ERRORS
+from app.utils.path_io.path_utils import get_base_dir
+
+logger = logging.getLogger(__name__)
+
+# 入口 HTML 必须每次回源校验，否则升级后旧 HTML 会继续引用已删除的 hash chunk，
+# 导致图片/样式/模块路由动态 import 全部 404。hash 资源本身可长期缓存。
+_INDEX_CACHE_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
+
+_EXCLUDED_PREFIXES = (
+    "api/",
+    "assets/",
+    "static/",
+    "outputs/",
+    "uploads/",
+    "fonts/",
+    "images/",
+    "js/",
+    "css/",
+    "favicon",
+    "docs",
+    "openapi.json",
+    "redoc",
+    # Vue public/ 根路径资源（由 StaticFiles 或显式路由提供；勿被 SPA 兜底成 index.html）
+    "font-awesome/",
+    "startup/",
+    "yuangong/",
+    "workflow/",
+    "platform/",
+    "data-sources/",
+    "xcmax-dashboard/",
+    "brand-xc-logo",
+    "ai-butler-",
+)
+
+
+# vue-dist 根目录单文件（非 full 版可能未挂载 legacy_gaps，须在此兜底，勿返回 index.html）
+_VUE_DIST_ROOT_FILES: dict[str, str] = {
+    "sw.js": "application/javascript",
+    "workflow-employee-docs.json": "application/json",
+    "workflow-employees.json": "application/json",
+    "vite.svg": "image/svg+xml",
+    "brand-xc-logo.jpg": "image/jpeg",
+    "brand-xc-logo.png": "image/png",
+    # 小C助理头像（FloatingChatAssistant public/ 根路径）
+    "ai-butler-female-avatar-v1.png": "image/png",
+    "ai-butler-male-avatar-v1.jpg": "image/jpeg",
+}
+
+
+def _vue_dist_dir() -> str:
+    return os.path.join(get_base_dir(), "templates", "vue-dist")
+
+
+def _workflow_employees_json_candidates() -> list[str]:
+    base = get_base_dir()
+    return [
+        os.path.join(_vue_dist_dir(), "workflow-employees.json"),
+        os.path.join(base, "frontend", "public", "workflow-employees.json"),
+        os.path.join(base, "frontend", "src", "data", "workflow-employees.json"),
+    ]
+
+
+def _try_serve_vue_dist_root_file(fallback: str) -> FileResponse | None:
+    media = _VUE_DIST_ROOT_FILES.get(fallback)
+    if not media:
+        return None
+    safe_name = next((name for name in _VUE_DIST_ROOT_FILES if fallback == name), "")
+    if not safe_name:
+        return None
+    if safe_name == "workflow-employees.json":
+        for p in _workflow_employees_json_candidates():
+            if os.path.isfile(p):
+                return FileResponse(p, media_type=media)
+        return None
+    candidates = [
+        os.path.join(_vue_dist_dir(), safe_name),
+        os.path.join(get_base_dir(), "frontend", "public", safe_name),
+    ]
+    for p in candidates:
+        if os.path.isfile(p):
+            return FileResponse(p, media_type=media)
+    return None
+
+
+def register_spa_history_fallback(app: FastAPI) -> None:
+    """Vue History fallback：必须最后注册，避免吞掉 API。"""
+
+    @app.get("/{fallback:path}", include_in_schema=False)
+    def vue_history_fallback(fallback: str):
+        # 桌面进程：/admin* 不得回落企业 index.html（管理端仅网页）
+        if fallback == "admin" or fallback.startswith("admin/"):
+            try:
+                from app.utils.deployment import is_desktop_mode
+
+                if is_desktop_mode():
+                    return JSONResponse(
+                        {
+                            "success": False,
+                            "message": "桌面端不提供管理端，请使用网页版管理端",
+                            "error": {"code": "ADMIN_DESKTOP_FORBIDDEN"},
+                        },
+                        status_code=404,
+                    )
+            except RECOVERABLE_ERRORS:
+                pass
+        root_file = _try_serve_vue_dist_root_file(fallback)
+        if root_file is not None:
+            return root_file
+        if any(fallback.startswith(p) for p in _EXCLUDED_PREFIXES):
+            return JSONResponse(
+                {"success": False, "message": f"资源不存在：/{fallback}"}, status_code=404
+            )
+        vue_index = os.path.join(_vue_dist_dir(), "index.html")
+        if os.path.exists(vue_index):
+            return FileResponse(
+                vue_index,
+                media_type="text/html",
+                headers=_INDEX_CACHE_HEADERS,
+            )
+        return JSONResponse(
+            {"success": False, "message": f"页面不存在：/{fallback}"}, status_code=404
+        )
+
+
+__all__ = ["register_spa_history_fallback", "ensure_spa_fallback_last"]
+
+
+def ensure_spa_fallback_last(app: FastAPI) -> None:
+    """After Mod routes are appended post-fallback registration, move catch-all to the end."""
+    try:
+        routes = getattr(getattr(app, "router", None), "routes", None)
+        if not isinstance(routes, list) or not routes:
+            return
+        fallback_path = "/{fallback:path}"
+        fallback_routes = [r for r in routes if getattr(r, "path", None) == fallback_path]
+        if not fallback_routes:
+            return
+        for route in fallback_routes:
+            try:
+                routes.remove(route)
+            except ValueError:
+                continue
+            routes.append(route)
+        logger.info(
+            "Reordered %d Vue history fallback route(s) to end of app.router.routes",
+            len(fallback_routes),
+        )
+    except RECOVERABLE_ERRORS as exc:
+        logger.warning("Failed to reorder history fallback routes: %s", exc)

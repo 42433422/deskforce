@@ -1,0 +1,130 @@
+using System.Security.Cryptography;
+using System.Windows;
+using XcagiInstaller.Services;
+
+namespace XcagiInstaller;
+
+public partial class App : System.Windows.Application
+{
+    protected override async void OnStartup(StartupEventArgs e)
+    {
+        SilentInstallOptions options;
+        try { options = SilentInstallOptions.Parse(e.Args); }
+        catch (NotSupportedException ex)
+        {
+            NsisSilentInstaller.Trace(ex.Message);
+            ShutdownOnUiThread(1);
+            return;
+        }
+        if (!options.Enabled)
+        {
+            base.OnStartup(e);
+            return;
+        }
+
+        ShutdownMode = ShutdownMode.OnExplicitShutdown;
+        InstallResult result = default;
+        try
+        {
+            NsisSilentInstaller.Trace("silent install start");
+            var setupExe = await PayloadLocator.ResolveSetupExeAsync(
+                cancellationToken: CancellationToken.None).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(setupExe))
+                throw new InvalidOperationException("Unable to resolve embedded setup payload.");
+            NsisSilentInstaller.Trace($"payload={setupExe};{DescribeFile(setupExe)}");
+            NsisSilentInstaller.ValidateRegisteredInstallDirectory(options.InstallDirectory ?? NsisSilentInstaller.DefaultInstallDirectory());
+
+            result = await NsisSilentInstaller.RunAsync(
+                setupExe,
+                options.InstallDirectory ?? NsisSilentInstaller.DefaultInstallDirectory(),
+                cancellationToken: CancellationToken.None, userDataDirectory: NsisSilentInstaller.UserDataDirectory(), updaterHandoff: e.Args.Contains("--updated")).ConfigureAwait(false);
+            if (!result.Success)
+                throw new InvalidOperationException(result.Error ?? "Silent install failed.");
+            NsisSilentInstaller.Trace($"installed={result.InstallDir};app={result.AppExePath}");
+
+            ShutdownOnUiThread(0);
+        }
+        catch (Exception ex)
+        {
+            NsisSilentInstaller.Trace("failed: " + (result.Success ? await result.RecoverPostInstallFailureAsync(ex.Message) : ex.ToString()));
+            ShutdownOnUiThread(1);
+        }
+    }
+
+    private void ShutdownOnUiThread(int exitCode)
+    {
+        if (Dispatcher.CheckAccess())
+        {
+            Shutdown(exitCode);
+            return;
+        }
+
+        Dispatcher.Invoke(() => Shutdown(exitCode));
+    }
+
+    private static string DescribeFile(string path)
+    {
+        try
+        {
+            using var sha = SHA256.Create();
+            using var stream = File.OpenRead(path);
+            var hash = Convert.ToHexString(sha.ComputeHash(stream)).ToLowerInvariant();
+            return $"size={new FileInfo(path).Length};sha256={hash}";
+        }
+        catch (Exception ex)
+        {
+            return $"describe_error={ex.GetType().Name}:{ex.Message}";
+        }
+    }
+
+    private sealed record SilentInstallOptions(
+        bool Enabled,
+        string? InstallDirectory)
+    {
+        public static SilentInstallOptions Parse(string[] args)
+        {
+            var enabled = false;
+            string? installDirectory = null;
+
+            for (var i = 0; i < args.Length; i += 1)
+            {
+                var arg = args[i];
+                if (arg.Equals("--silent", StringComparison.OrdinalIgnoreCase) ||
+                    arg.Equals("/silent", StringComparison.OrdinalIgnoreCase) ||
+                    arg.Equals("/S", StringComparison.OrdinalIgnoreCase))
+                {
+                    enabled = true;
+                    continue;
+                }
+
+                if (arg.Equals("--sunbird-seed", StringComparison.OrdinalIgnoreCase) ||
+                    arg.Equals("/sunbird-seed", StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new NotSupportedException("The retired --sunbird-seed option is not supported.");
+                }
+
+                if (arg.Equals("--install-dir", StringComparison.OrdinalIgnoreCase) ||
+                    arg.Equals("/install-dir", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (i + 1 < args.Length)
+                    {
+                        installDirectory = args[i + 1];
+                        i += 1;
+                    }
+                    continue;
+                }
+
+                if (arg.StartsWith("--install-dir=", StringComparison.OrdinalIgnoreCase))
+                {
+                    installDirectory = arg["--install-dir=".Length..];
+                    continue;
+                }
+
+                if (arg.StartsWith("/D=", StringComparison.OrdinalIgnoreCase))
+                    installDirectory = string.Join(" ", args[i..])["/D=".Length..];
+            }
+
+            return new SilentInstallOptions(enabled, installDirectory);
+        }
+    }
+}

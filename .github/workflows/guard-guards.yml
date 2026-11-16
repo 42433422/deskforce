@@ -1,0 +1,47 @@
+# 元守卫: 记录 PR 是否修改了 CODEOWNERS 标注的守卫路径。
+# 守卫路径的正确性由对应 CI 测试和 required status checks 自动验证，
+# 不再要求人工添加 guard-approved label。
+name: Guard Guards
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+      - 'FHD/.github/workflows/**'
+      - 'FHD/scripts/ci/**'
+      - 'FHD/scripts/arch_fitness.py'
+      - 'FHD/scripts/dev/coverage_ratchet.py'
+      - 'FHD/scripts/dev/count_type_debt.py'
+      - 'FHD/scripts/dev/count_raw_sql.py'
+      - 'FHD/scripts/dev/verify_version_anchors.py'
+      - 'FHD/pyproject.toml'
+      - 'FHD/metrics/coverage_ratchet_baseline.json'
+      - 'FHD/frontend/vitest.config.js'
+      - 'FHD/tests/release/**'
+      - 'FHD/tests/release_gate/**'
+      - '.trae/rules/**'
+      - '.github/CODEOWNERS'
+      - '.github/workflows/guard-guards.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  guard-guards:
+    name: Guard Guards (meta-guard)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Record guard path change
+        run: |
+          set -euo pipefail
+          echo "🛡️  检测到本 PR 修改了守卫/红线路径。"
+          echo ""
+          echo "守卫路径包括:"
+          echo "  - CI workflows (.github/workflows/, FHD/.github/workflows/)"
+          echo "  - CI 守卫脚本 (FHD/scripts/ci/, FHD/scripts/dev/coverage_ratchet.py 等)"
+          echo "  - 覆盖率/类型/SQL 棘轮基线 (pyproject.toml, coverage_ratchet_baseline.json, vitest.config.js)"
+          echo "  - Release Gate 测试 (FHD/tests/release/, FHD/tests/release_gate/)"
+          echo "  - Trae 工程规则 (.trae/rules/)"
+          echo "  - CODEOWNERS / 本 workflow 自身"
+          echo ""
+          echo "✅ 不需要人工标签；继续执行仓库配置的自动化 CI 守卫。"

@@ -1,0 +1,63 @@
+param(
+  [Parameter(Mandatory = $true)]
+  [ValidateSet('personal', 'enterprise')]
+  [string]$ProductSku
+)
+
+$ErrorActionPreference = "Stop"
+$Root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
+$modsRoots = @(
+  (Join-Path $Root "mods"),
+  (Join-Path $Root "XCAGI\mods")
+)
+$stageDir = Join-Path $Root "build\staged-industry-seeds-$ProductSku"
+
+if ($ProductSku -ne 'enterprise') {
+  if (Test-Path $stageDir) {
+    Remove-Item $stageDir -Recurse -Force
+  }
+  New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+  Write-Host "Skipped industry-seeds staging for SKU $ProductSku (enterprise only)"
+  exit 0
+}
+
+$readScript = Join-Path $PSScriptRoot "read-open-industry-seed-ids.py"
+$idsJson = (& python $readScript) -join "`n"
+if ($LASTEXITCODE -ne 0) { throw "read-open-industry-seed-ids.py failed" }
+$parsedIds = $idsJson | ConvertFrom-Json
+$ids = @()
+foreach ($id in $parsedIds) {
+  $ids += [string]$id
+}
+
+if (Test-Path $stageDir) {
+  Remove-Item $stageDir -Recurse -Force
+}
+New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+
+$missing = @()
+foreach ($modId in $ids) {
+  $src = $null
+  foreach ($modsRoot in $modsRoots) {
+    $candidate = Join-Path $modsRoot $modId
+    if (Test-Path $candidate) {
+      $src = (Resolve-Path $candidate).Path
+      break
+    }
+  }
+  if (-not $src) {
+    $missing += $modId
+    Write-Warning "Industry seed mod not found, skip: $modId ($($modsRoots -join ', '))"
+    continue
+  }
+  $dst = Join-Path $stageDir $modId
+  Copy-Item -Path $src -Destination $dst -Recurse -Force
+  Write-Host "Staged industry seed: $modId"
+}
+
+if ($missing.Count -gt 0) {
+  Write-Warning "Skipped missing industry seed mod(s): $($missing -join ', ')"
+}
+
+$stagedCount = $ids.Count - $missing.Count
+Write-Host "Staged $stagedCount industry seed mod(s) for SKU $ProductSku -> $stageDir"

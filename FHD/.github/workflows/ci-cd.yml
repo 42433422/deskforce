@@ -1,0 +1,1648 @@
+name: CI/CD Pipeline
+run-name: >-
+  CI/CD ${{ github.event_name == 'workflow_dispatch' && inputs.release_sha || github.sha }}
+
+on:
+  push:
+    branches: [ main, develop, master ]
+    tags:
+      - "FHD/v*"
+  pull_request:
+    branches: [ main, develop, master ]
+  schedule:
+    # Nightly 全量（每日 16:00 UTC = 北京 00:00）：PR 上被目标化跳过的重活在此全跑。
+    # 镜像构建/推送（docker-build-fhd-api）已显式排除 schedule，避免夜间误推制品。
+    - cron: "0 16 * * *"
+  workflow_dispatch:
+    inputs:
+      backend_shards:
+        description: "Backend partitions (concurrency is capped at 8)"
+        required: false
+        default: '8'
+        type: choice
+        options: ['4', '8', '16', '24']
+      release_channel:
+        description: "Release channel (stable=prod, staging)"
+        required: false
+        default: stable
+        type: choice
+        options:
+          - stable
+          - staging
+      push_to_cvm:
+        description: "Push release artifacts to CVM update server"
+        required: false
+        default: false
+        type: boolean
+      dispatch_evolution:
+        description: "Run the independent Evolution workflow after CVM upload"
+        required: false
+        default: true
+        type: boolean
+      push_image_tar:
+        description: "Also push the optional 600MB+ offline image archive"
+        required: false
+        default: false
+        type: boolean
+      release_sha:
+        description: "Exact 40-character SHA to build/deploy; required when push_to_cvm=true"
+        required: false
+        default: ""
+        type: string
+      security_scan_run_id:
+        description: "Current all-source zero-finding scan; required for stable CVM upload"
+        required: false
+        default: ""
+        type: string
+      previous_security_scan_run_id:
+        description: "Compatibility input; pass the current scan run ID for single-scan stable upload"
+        required: false
+        default: ""
+        type: string
+
+# CI 加速：同一 PR 的旧提交自动取消（P1-4）；push/tag/schedule/dispatch 每次
+# 独立分组且 cancel-in-progress=false —— 正式发布、主线、夜间全量永不误取消。
+concurrency:
+  group: ci-cd-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTHON_VERSION: "3.11"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  IMAGE_NAME_FHD_API: ${{ github.repository }}/xcagi-fhd-api
+  XCAGI_RELEASE_SHA: ${{ inputs.release_sha || github.sha }}
+
+jobs:
+  agent-postgres-transactions:
+    name: Agent PostgreSQL transactions
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: agent_test
+          POSTGRES_PASSWORD: agent-test-only
+          POSTGRES_DB: agent_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agent_test -d agent_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      XCAGI_TEST_AGENT_POSTGRES_URL: postgresql+psycopg://agent_test:agent-test-only@127.0.0.1:5432/agent_test
+      XCAGI_SKIP_INTENT_LLM: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha || github.sha }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v6
+      - name: Install test dependencies
+        working-directory: FHD
+        run: uv sync --frozen --extra server-api --extra dev
+      - name: Verify PostgreSQL approval, resume, and cross-module execution transactions
+        working-directory: FHD
+        run: |
+          test -n "$XCAGI_TEST_AGENT_POSTGRES_URL"
+          uv run --no-sync pytest tests/test_application/test_approval_session_renewal.py tests/test_application/test_cross_module_execution_transactions.py tests/test_application/test_approval_persistence.py::test_guarded_delete_serializes_concurrent_writes tests/test_application/test_approval_persistence.py::test_only_one_concurrent_reviewer_can_claim_approval -q -o addopts= --junitxml=agent-postgres-results.xml
+      - name: Retain transaction test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-postgres-transactions
+          path: FHD/agent-postgres-results.xml
+          if-no-files-found: warn
+  # Guard against temporary scripts in business directories
+  guard-temp-scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate explicit CVM release inputs
+        if: github.event_name == 'workflow_dispatch' && inputs.push_to_cvm == true
+        working-directory: .
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          RELEASE_CHANNEL: ${{ inputs.release_channel }}
+          CURRENT_SECURITY_SCAN_RUN_ID: ${{ inputs.security_scan_run_id }}
+          PREVIOUS_SECURITY_SCAN_RUN_ID: ${{ inputs.previous_security_scan_run_id }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::release_sha must be an explicit full lowercase 40-character SHA for CVM upload."
+            exit 1
+          fi
+          case "$RELEASE_CHANNEL" in
+            staging) exit 0 ;;
+            stable) ;;
+            *) echo "::error::Invalid CVM release channel"; exit 1 ;;
+          esac
+          for name in CURRENT_SECURITY_SCAN_RUN_ID PREVIOUS_SECURITY_SCAN_RUN_ID; do
+            if [[ ! "${!name}" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::error::${name} must be a positive numeric GitHub Actions run id for stable upload."
+              exit 1
+            fi
+          done
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha || github.sha }}
+          # 保留 HEAD~1 给手动运行；PR/base 与 push/before 在下方精确补取。
+          fetch-depth: 2
+
+      - name: Block new temporary scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_REF="${{ github.base_ref }}"
+            git fetch origin "${BASE_REF}" --depth=1
+            ADDED_FILES="$(git diff --name-only --diff-filter=A "origin/${BASE_REF}"...HEAD || true)"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # Manual rerun: scan only files newly added in the tip commit (not entire tree).
+            ADDED_FILES="$(git diff --name-only --diff-filter=A HEAD~1 HEAD 2>/dev/null || true)"
+          else
+            BEFORE_SHA="${{ github.event.before }}"
+            if [ -z "${BEFORE_SHA}" ] || [ "${BEFORE_SHA}" = "0000000000000000000000000000000000000000" ]; then
+              ADDED_FILES="$(git diff --name-only --diff-filter=A HEAD~1 HEAD 2>/dev/null || true)"
+            else
+              git fetch origin "${BEFORE_SHA}" --depth=1 || true
+              ADDED_FILES="$(git diff --name-only --diff-filter=A "${BEFORE_SHA}" "${{ github.sha }}" || true)"
+            fi
+          fi
+
+          echo "Added files:"
+          echo "${ADDED_FILES}"
+
+          python3 scripts/ci/guard_temp_scripts.py --all-tracked
+          printf '%s\n' "${ADDED_FILES}" | python3 scripts/ci/guard_temp_scripts.py --added-from-stdin
+          echo "✅ Temporary script location guard passed."
+
+  classify:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    outputs:
+      valid: ${{ steps.paths.outputs.valid }}
+      source_sha: ${{ steps.paths.outputs.source_sha }}
+      backend: ${{ steps.paths.outputs.backend }}
+      backend_skip: ${{ steps.paths.outputs.backend_skip }}
+      frontend: ${{ steps.paths.outputs.frontend }}
+      frontend_skip: ${{ steps.paths.outputs.frontend_skip }}
+      macos: ${{ steps.paths.outputs.macos }}
+      windows: ${{ steps.paths.outputs.windows }}
+      backend_matrix: ${{ steps.plan.outputs.matrix }}
+      backend_total: ${{ steps.plan.outputs.total }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha || github.sha }}
+          fetch-depth: 1
+      - name: Classify all changed paths and bind the tested source
+        id: paths
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.release_sha || github.sha }}
+        run: |
+          if [ -n "$PR_BASE_SHA" ] && [ -n "$PR_HEAD_SHA" ]; then
+            git fetch --no-tags --depth=1 origin "$PR_BASE_SHA" "$PR_HEAD_SHA" || true
+          fi
+          python scripts/dev/change_classifier.py --all \
+            --base "$PR_BASE_SHA" --head "$PR_HEAD_SHA" \
+            --source-sha "$EXPECTED_SOURCE_SHA" --report FHD/classification.json
+      - name: Plan backend partitions
+        id: plan
+        env:
+          SHARD_TOTAL: ${{ inputs.backend_shards || '8' }}
+        run: python FHD/scripts/ci/backend_shards.py plan --total "$SHARD_TOTAL"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ci-classification-${{ github.run_attempt }}
+          path: FHD/classification.json
+          if-no-files-found: error
+          retention-days: 7
+
+  backend-quality:
+    # SSOT runs alongside tests; aggregate gates still require every guard to succeed.
+    needs: [guard-temp-scripts, classify]
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ needs.classify.outputs.backend_skip }}
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha || github.sha }}
+          # CI 加速：默认浅克隆；分类器/覆盖率地板自取 base（见下），失败即 fail-open 跑全量。
+          fetch-depth: 1
+
+      - name: Skip notice (no backend-relevant changes)
+        if: needs.classify.outputs.backend_skip == 'true'
+        run: echo "No backend-relevant path changes; backend-test satisfied without running the suite."
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        if: needs.classify.outputs.backend_skip != 'true'
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Set up cached uv installer
+        if: needs.classify.outputs.backend_skip != 'true'
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            FHD/requirements-server-api.txt
+            FHD/ops/deploy/requirements-dev.txt
+            FHD/uv.lock
+            FHD/pyproject.toml
+            FHD/packages/**/pyproject.toml
+
+      - name: Install dependencies
+        if: needs.classify.outputs.backend_skip != 'true'
+        run: |
+          set -euo pipefail
+          pytest_pin="$(python "$GITHUB_WORKSPACE/FHD/scripts/dev/check_requirements_lock.py" --pytest-pin)"
+          [[ "$pytest_pin" =~ ^pytest==[0-9]+(\.[0-9]+){2}$ ]]
+          uv --version
+          uv pip install --system --python "$(command -v python)" -r requirements-server-api.txt -r ops/deploy/requirements-dev.txt "$pytest_pin"
+          uv pip check --system --python "$(command -v python)"
+
+      - name: Set up the real private Mod frontend compiler
+        if: needs.classify.outputs.backend_skip != 'true'
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install runtime Mod compiler dependencies
+        if: needs.classify.outputs.backend_skip != 'true'
+        working-directory: frontend
+        run: bash ../scripts/ci/npm_ci_with_network_retry.sh --no-audit --no-fund
+
+      - name: Verify requirements lock is in sync
+        if: needs.classify.outputs.backend_skip != 'true'
+        run: |
+          python scripts/dev/check_requirements_lock.py
+
+      - name: Validate coverage SSOT metadata
+        if: needs.classify.outputs.backend_skip != 'true'
+        run: python scripts/ci/check_coverage_ssot.py
+
+      - name: Run Ruff lint
+        if: needs.classify.outputs.backend_skip != 'true'
+        run: ruff check app/ tests/
+
+      - name: Run Ruff format check
+        if: needs.classify.outputs.backend_skip != 'true'
+        run: ruff format --check app/ tests/
+
+      - name: Run mypy type checking
+        if: needs.classify.outputs.backend_skip != 'true'
+        run: mypy app/ --no-error-summary
+
+      - name: Type/SQL debt ratchet
+        if: needs.classify.outputs.backend_skip != 'true'
+        run: |
+          python scripts/dev/count_type_debt.py --max-type-ignore 0 --max-mypy-disable 0 --max-noqa 222 --max-ts-nocheck 0 --max-any 99999
+          python scripts/dev/count_raw_sql.py
+
+      - name: "[观察期] Schema drift check（模型 vs 迁移链）"
+        if: needs.classify.outputs.backend_skip != 'true'
+        continue-on-error: true
+        run: python scripts/dev/check_schema_drift.py
+
+      - name: Big files ratchet (巨文件只减不增)
+        if: needs.classify.outputs.backend_skip != 'true'
+        run: python scripts/dev/count_big_files.py
+
+      - name: Route integrity tests
+        if: needs.classify.outputs.backend_skip != 'true'
+        env:
+          XCAGI_SKIP_LEGACY_COMPAT_ROUTES: "1"
+        run: python -m pytest tests/test_routes/test_route_registry.py tests/test_routes/test_registry_unit.py tests/test_routes/test_route_golden.py -x -q
+
+      - name: Intent benchmark ratchet (golden set 只升不降)
+        if: needs.classify.outputs.backend_skip != 'true'
+        env:
+          XCAGI_SKIP_LEGACY_COMPAT_ROUTES: "1"
+        run: python scripts/dev/intent_benchmark.py --check
+
+      - name: Coverage floor guard (下调必须有 ADR)
+        if: github.event_name == 'pull_request' && needs.classify.outputs.backend_skip != 'true'
+        run: |
+          # PR checkout 是 merge commit，工作区==HEAD，必须对比目标分支才能识别下调。
+          git fetch --depth=1 origin "${{ github.base_ref }}"
+          python scripts/dev/guard_coverage_floor.py --base FETCH_HEAD
+
+      - name: coverage_ramp stub quota (只减不增)
+        if: needs.classify.outputs.backend_skip != 'true'
+        run: python scripts/dev/count_coverage_ramp_stubs.py --check
+
+      - name: test-bloat gate (P1-2 测试膨胀门禁)
+        if: needs.classify.outputs.backend_skip != 'true'
+        run: python scripts/dev/test_bloat_report.py --check
+
+
+  backend-test-shard:
+    needs: [guard-temp-scripts, classify]
+    if: needs.classify.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix: ${{ fromJSON(needs.classify.outputs.backend_matrix) }}
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: --health-cmd "redis-cli ping" --health-interval 10s --health-timeout 5s --health-retries 5
+    env:
+      BACKEND_SHARD_INDEX: ${{ matrix.shard }}
+      BACKEND_SHARD_TOTAL: ${{ needs.classify.outputs.backend_total }}
+      BACKEND_TIMINGS_FILE: metrics/backend_test_timings.json
+      BACKEND_SOURCE_SHA: ${{ inputs.release_sha || github.sha }}
+      XCAGI_SKIP_LEGACY_COMPAT_ROUTES: "1"
+      INTENT_BENCHMARK_RUN: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha || github.sha }}
+          fetch-depth: 1
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Set up cached uv installer
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            FHD/requirements-server-api.txt
+            FHD/ops/deploy/requirements-dev.txt
+            FHD/uv.lock
+            FHD/pyproject.toml
+            FHD/packages/**/pyproject.toml
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          pytest_pin="$(python "$GITHUB_WORKSPACE/FHD/scripts/dev/check_requirements_lock.py" --pytest-pin)"
+          [[ "$pytest_pin" =~ ^pytest==[0-9]+(\.[0-9]+){2}$ ]]
+          uv --version
+          uv pip install --system --python "$(command -v python)" -r requirements-server-api.txt -r ops/deploy/requirements-dev.txt "$pytest_pin"
+          uv pip check --system --python "$(command -v python)"
+          python -m pip list --format=json > dependency-versions.json
+
+      - name: Set up the real private Mod frontend compiler
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install runtime Mod compiler dependencies
+        working-directory: frontend
+        run: bash ../scripts/ci/npm_ci_with_network_retry.sh --no-audit --no-fund
+
+      - name: Run complete suite in isolated module shard
+        run: |
+          test "$(git rev-parse HEAD)" = "$BACKEND_SOURCE_SHA"
+          mkdir -p shard-evidence
+          cp dependency-versions.json shard-evidence/
+          export BACKEND_SHARD_MANIFEST=shard-evidence/full.json
+          rc=0
+          python -m pytest tests/ -v -p scripts.ci.backend_shards \
+            --cov --cov-branch --cov-fail-under=0 --cov-report= \
+            --junitxml=shard-evidence/full.xml || rc=$?
+          if [ -f .coverage ]; then cp .coverage shard-evidence/.coverage.full; fi
+          test "$rc" -eq 0
+          if find tests -name 'test_coverage_ramp_*.py' -not -path '*/__pycache__/*' | grep -q .; then
+            export BACKEND_SHARD_MODE=behavior BACKEND_SHARD_MANIFEST=shard-evidence/behavior.json
+            python -m pytest tests/ -q -m 'not coverage_ramp' -p scripts.ci.backend_shards \
+              --cov --cov-branch --cov-fail-under=0 --cov-report= \
+              --junitxml=shard-evidence/behavior.xml
+            cp .coverage shard-evidence/.coverage.behavior
+          else
+            cp shard-evidence/.coverage.full shard-evidence/.coverage.behavior
+            cp shard-evidence/full.xml shard-evidence/behavior.xml
+            python -c 'import json,pathlib; p=pathlib.Path("shard-evidence"); d=json.loads((p/"full.json").read_text()); d["mode"]="behavior"; (p/"behavior.json").write_text(json.dumps(d))'
+          fi
+          python scripts/ci/backend_shards.py seal shard-evidence
+      - name: Preserve shard evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-shard-${{ github.run_attempt }}-${{ matrix.shard }}
+          path: FHD/shard-evidence/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
+  backend-test:
+    needs: [guard-temp-scripts, ssot-drift-gate, classify, backend-quality, backend-test-shard]
+    if: always()
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ needs.classify.outputs.backend_skip }}
+    env:
+      BACKEND_SHARD_TOTAL: ${{ needs.classify.outputs.backend_total }}
+      BACKEND_TIMINGS_FILE: metrics/backend_test_timings.json
+      BACKEND_SOURCE_SHA: ${{ inputs.release_sha || github.sha }}
+    steps:
+      - name: Validate prerequisites and skip semantics
+        working-directory: .
+        env:
+          GUARD: ${{ needs.guard-temp-scripts.result }}
+          SSOT: ${{ needs.ssot-drift-gate.result }}
+          CLASSIFY: ${{ needs.classify.result }}
+          VALID: ${{ needs.classify.outputs.valid }}
+          SOURCE_SHA: ${{ needs.classify.outputs.source_sha }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.release_sha || github.sha }}
+          QUALITY: ${{ needs.backend-quality.result }}
+          SHARDS: ${{ needs.backend-test-shard.result }}
+          SHOULD_RUN: ${{ needs.classify.outputs.backend }}
+          SKIP: ${{ needs.classify.outputs.backend_skip }}
+        run: |
+          set -euo pipefail
+          test "$GUARD" = success
+          test "$SSOT" = success
+          test "$CLASSIFY" = success
+          test "$VALID" = true
+          test -n "$SOURCE_SHA"
+          test "$SOURCE_SHA" = "$EXPECTED_SOURCE_SHA"
+          test "$QUALITY" = success
+          case "$SHOULD_RUN:$SKIP" in
+            false:true) test "$SHARDS" = skipped ;;
+            true:false) test "$SHARDS" = success ;;
+            *) echo "::error::Invalid classifier decision"; exit 1 ;;
+          esac
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha || github.sha }}
+          fetch-depth: 1
+      - name: Refuse a change that drops merge-required contracts still required on main
+        working-directory: .
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          floor="${RUNNER_TEMP}/business-contract-floor.json"
+          if git cat-file -e origin/main:FHD/config/business_contract_floor.json 2>/dev/null; then
+            git show origin/main:FHD/config/business_contract_floor.json > "${floor}"
+          else
+            cp FHD/config/business_contract_floor.json "${floor}"
+          fi
+          python3 FHD/scripts/dev/check_business_contract_evidence.py floor --floor "${floor}"
+      - name: Record business contract as not applicable when backend tests are not required
+        if: needs.classify.outputs.backend != 'true'
+        run: |
+          test "$(git rev-parse HEAD)" = "$BACKEND_SOURCE_SHA"
+          python3 scripts/dev/check_business_contract_evidence.py ci-gate \
+            --source-sha "$BACKEND_SOURCE_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --backend skipped \
+            --evidence-out business-contract-evidence.json
+      - uses: actions/setup-python@v7
+        if: needs.classify.outputs.backend == 'true'
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: actions/download-artifact@v8
+        if: needs.classify.outputs.backend == 'true'
+        with:
+          pattern: backend-shard-${{ github.run_attempt }}-*
+          path: FHD/shards
+      - name: Verify complete same-source evidence before installing report tools
+        id: verify
+        if: needs.classify.outputs.backend == 'true'
+        run: |
+          test "$(git rev-parse HEAD)" = "$BACKEND_SOURCE_SHA"
+          python scripts/ci/backend_shards.py verify shards \
+            --artifact-prefix "backend-shard-${GITHUB_RUN_ATTEMPT}-" > shard-summary.json
+          python scripts/dev/check_business_contract_evidence.py ci-gate \
+            --source-sha "$BACKEND_SOURCE_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --shards shards \
+            --backend ran \
+            --evidence-out business-contract-evidence.json
+      - name: Install the verified coverage version
+        if: needs.classify.outputs.backend == 'true'
+        env:
+          COVERAGE_VERSION: ${{ steps.verify.outputs.coverage_version }}
+        run: python -m pip install "coverage==$COVERAGE_VERSION"
+      - name: Combine coverage and enforce full and behavior ratchets
+        if: needs.classify.outputs.backend == 'true'
+        env:
+          XCAGI_SKIP_LEGACY_COMPAT_ROUTES: "1"
+        run: |
+          python scripts/ci/backend_shard_aggregate.py shards \
+            --artifact-prefix "backend-shard-${GITHUB_RUN_ATTEMPT}-"
+      - uses: actions/upload-artifact@v4
+        if: always() && needs.classify.outputs.backend == 'true'
+        with:
+          name: backend-combined-${{ github.run_attempt }}
+          path: |
+            FHD/shard-summary.json
+            FHD/backend-aggregate-timings.json
+            FHD/coverage.json
+            FHD/coverage-behavior.json
+            FHD/coverage.xml
+            FHD/business-contract-evidence.json
+          if-no-files-found: error
+          retention-days: 7
+
+  frontend-quality:
+    needs: [guard-temp-scripts, classify]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha || github.sha }}
+          fetch-depth: 1
+      - name: Skip notice (no frontend-relevant changes)
+        if: needs.classify.outputs.frontend_skip == 'true'
+        run: echo "No frontend-relevant path changes; classification is retained by the aggregate gate."
+      - name: Set up Node.js
+        if: needs.classify.outputs.frontend == 'true'
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install dependencies
+        if: needs.classify.outputs.frontend == 'true'
+        working-directory: frontend
+        run: bash ../scripts/ci/npm_ci_with_network_retry.sh --no-audit --no-fund
+      - name: Run ESLint including test assertion guards
+        if: needs.classify.outputs.frontend == 'true'
+        working-directory: frontend
+        run: npx eslint src/ "tests/**/*.test.{js,ts}"
+      - name: Frontend coverage stub ratchet
+        if: needs.classify.outputs.frontend == 'true'
+        run: python scripts/dev/count_frontend_coverage_stubs.py --check
+      - name: Verify native shard and coverage contracts
+        if: needs.classify.outputs.frontend == 'true'
+        working-directory: frontend
+        run: node --test ../tests/test_ci/frontend_shards.test.mjs
+      - name: Frontend ts-any ratchet gate
+        if: needs.classify.outputs.frontend == 'true'
+        run: python ../scripts/dev/count_ts_any.py --check
+      - name: Run vue-tsc
+        if: needs.classify.outputs.frontend == 'true'
+        working-directory: frontend
+        run: |
+          set +e
+          npm run type-check
+          if [ "$?" -ne 0 ]; then
+            echo "::warning::vue-tsc reported errors (advisory; strict build uses tsconfig.build.json)"
+          fi
+
+  frontend-test-shard:
+    needs: [guard-temp-scripts, classify]
+    if: needs.classify.outputs.frontend == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        shard: [1, 2, 3, 4]
+    env:
+      FRONTEND_SHARD_INDEX: ${{ matrix.shard }}
+      FRONTEND_SHARD_TOTAL: "4"
+      FRONTEND_SOURCE_SHA: ${{ inputs.release_sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha || github.sha }}
+          fetch-depth: 1
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install dependencies
+        working-directory: frontend
+        run: bash ../scripts/ci/npm_ci_with_network_retry.sh --no-audit --no-fund
+      - name: Run frontend shard with raw coverage evidence
+        working-directory: frontend
+        run: node ../scripts/ci/frontend_shards.mjs run shard-evidence
+      - name: Preserve frontend shard evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-shard-${{ github.run_attempt }}-${{ matrix.shard }}
+          path: FHD/frontend/shard-evidence/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
+  frontend-test:
+    needs: [guard-temp-scripts, ssot-drift-gate, classify, frontend-quality, frontend-test-shard]
+    if: always()
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ needs.classify.outputs.frontend_skip }}
+    env:
+      FRONTEND_SHARD_TOTAL: "4"
+      FRONTEND_SOURCE_SHA: ${{ inputs.release_sha || github.sha }}
+    steps:
+      - name: Validate prerequisites and skip semantics
+        working-directory: .
+        env:
+          GUARD: ${{ needs.guard-temp-scripts.result }}
+          SSOT: ${{ needs.ssot-drift-gate.result }}
+          CLASSIFY: ${{ needs.classify.result }}
+          VALID: ${{ needs.classify.outputs.valid }}
+          SOURCE_SHA: ${{ needs.classify.outputs.source_sha }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.release_sha || github.sha }}
+          QUALITY: ${{ needs.frontend-quality.result }}
+          SHARDS: ${{ needs.frontend-test-shard.result }}
+          SHOULD_RUN: ${{ needs.classify.outputs.frontend }}
+          SKIP: ${{ needs.classify.outputs.frontend_skip }}
+        run: |
+          set -euo pipefail
+          test "$GUARD" = success
+          test "$SSOT" = success
+          test "$CLASSIFY" = success
+          test "$VALID" = true
+          test -n "$SOURCE_SHA"
+          test "$SOURCE_SHA" = "$EXPECTED_SOURCE_SHA"
+          test "$QUALITY" = success
+          case "$SHOULD_RUN:$SKIP" in
+            false:true) test "$SHARDS" = skipped ;;
+            true:false) test "$SHARDS" = success ;;
+            *) echo "::error::Invalid classifier decision"; exit 1 ;;
+          esac
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha || github.sha }}
+          fetch-depth: 1
+      - uses: actions/setup-node@v7
+        if: needs.classify.outputs.frontend == 'true'
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install dependencies for native Vitest report merging
+        if: needs.classify.outputs.frontend == 'true'
+        working-directory: frontend
+        run: bash ../scripts/ci/npm_ci_with_network_retry.sh --no-audit --no-fund
+      - uses: actions/download-artifact@v8
+        if: needs.classify.outputs.frontend == 'true'
+        with:
+          pattern: frontend-shard-${{ github.run_attempt }}-*
+          path: FHD/frontend/shards
+      - name: Verify all shards and merge native Vitest coverage
+        if: needs.classify.outputs.frontend == 'true'
+        working-directory: frontend
+        run: node ../scripts/ci/frontend_shards.mjs merge shards
+      - name: Frontend coverage ratchet gate
+        if: needs.classify.outputs.frontend == 'true'
+        working-directory: frontend
+        run: python ../scripts/dev/coverage_ratchet.py --check --require-frontend
+      - name: Upload merged JUnit report
+        if: always() && needs.classify.outputs.frontend == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: vitest-junit-${{ github.run_id }}
+          path: FHD/frontend/test-results/junit.xml
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Upload frontend coverage and partition summary
+        if: always() && needs.classify.outputs.frontend == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-coverage-${{ github.run_attempt }}
+          path: |
+            FHD/frontend/coverage/
+            FHD/frontend/.frontend-merge/summary.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 30
+
+  # Preserve the previous standalone check contexts without executing the suite twice.
+  # Classified skips are validated by frontend-test; an actually skipped gate fails here.
+  vitest:
+    name: Vitest (173 文件 · jsdom)
+    needs: frontend-test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the verified frontend result
+        working-directory: .
+        env:
+          FRONTEND_RESULT: ${{ needs.frontend-test.result }}
+        run: test "$FRONTEND_RESULT" = success
+
+  frontend-smoke:
+    needs: frontend-test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the verified frontend result
+        working-directory: .
+        env:
+          FRONTEND_RESULT: ${{ needs.frontend-test.result }}
+        run: test "$FRONTEND_RESULT" = success
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha || github.sha }}
+      - name: Preserve the original repository hygiene prerequisite
+        run: bash scripts/ci/check_repo_hygiene.sh
+
+  # Run mock contracts once here; e2e.yml retains the real API + strict-build path.
+  frontend-e2e:
+    needs: [guard-temp-scripts, classify]
+    if: needs.classify.outputs.backend == 'true' || needs.classify.outputs.frontend == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha || github.sha }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Cache Playwright browsers (pinned by package-lock)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('FHD/frontend/package-lock.json') }}
+
+      - name: Install Playwright Chromium binary (CDN)
+        working-directory: frontend
+        run: |
+          bash ../scripts/ci/npm_ci_with_network_retry.sh
+          npx playwright install chromium
+
+      # 2026-09-10 #1851 复审：apt 外部源（Google Chrome 等）曾出现 Hash Sum
+      # mismatch 导致 P0 E2E 被环境阻断。整改：浏览器二进制走 Playwright CDN
+      # 让 job 红掉并保留日志——禁止 || true 或跳过当修复。
+      - name: Install Playwright system deps (bounded retry)
+        working-directory: frontend
+        run: |
+          set -uo pipefail
+          rc=1
+          use_public_dns() {
+            echo "::warning::Ubuntu archive did not resolve; using 8.8.8.8 and 1.1.1.1"
+            sudo mkdir -p /etc/systemd/resolved.conf.d
+            printf '[Resolve]\nDNS=8.8.8.8 1.1.1.1\n' | sudo tee /etc/systemd/resolved.conf.d/ci-dns.conf >/dev/null
+            sudo systemctl restart systemd-resolved || true
+            getent hosts archive.ubuntu.com >/dev/null && return 0
+            printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' | sudo tee /etc/resolv.conf >/dev/null
+          }
+          sudo find /etc/apt -type f -exec sed -i 's/azure\.archive\.ubuntu\.com/archive.ubuntu.com/g' {} + || true
+          getent hosts archive.ubuntu.com >/dev/null || use_public_dns
+          for attempt in 1 2 3; do
+            echo "[deps] attempt ${attempt}/3"
+            if npx playwright install-deps chromium; then
+              rc=0
+              break
+            fi
+            echo "::warning::playwright install-deps attempt ${attempt} failed; refreshing apt lists"
+            sudo apt-get clean || true
+            sudo rm -rf /var/lib/apt/lists/*
+            sudo find /etc/apt -type f -exec sed -i 's/azure\.archive\.ubuntu\.com/archive.ubuntu.com/g' {} + || true
+            getent hosts archive.ubuntu.com >/dev/null || use_public_dns
+            sudo apt-get update
+          done
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::playwright system deps failed after 3 attempts (环境阻断，需人工排查，不得跳过)"
+            exit 1
+          fi
+
+      - name: Start dev server
+        working-directory: frontend
+        run: |
+          npm run dev -- --host 127.0.0.1 --port 5001 &
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:5001/ >/dev/null && break
+            sleep 2
+          done
+          curl -sf http://127.0.0.1:5001/ >/dev/null
+
+      - name: Run P0 E2E (mock API)
+        working-directory: frontend
+        env:
+          E2E_VITE_MOCK_API: "1"
+          PLAYWRIGHT_BASE_URL: http://127.0.0.1:5001
+        run: npm run test:e2e:p0 -- --reporter=line
+      - name: Preserve mock E2E layout screenshots and failure evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-e2e-evidence-${{ github.run_attempt }}
+          path: FHD/frontend/test-results/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  arch-fitness:
+    needs: guard-temp-scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha || github.sha }}
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install architecture contract checker from dependency SSOT
+        run: |
+          python - <<'PYTHON'
+          import pathlib, subprocess, sys, tomllib
+          config = tomllib.loads(pathlib.Path("pyproject.toml").read_text())
+          requirements = config["project"]["optional-dependencies"]["dev"]
+          requirement = next(value for value in requirements if value.startswith("import-linter"))
+          subprocess.check_call([sys.executable, "-m", "pip", "install", requirement])
+          PYTHON
+
+      - name: Check sync data-access import contracts
+        run: lint-imports --config pyproject.toml --no-cache
+
+      - name: Require traceable oversized-source growth review requests
+        if: github.event_name == 'pull_request'
+        env:
+          GROWTH_BASE: ${{ github.event.pull_request.base.sha }}
+          GROWTH_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: python ../scripts/dev/source_growth_review.py --base "$GROWTH_BASE" --head "$GROWTH_HEAD"
+
+      - name: Run architecture fitness checks
+        run: python scripts/arch_fitness.py
+
+      - name: arch-fitness-legacy-check (P1-4 双轨边界)
+        run: |
+          python - <<'PY'
+          import subprocess, sys, os
+          sys.path.insert(0, os.path.join(os.getcwd(), "scripts"))
+          import arch_fitness
+          r = subprocess.run(["python", "scripts/arch_fitness.py"], capture_output=True, text=True)
+          baselined = arch_fitness._load_baseline_keys()
+          # 只拦「新增」的 legacy/compat 散落；基线内已知项放行（与 arch_fitness.py 判定一致）。
+          blocked = [l for l in (r.stdout + r.stderr).splitlines()
+                     if "[legacy-boundary]" in l and "must live under app/legacy/" in l
+                     and arch_fitness._violation_key(l) not in baselined]
+          if blocked:
+              print("::error::新增 legacy/compat 文件散落到 app/legacy/ 之外：")
+              print("\n".join(blocked))
+              sys.exit(1)
+          print("arch-fitness-legacy-check OK")
+          PY
+
+      - name: docs-ssot-lint
+        run: python scripts/dev/docs_ssot_lint.py --strict
+
+      - name: doc-version-freshness
+        run: python scripts/dev/verify_doc_versions.py
+
+      - name: doc-claims-consistency
+        run: python scripts/dev/verify_doc_claims.py
+
+      - name: claimed-vs-actual-freshness
+        run: python scripts/dev/gen_claimed_vs_actual.py --check
+
+  security-scan:
+    needs: guard-temp-scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha || github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Run security checks
+        run: |
+          # Security gate policy (see docs/CI_SSOT.md → Security scanning):
+          #  - HARD gate for CRITICAL/HIGH = container-scan job (Trivy, exit-code 1).
+          #  - pip-audit is a blocking dependency CVE gate.
+          #  - bandit broad scan (--exit-zero) is ADVISORY; the focused B608 (SQL injection)
+          #    pass below is BLOCKING.
+          pip install pip-audit bandit
+          pip-audit -r requirements-server-api.txt
+          bandit -r app/ -lll --skip B101,B601,B110 --exit-zero
+          # B608=SQLi (blocking scan below skips it); B324/B413=cache-key hash & legacy wechat crypto (non-exploit)
+          bandit -r app/ -lll -s B608,B324,B413
+
+  # Container image vulnerability scan (built image from CI Dockerfile)
+  container-scan:
+    needs: [classify, pack-verify]
+    if: needs.classify.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha || github.sha }}
+
+      - name: Download immutable server release
+        uses: actions/download-artifact@v8
+        with:
+          name: fhd-server-release
+          path: dist/deploy
+
+      - name: Restore CI-built admin console into scan context
+        run: |
+          set -euo pipefail
+          artifact="$(find dist/deploy -maxdepth 1 -name 'fhd-full-*.tar.gz' -print -quit)"
+          test -n "$artifact"
+          manifest="$(dirname "$artifact")/fhd-manifest.json"
+          expected_verifier="$(python3 - "$manifest" <<'PY'
+          import json, sys
+          print(json.load(open(sys.argv[1], encoding="utf-8")).get("archive_verifier_sha256", ""))
+          PY
+          )"
+          actual_verifier="$(sha256sum -- scripts/deploy/lib/verify_release_archive.py | awk '{print $1}')"
+          test "$expected_verifier" = "$actual_verifier"
+          python3 scripts/deploy/lib/verify_release_archive.py --archive "$artifact"
+          tar -xzf "$artifact" ./templates/admin-vue-dist
+          python3 scripts/deploy/lib/verify_admin_console.py \
+            --root templates/admin-vue-dist \
+            --expected-git-sha "${XCAGI_RELEASE_SHA}"
+
+      - name: Build image for scanning
+        run: docker build --target production -f ops/docker/Dockerfile.fhd-api -t xcagi-ci-scan:local .
+
+      - name: Smoke test production image
+        run: |
+          set -euo pipefail
+          expected_version="$(python3 -c 'import sys; sys.path.insert(0, "scripts/dev"); from verify_version_anchors import canonical_version; print(canonical_version())')"
+          container_name="xcagi-ci-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'docker rm -f "${container_name}" >/dev/null 2>&1 || true' EXIT
+          docker run -d --name "${container_name}" \
+            -e XCAGI_GUNICORN_WORKERS=1 -e FHD_SKIP_ADMIN_BOOTSTRAP=1 \
+            -e DATABASE_URL=sqlite:////app/data/ci-smoke.db \
+            -e VECTOR_DB_URL=sqlite:////app/data/ci-smoke.db \
+            xcagi-ci-scan:local
+
+          for attempt in $(seq 1 60); do
+            if [ "$(docker inspect --format '{{.State.Running}}' "${container_name}")" != "true" ]; then
+              break
+            fi
+            if payload="$(docker exec "${container_name}" curl -fsS http://127.0.0.1:5000/api/health)" \
+              && jq -e --arg v "${expected_version}" '.runtime.status == "healthy" and .version == $v' <<<"${payload}" >/dev/null; then
+              jq '{status, version, runtime_status: .runtime.status}' <<<"${payload}"
+              exit 0
+            fi
+            sleep 1
+          done
+
+          docker logs --tail 200 "${container_name}" >&2
+          exit 1
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: xcagi-ci-scan:local
+          format: table
+          exit-code: 1
+          severity: CRITICAL,HIGH
+
+  # FHD 服务器 API 发布包（tarball + manifest；不含生产 SSH 部署）
+  pack-verify:
+    needs: [guard-temp-scripts, classify]
+    if: needs.classify.outputs.backend == 'true' || needs.classify.outputs.frontend == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha || github.sha }}
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up Node.js for immutable admin console
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install admin console build dependencies
+        working-directory: frontend
+        run: bash ../scripts/ci/npm_ci_with_network_retry.sh
+
+      - name: Verify version anchors and offline startup measurements
+        run: |
+          python scripts/dev/verify_version_anchors.py
+          node --test scripts/package/macos-startup-metrics.test.cjs
+
+      - name: Pack FHD server release tarball
+        env:
+          FHD_RELEASE_CHANNEL: ${{ github.event_name == 'workflow_dispatch' && inputs.release_channel || (contains(github.ref, '-rc') && 'staging' || 'stable') }}
+        run: bash scripts/deploy/fhd-pack-release.sh
+
+      - name: Upload server release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fhd-server-release
+          path: |
+            dist/deploy/fhd-full-*.tar.gz
+            dist/deploy/fhd-manifest.json
+          if-no-files-found: error
+          retention-days: 14
+
+  # FHD API 生产镜像（xcagi-fhd-api → GHCR；manifest v2 含 image_digest）
+  docker-build-fhd-api:
+    needs: [backend-test, frontend-test, frontend-e2e, security-scan, container-scan, pack-verify, arch-fitness]
+    if: github.event_name != 'schedule' && needs.backend-test.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    # image_tag: 用 metadata-action outputs.version（勿手搓短 sha）— docker/metadata-action#479
+    outputs:
+      image_tag: ${{ steps.meta_fhd.outputs.version }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write      # cosign keyless (Sigstore OIDC) + provenance
+      attestations: write  # actions/attest-build-provenance (SLSA)
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha || github.sha }}
+
+      # GHCR repo paths must be lowercase; github.repository here is 42433422/XCMAX (mixed case).
+      # metadata-action lowercases its own tags, but the manual cosign/SBOM/provenance refs below
+      # need an explicit lowercase name to avoid "repository name must be lowercase" failures.
+      - name: Compute lowercase FHD API image name
+        id: imgref
+        run: |
+          name="${{ env.REGISTRY }}/${{ env.IMAGE_NAME_FHD_API }}"
+          echo "name=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Download server release manifest
+        uses: actions/download-artifact@v8
+        with:
+          name: fhd-server-release
+          path: dist/deploy
+
+      - name: Restore CI-built admin console into image context
+        run: |
+          set -euo pipefail
+          artifact="$(find dist/deploy -maxdepth 1 -name 'fhd-full-*.tar.gz' -print -quit)"
+          test -n "$artifact"
+          tar -xzf "$artifact" ./templates/admin-vue-dist
+          python3 scripts/deploy/lib/verify_admin_console.py \
+            --root templates/admin-vue-dist \
+            --expected-git-sha "${XCAGI_RELEASE_SHA}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract FHD API image metadata
+        id: meta_fhd
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.imgref.outputs.name }}
+          tags: |
+            type=sha,prefix=sha-,enable=${{ github.event_name != 'workflow_dispatch' }}
+            type=raw,value=sha-${{ env.XCAGI_RELEASE_SHA }},enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=ref,event=tag,enable=${{ startsWith(github.ref, 'refs/tags/FHD/v') }}
+      - name: Build and push xcagi-fhd-api
+        id: build_fhd
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./ops/docker/Dockerfile.fhd-api
+          push: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/FHD/v') }}
+          tags: ${{ steps.meta_fhd.outputs.tags }}
+          labels: ${{ steps.meta_fhd.outputs.labels }}
+          build-args: |
+            XCAGI_GIT_SHA=${{ env.XCAGI_RELEASE_SHA }}
+          cache-from: type=gha,scope=xcagi-fhd-api
+          cache-to: type=gha,mode=max,scope=xcagi-fhd-api
+
+      # ── Supply-chain trust (only when image was pushed → digest present) ──
+      - name: Install Cosign
+        if: steps.build_fhd.outputs.digest != ''
+        uses: sigstore/cosign-installer@v4.1.3
+
+      - name: Sign xcagi-fhd-api image (keyless / Sigstore OIDC)
+        if: steps.build_fhd.outputs.digest != ''
+        env:
+          IMAGE_DIGEST_REF: ${{ steps.imgref.outputs.name }}@${{ steps.build_fhd.outputs.digest }}
+        run: cosign sign --yes "${IMAGE_DIGEST_REF}"
+
+      - name: Generate SBOM (SPDX-JSON) for xcagi-fhd-api
+        if: steps.build_fhd.outputs.digest != ''
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.imgref.outputs.name }}@${{ steps.build_fhd.outputs.digest }}
+          format: spdx-json
+          output-file: ${{ runner.temp }}/fhd-api-sbom.spdx.json
+          upload-artifact: false
+
+      - name: Attest SBOM to image (cosign)
+        if: steps.build_fhd.outputs.digest != ''
+        env:
+          IMAGE_DIGEST_REF: ${{ steps.imgref.outputs.name }}@${{ steps.build_fhd.outputs.digest }}
+          SBOM_FILE: ${{ runner.temp }}/fhd-api-sbom.spdx.json
+        run: cosign attest --yes --predicate "${SBOM_FILE}" --type spdxjson "${IMAGE_DIGEST_REF}"
+
+      - name: Generate SLSA build provenance attestation
+        if: steps.build_fhd.outputs.digest != ''
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ steps.imgref.outputs.name }}
+          subject-digest: ${{ steps.build_fhd.outputs.digest }}
+          push-to-registry: true
+
+      - name: Upload SBOM artifact
+        if: steps.build_fhd.outputs.digest != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: fhd-api-sbom
+          path: ${{ runner.temp }}/fhd-api-sbom.spdx.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Merge image digest into manifest
+        if: steps.build_fhd.outputs.digest != ''
+        env:
+          FHD_IMAGE_REF: ${{ steps.imgref.outputs.name }}
+          FHD_IMAGE_DIGEST: ${{ steps.build_fhd.outputs.digest }}
+        run: bash scripts/deploy/fhd-merge-manifest-image.sh
+
+      - name: Export image tarball for server bootstrap
+        if: steps.build_fhd.outputs.digest != '' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/FHD/v'))
+        env:
+          FHD_IMAGE_DIGEST: ${{ steps.build_fhd.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/deploy
+          ref="${{ steps.imgref.outputs.name }}"
+          # build-push-action 只推送到 GHCR，本地 daemon 无镜像；先 pull 再 save
+          docker pull "${ref}@${FHD_IMAGE_DIGEST}"
+          docker save "${ref}@${FHD_IMAGE_DIGEST}" -o dist/deploy/fhd-api-image.tar
+          gzip -f dist/deploy/fhd-api-image.tar
+
+      - name: Upload manifest with image digest
+        if: steps.build_fhd.outputs.digest != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: fhd-server-release-with-image
+          path: |
+            dist/deploy/fhd-manifest.json
+            dist/deploy/fhd-full-*.tar.gz
+            dist/deploy/fhd-api-image.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  # gitops-image-bump 已随假 k8s/GitOps 路径退役（2026-07-01 运维根治）——
+  # 生产 CD 的唯一正道是下方 cvm-push-release + 服务器端 fhd-auto-update.sh。
+
+  # CVM 拉取式自动 CD（main 成功 + secrets 就绪时 scp manifest/tarball；无 secrets 则跳过）
+  cvm-push-release:
+    needs: [docker-build-fhd-api]
+    if: |
+      needs.docker-build-fhd-api.result == 'success' &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.push_to_cvm == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    concurrency:
+      group: cvm-push-release-${{ github.event_name == 'workflow_dispatch' && inputs.release_channel || (contains(github.ref, '-rc') && 'staging' || 'stable') }}
+      # The CVM link needs tens of minutes. Cancelling a runner does not
+      # reliably terminate its remote rsync receiver, so serialize releases
+      # instead of leaving orphan transfers that compete with the next SHA.
+      cancel-in-progress: false
+    # 正常发布只推必需 tarball + manifest；离线镜像归档仅手动显式启用。
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Download normalized security evidence for stable upload
+        if: ${{ inputs.release_channel == 'stable' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: xcagi-security-release-reports
+          path: ${{ runner.temp }}/security-reports/current
+          run-id: ${{ inputs.security_scan_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download compatibility security evidence for stable upload
+        if: ${{ inputs.release_channel == 'stable' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: xcagi-security-release-reports
+          path: ${{ runner.temp }}/security-reports/previous
+          run-id: ${{ inputs.previous_security_scan_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Enforce exact-SHA security clearance for stable upload
+        if: ${{ inputs.release_channel == 'stable' }}
+        working-directory: .
+        run: >-
+          python FHD/scripts/security/verify_security_scan_pair.py
+          --previous-dir "${RUNNER_TEMP}/security-reports/previous"
+          --current-dir "${RUNNER_TEMP}/security-reports/current"
+          --release-sha "${XCAGI_RELEASE_SHA}"
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: fhd-server-release-with-image
+          path: dist/deploy
+
+      - name: Push to CVM update server
+        env:
+          FHD_PUSH_HOST: ${{ secrets.FHD_PUSH_HOST }}
+          FHD_PUSH_USER: ${{ secrets.FHD_PUSH_USER }}
+          FHD_PUSH_SSH_KEY_RAW: ${{ secrets.FHD_PUSH_SSH_KEY }}
+          FHD_RELEASE_CHANNEL: ${{ github.event_name == 'workflow_dispatch' && inputs.release_channel || (contains(github.ref, '-rc') && 'staging' || 'stable') }}
+          FHD_CVM_PUSH_STRICT: "true"
+          FHD_PUSH_IMAGE_TAR: ${{ github.event_name == 'workflow_dispatch' && inputs.push_image_tar && '1' || '0' }}
+          # Stable artifacts are uploaded atomically, then await the audited
+          # fhd-deploy workflow approval. Staging remains immediate.
+          FHD_PUSH_APPLY_NOW: ${{ (github.event_name == 'workflow_dispatch' && inputs.release_channel || (contains(github.ref, '-rc') && 'staging' || 'stable')) == 'staging' && '1' || '0' }}
+          # Allow slow CVM transfer and resumable retries.
+          FHD_CVM_PUSH_TIMEOUT: "75m"
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "${XCAGI_RELEASE_SHA}" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::release_sha must resolve to a full lowercase 40-character SHA."
+            exit 1
+          fi
+          if [ "$(git rev-parse HEAD)" != "${XCAGI_RELEASE_SHA}" ]; then
+            echo "::error::Release checkout drifted from ${XCAGI_RELEASE_SHA}."
+            exit 1
+          fi
+          if [ -z "${FHD_PUSH_HOST:-}" ] || [ -z "${FHD_PUSH_SSH_KEY_RAW:-}" ]; then
+            if [ "${FHD_CVM_PUSH_STRICT:-false}" = "true" ]; then
+              echo "::error::CVM push required (strict mode: tag release or workflow_dispatch) but FHD_PUSH_HOST/FHD_PUSH_SSH_KEY secrets missing. Configure secrets or the production server will serve stale artifacts."
+              exit 1
+            fi
+            echo "::notice::Skipping CVM push — configure FHD_PUSH_HOST and FHD_PUSH_SSH_KEY in repo secrets."
+            exit 0
+          fi
+          mkdir -p ~/.ssh
+          KEY_FILE="${RUNNER_TEMP}/fhd_push_key"
+          printf '%s\n' "$FHD_PUSH_SSH_KEY_RAW" > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+          export FHD_SKIP_PACK=1
+          export FHD_PUSH_SSH_KEY="$KEY_FILE"
+          export FHD_PUSH_HOST="$FHD_PUSH_HOST"
+          export FHD_PUSH_USER="${FHD_PUSH_USER:-root}"
+          export FHD_RELEASE_CHANNEL="${FHD_RELEASE_CHANNEL:-stable}"
+          set +e
+          timeout "${FHD_CVM_PUSH_TIMEOUT:-12m}" bash scripts/deploy/fhd-push-release.sh
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            exit 0
+          fi
+          if [ "${FHD_CVM_PUSH_STRICT:-false}" = "true" ]; then
+            echo "::error::CVM push failed with status ${status}."
+            exit "$status"
+          fi
+          if [ "$status" -eq 124 ]; then
+            echo "::warning::CVM push timed out after ${FHD_CVM_PUSH_TIMEOUT:-12m}; keeping main CI green. Use workflow_dispatch with push_to_cvm=true for a strict retry."
+          else
+            echo "::warning::CVM push failed with status ${status}; keeping main CI green. Use workflow_dispatch with push_to_cvm=true for a strict retry."
+          fi
+
+  # Bot-token workflow_dispatch does not reliably emit a downstream workflow_run
+  # event. Dispatch Evolution with the repository PAT only after the exact CVM
+  # release and DR receipt have succeeded.
+  dispatch-evolution-after-cvm:
+    needs: [cvm-push-release]
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main' &&
+      inputs.push_to_cvm == true &&
+      inputs.dispatch_evolution == true &&
+      needs.cvm-push-release.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Dispatch Evolution Orchestrator after exact production receipt
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ secrets.CI_COMMIT_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "${GH_TOKEN:-}"
+          gh workflow run fhd-evolution-orchestrator.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref main \
+            -f force_run=false
+
+  # Docker Build & Push（全仓镜像）已于 2026-07-20 退役：推 <repo>:sha-xxx 无人引用，
+  # 实际制品由 docker-build-fhd-api（GHCR fhd-api 镜像）与 pack-verify（tarball）承担。
+  # 2026-08-01 移除残留 job 定义（无下游 needs，branch protection 未引用）。
+
+  release-verify:
+    name: release-verify
+    needs: [backend-test, frontend-test, frontend-e2e, pack-verify, arch-fitness]
+    if: needs.backend-test.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RELEASE_VERIFY_SKIP_E2E: "1"
+      RELEASE_VERIFY_SKIP_PACK: "0"
+      RELEASE_VERIFY_SKIP_DESKTOP: "0"
+      XCAGI_SKIP_LEGACY_COMPAT_ROUTES: "1"
+      XCAGI_TENANT_STRICT: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha || github.sha }}
+          # release_verify.sh 内跑 ssot gate，capability-center --check 需完整历史
+          # （浅克隆下 verified_at 只能命中 checkout commit），同 ssot-drift-gate。
+          fetch-depth: 0
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up cached uv installer
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            FHD/requirements-server-api.txt
+            FHD/ops/deploy/requirements-dev.txt
+            FHD/uv.lock
+            FHD/pyproject.toml
+            FHD/packages/**/pyproject.toml
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install backend test deps
+        run: |
+          set -euo pipefail
+          pytest_pin="$(python "$GITHUB_WORKSPACE/FHD/scripts/dev/check_requirements_lock.py" --pytest-pin)"
+          [[ "$pytest_pin" =~ ^pytest==[0-9]+(\.[0-9]+){2}$ ]]
+          uv --version
+          uv pip install --system --python "$(command -v python)" -r requirements-server-api.txt -r ops/deploy/requirements-dev.txt "$pytest_pin"
+          uv pip check --system --python "$(command -v python)"
+
+      - name: Install frontend deps
+        working-directory: frontend
+        run: bash ../scripts/ci/npm_ci_with_network_retry.sh
+
+      - name: Install desktop deps
+        working-directory: desktop
+        run: bash ../scripts/ci/npm_ci_with_network_retry.sh
+
+      - name: Run release_verify.sh
+        run: bash scripts/dev/release_verify.sh
+
+  desktop-build-smoke:
+    name: desktop-build-smoke
+    needs: [frontend-test, classify]
+    # 仅 desktop/runtime/updater/打包/签名相关改动才跑（日常前端/后端改动不触发）。
+    if: needs.classify.outputs.macos != 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha || github.sha }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - name: Desktop tsc build
+        working-directory: desktop
+        run: |
+          bash ../scripts/ci/npm_ci_with_network_retry.sh
+          npm run build
+
+  desktop-test:
+    name: desktop-test
+    needs: [frontend-test, classify]
+    # 仅 desktop/runtime/updater/打包/签名相关改动才跑（日常前端/后端改动不触发）。
+    if: needs.classify.outputs.macos != 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha || github.sha }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - name: Install desktop deps
+        working-directory: desktop
+        run: bash ../scripts/ci/npm_ci_with_network_retry.sh
+      - name: Run full desktop unit-test suite
+        working-directory: desktop
+        run: npm test
+
+  desktop-windows-release-script-smoke:
+    name: desktop-windows-release-script-smoke
+    needs: [guard-temp-scripts, classify]
+    # Windows 发布脚本及原生文件边界相关改动运行；分类器统一维护触发范围。
+    if: needs.classify.outputs.windows != 'false'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha || github.sha }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Verify dormant catalog native file observations (not activation)
+        shell: pwsh
+        env:
+          PYTHONPATH: "."
+          PYTHONDONTWRITEBYTECODE: "1"
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Import the real desktop package without installing unrelated audio/ML services.
+          $nativePackages = 'aiohappyeyeballs,aiohttp,aiosignal,attrs,frozenlist,multidict,propcache,yarl,pytest,pytest-asyncio,pygments,sqlalchemy,annotated-doc,annotated-types,anyio,click,cryptography,fastapi,httpx,idna,orjson,pydantic,pydantic-core,python-dotenv,python-multipart,redis,setuptools,sniffio,starlette,typing-inspection,typing-extensions,zstandard'
+          $nativeRequirements = python -c "import sys,tomllib; p=tomllib.load(open('uv.lock','rb')); names=sys.argv[1].split(','); v={n:[x['version'] for x in p['package'] if x['name'].lower().replace('_','-')==n] for n in names}; assert all(len(x)==1 for x in v.values()); print(' '.join(n+'=='+v[n][0] for n in names))" $nativePackages
+          if ($LASTEXITCODE -ne 0) { throw 'Locked native test dependencies unavailable' }
+          python -m pip install --disable-pip-version-check ($nativeRequirements -split ' ')
+          if ($LASTEXITCODE -ne 0) { throw 'Native catalog dependencies installation failed' }
+          python -c "import sys; assert sys.platform == 'win32', 'Native Windows execution required'"
+          if ($LASTEXITCODE -ne 0) { throw 'Native Windows runtime unavailable' }
+          python -m pytest --noconftest -o addopts= -p no:cacheprovider -p pytest_asyncio.plugin -q tests/test_desktop/test_windows_catalog_files_native.py --junitxml=windows-catalog-native.xml
+          if ($LASTEXITCODE -ne 0) { throw 'Native catalog observation tests failed' }
+          @'
+          import xml.etree.ElementTree as ET
+          root = ET.parse('windows-catalog-native.xml').getroot()
+          expected = {
+              'test_native_main_pin_allows_sqlite_writes_but_refuses_rename_and_delete',
+              'test_native_wal_snapshot_does_not_pin_sqlite_sidecar_cleanup',
+              'test_native_hardlinked_main_and_sidecar_are_refused',
+              'test_native_parent_junction_is_refused_without_elevation',
+          }
+          cases = root.findall('.//testcase')
+          assert len(cases) == 4 and {case.attrib['name'] for case in cases} == expected
+          assert not any(root.findall('.//' + tag) for tag in ('skipped', 'failure', 'error'))
+          print('Verified four executed native observation tests; no activation/durability claim')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Expected four executed native tests; skips are not acceptance' }
+      - name: Verify native Windows employee identity boundaries
+        shell: pwsh
+        env:
+          PYTHONPATH: "."
+          PYTHONDONTWRITEBYTECODE: "1"
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -c "import sys; assert sys.platform == 'win32', 'Native Windows execution required'"
+          if ($LASTEXITCODE -ne 0) { throw 'Native Windows runtime unavailable' }
+          python -m pytest --noconftest -o addopts= -p no:cacheprovider -p pytest_asyncio.plugin -q tests/test_desktop/test_windows_employee_identity_native.py --junitxml=windows-employee-identity-native.xml
+          if ($LASTEXITCODE -ne 0) { throw 'Native employee identity tests failed' }
+          @'
+          import xml.etree.ElementTree as ET
+          root = ET.parse('windows-employee-identity-native.xml').getroot()
+          expected = {
+              'test_native_employee_identity_round_trip',
+              'test_native_employee_identity_hardlink_is_refused',
+              'test_native_employee_identity_parent_junction_is_refused',
+              'test_native_employee_identity_workspace_junction_is_refused',
+          }
+          cases = root.findall('.//testcase')
+          assert len(cases) == 4 and {case.attrib['name'] for case in cases} == expected
+          assert not any(root.findall('.//' + tag) for tag in ('skipped', 'failure', 'error'))
+          print('Verified four executed native employee identity tests')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Native identity skips are not acceptance' }
+      - name: Retain native Windows identity results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-employee-identity-native
+          path: FHD/windows-employee-identity-native.xml
+          if-no-files-found: error
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - name: Parse Windows release scripts (pwsh + Windows PowerShell 5.1)
+        shell: pwsh
+        run: |
+          # 全量解析 scripts/package/*.ps1（此前只硬编码 4 个路径，acceptance-windows.ps1 整体无法解析却在 main 上长期绿）；
+          # 必须用 Windows PowerShell 5.1 复解析并试取版：真机以 powershell -File 执行它们，UTF-8 无 BOM 的中文脚本在 5.1 下按 ANSI 解码即 ParserError／按 ANSI 读 VERSION.md 即取不到版本，而 pwsh 7 两者都看不到。
+          $paths = @(Get-ChildItem -LiteralPath 'scripts/package' -Filter '*.ps1' -File | Sort-Object Name); if ($paths.Count -eq 0) { throw 'scripts/package 下未找到任何 .ps1：脚本清单为空，门禁失效' }
+          foreach ($item in $paths) { $null = [scriptblock]::Create((Get-Content -LiteralPath $item.FullName -Raw)) }
+          $probe = "`$bad=0;Get-ChildItem 'scripts/package' -Filter *.ps1|%{`$t=`$null;`$e=`$null;[void][System.Management.Automation.Language.Parser]::ParseFile(`$_.FullName,[ref]`$t,[ref]`$e);if(`$e.Count){`$bad++;Write-Host `$_.Name}};if(`$bad){exit 1};try{. 'scripts/package/product-version.ps1';if((Resolve-ProductVersion) -notmatch '^\d+\.\d+\.\d+\.\d+`$'){Write-Host 'Resolve-ProductVersion returned a non-version value';exit 1}}catch{Write-Host (`$_.Exception.Message);exit 1}"
+          & (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -NoProfile -NonInteractive -Command $probe; if ($LASTEXITCODE -ne 0) { throw 'Windows PowerShell 5.1 下 scripts/package 脚本解析失败或 Resolve-ProductVersion 取版失败：非 ASCII 脚本须以 UTF-8 BOM 保存，读 VERSION.md 须显式 -Encoding UTF8' }
+          Write-Host "已解析 $($paths.Count) 个 Windows 发布/打包脚本（pwsh 7 + Windows PowerShell 5.1）"
+      - name: Parse SSL.com electron-builder signing hook
+        shell: pwsh
+        run: node --check desktop/build/windows-sign.cjs
+      - name: Install SSL.com CodeSignTool smoke
+        uses: SSLcom/esigner-codesign@cf5f6c1d38ad10f47e3ed9aca873f429b1a8d85b # v1.3.2
+        with:
+          command: --version
+          environment_name: PROD
+          signing_method: v2
+      - name: Verify SSL.com CodeSignTool exports
+        shell: pwsh
+        run: |
+          if (-not $env:CODE_SIGN_TOOL_PATH) {
+            throw 'SSL.com action did not export CODE_SIGN_TOOL_PATH'
+          }
+          if (-not $env:JAVA_HOME) {
+            throw 'SSL.com action did not provide or retain JAVA_HOME'
+          }
+          $jar = Join-Path $env:CODE_SIGN_TOOL_PATH 'jar/code_sign_tool-1.3.0.jar'
+          $java = Join-Path $env:JAVA_HOME 'bin/java.exe'
+          foreach ($path in @($jar, $java)) {
+            if (-not (Test-Path -LiteralPath $path)) {
+              throw "SSL.com CodeSignTool smoke path missing: $path"
+            }
+          }
+          & $java -Xmx1024M -jar $jar --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "SSL.com CodeSignTool version probe failed with exit code $LASTEXITCODE"
+          }
+      - name: Test Windows full rollback helper
+        shell: pwsh
+        working-directory: desktop
+        run: |
+          npm ci
+          $env:XCAGI_DESKTOP_TEST = '1'
+          npx vitest run rollback-windows.test.ts updater-install.test.ts rollback.test.ts
+
+  # SSOT drift gate (blocking): drift in any registered SSOT domain fails the pipeline.
+  # deps/k8s drift cleared + employee-roster/db-schema registered 2026-06-23 + service-topology 2026-06-24.
+  # dev-inventory / dev-guards (统一入口) registered 2026-08-07 — 收编分散规范性守卫/棘轮脚本入 SSOT 工程。
+  ssot-drift-gate:
+    name: SSOT Drift Gate
+    needs: guard-temp-scripts
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha || github.sha }}
+          # capability-center --check 需用 git log 重算证据 commit/verified_at，
+          # 浅克隆会导致生成结果与已提交页面漂移，必须完整历史。
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install PyYAML
+        run: pip install pyyaml
+
+      - name: SSOT drift gate
+        working-directory: FHD
+        run: python scripts/dev/ssot_cli.py gate
+
+      - name: Workflow sync drift gate
+        shell: bash
+        working-directory: .
+        run: |
+          set -euo pipefail
+          # 校验根仓 .github/workflows/ 与 FHD/MODstore 源一致
+          # 编辑源必须改 FHD/.github/workflows/ 或 MODstore_deploy/.github/workflows/，
+          # 然后跑 python scripts/dev/publish_ci_workflows_to_root.py 同步
+          python scripts/dev/publish_ci_workflows_to_root.py --check

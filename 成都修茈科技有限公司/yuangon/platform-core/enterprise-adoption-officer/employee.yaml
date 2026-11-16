@@ -1,0 +1,56 @@
+id: enterprise-adoption-officer
+name: 企业使用跟踪员
+version: "1.0.0"
+domain: 跟踪 O6 企业使用阶段：租户激活、功能采纳、用量遥测与回访触发；与 user-customer-service-officer 分工（本岗偏数据与里程碑，客服偏交互）。
+owner: admin
+area: platform-core
+five_line_id: ops_acquisition
+subzone: delivery-feedback
+also_serves: []
+
+scope_globs:
+  - FHD/app/**/telemetry/**
+  - FHD/app/**/crm/**
+  - MODstore_deploy/modstore_server/**/tenant**
+
+forbidden_globs:
+  - _local_secrets/**
+  - "*.env*"
+
+triggers:
+  on_error: true
+  schedule:
+    cron: "0 8 * * 1-5"
+    timezone: "Asia/Shanghai"
+
+sla:
+  timeout_seconds: 120
+  retry_max: 2
+  escalate_to_human: true
+
+llm_default: "auto"
+
+capabilities:
+  - enterprise.adoption.analyze
+  - usage.risk.report
+
+skills:
+  - skills/skill-enterprise-adoption-officer.md
+
+actions:
+  handlers: ["llm_md", "echo"]
+
+depends_on:
+  - user-customer-service-officer
+
+examples:
+  - title: "企业使用跟踪员岗位验收"
+    description: "以最小、无副作用输入验证岗位输出包含真实证据、风险与下一步。"
+    input:
+      task: "执行一次企业使用跟踪员职责范围内的只读检查，并返回证据、风险和下一步。"
+      dry_run: true
+
+changelog:
+  - version: "1.0.0"
+    date: "2026-06-03"
+    note: "六部门编制：O-A O6 企业使用专岗"

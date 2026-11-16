@@ -1,0 +1,491 @@
+import {
+  createRouter,
+  createWebHistory,
+  START_LOCATION,
+  type RouteRecordRaw,
+  type RouteLocationRaw,
+} from 'vue-router'
+import { getSidebarNavigationGeneration } from '@/utils/sidebarNavigation'
+import { showAppToast } from '@/composables/useAppToast'
+import { useLanGate } from '@/composables/useLanGate'
+import { shouldRouteToProductOnboarding } from '@/composables/useProductFlow'
+import { resolveHostPackOnboardingStep, shouldRouteToHostPackOnboarding } from '@/utils/hostPackOnboardingGate'
+import { customerServiceHostPathFromModPath } from '@/utils/customerServicePagePaths'
+import { resolvePlannerChatHomePath, resolvePlannerPagePath } from '@/utils/plannerPagePaths'
+import { readActiveExtensionModId } from '@/utils/erpDomainPaths'
+import { isProtectedClientModId } from '@/constants/protectedMods'
+import { fetchProductSku, isEnterpriseEdition } from '@/utils/productSku'
+import {
+  consumeDesktopSessionBootstrapHint,
+  hasRecentEnterpriseSessionHint,
+  validateEnterpriseSessionCached,
+} from '@/utils/authSessionCache'
+import { useModsStore } from '@/stores/mods'
+import { DESKTOP_ADMIN_FORBIDDEN_MESSAGE, isAdminConsoleSpa, resolveAdminConsoleHomeUrl } from '@/utils/adminConsoleUrl'
+import { isDesktopShell } from '@/utils/desktopShell'
+import { committedRouteTitle } from '@/utils/routeTitle'
+import { ADMIN_HOST_ROUTE_RECORDS } from '@admin-console-inject/adminHostRoutes'
+import { ADMIN_OPERATOR_BLOCKED_ROUTE_NAMES, ADMIN_OPERATOR_HOME_ROUTE } from '@/constants/adminOperatorNav'
+import { buildRoleMenuProfile, canShowCoreMenuKey, tenantScopedBusinessPath, UNSCOPED_HOST_BUSINESS_KEYS } from '@/utils/roleMenuProfile'
+import { isClientErpSidebarContext } from '@/constants/genericModPack'
+import { resolveInitialRoutes } from './initialRouteSelection'
+import { CORE_ROUTES } from './routes/core'
+import { BUSINESS_ROUTES } from './routes/business'
+import { SHELL_ROUTES } from './routes/shell'
+import { refreshDesktopSessionInBackground } from '@/utils/desktopSessionRestore'
+import { clearRouteChunkError, isChunkLoadError, markRouteChunkError } from '@/utils/routeLoadState'
+const DEFAULT_DUTY_ROSTER_GRAPH_VIEW = 'department'
+function normalizeDutyRosterGraphView(raw: unknown): string {
+  const token = String(Array.isArray(raw) ? raw[0] : raw || '')
+    .trim()
+    .toLowerCase()
+  if (token === 'department' || token === 'dept' || token === '六部门') return 'department'
+  if (token === 'hub' || token === 'center' || token === '中心' || token === '中心图') return 'hub'
+  if (token === 'legacy-area' || token === 'area' || token === '物理' || token === '物理分区') return 'legacy-area'
+  if (token === 'client' || token === 'workshop' || token === '车间' || token === '客户端车间') return 'client'
+  return DEFAULT_DUTY_ROSTER_GRAPH_VIEW
+}
+
+// 路由定义按域拆分至 ./routes/（core/business/shell），拼接顺序与拆分前注册顺序完全一致
+const allRoutes: RouteRecordRaw[] = [
+  ...CORE_ROUTES,
+  ...BUSINESS_ROUTES,
+  ...SHELL_ROUTES,
+]
+
+if (import.meta.env.VITE_XCMAX_ADMIN_CONSOLE === '1') {
+  allRoutes.push(...ADMIN_HOST_ROUTE_RECORDS)
+}
+
+const routes = resolveInitialRoutes(allRoutes)
+
+const router = createRouter({
+  history: createWebHistory(import.meta.env.BASE_URL),
+  routes,
+})
+router.beforeEach(async (to, _from, finish) => {
+  const generation = getSidebarNavigationGeneration()
+  const next = (target?: RouteLocationRaw | boolean | Error) => {
+    if (generation !== getSidebarNavigationGeneration()) finish(false)
+    else if (target === undefined) finish()
+    else if (typeof target === 'boolean') finish(target)
+    else if (target instanceof Error) finish(target)
+    else finish(target)
+  }
+  const unavailable = () => {
+    if (generation === getSidebarNavigationGeneration()) showAppToast('连接暂不可用，未能验证会话。请检查连接后重试；没有判定账号失效。', 'warning')
+    next(false)
+  }
+  const refreshSignedInProfile = (profile: { refreshFromServer: () => Promise<unknown> }) => {
+    // Background refresh must not race a valid session into the login page.
+    void profile.refreshFromServer().catch(() => undefined)
+  }
+  let provisionalDesktopEntry = false
+  if (to.name === 'duty-roster-graph') {
+    const nextView = normalizeDutyRosterGraphView(to.query.view)
+    const currentView = String(Array.isArray(to.query.view) ? to.query.view[0] : to.query.view || '')
+      .trim()
+      .toLowerCase()
+    const normalizedView = String(nextView)
+    if (currentView !== normalizedView) {
+      next({
+        name: 'duty-roster-graph',
+        query: { ...to.query, view: normalizedView },
+        hash: to.hash,
+        replace: true,
+      })
+      return
+    }
+  }
+
+  if (isAdminConsoleSpa() && to.path.startsWith('/mod/xcagi-planner-bridge/')) {
+    const hostPath = to.path.slice('/mod/xcagi-planner-bridge'.length) || '/'
+    next({ path: hostPath, query: to.query, hash: to.hash, replace: true })
+    return
+  }
+
+  if (isAdminConsoleSpa() && to.name && ADMIN_OPERATOR_BLOCKED_ROUTE_NAMES.has(String(to.name))) {
+    next({ name: ADMIN_OPERATOR_HOME_ROUTE, replace: true })
+    return
+  }
+
+  // 独立管理端对所有非公开页面先做管理员会话校验。失败时必须闭锁到登录页，
+  // 不能继续渲染企业端对话页；登录后回到 `/` 时直接进入运维总览。
+  if (isAdminConsoleSpa() && !to.meta?.publicAccess) {
+    try {
+      const { useAccountProfileStore } = await import('@/stores/accountProfile')
+      const profile = useAccountProfileStore()
+      if (!profile.loaded) await profile.refreshFromServer()
+      else if (profile.sessionCheckUnavailable) refreshSignedInProfile(profile)
+      if (profile.sessionCheckUnavailable && !profile.loaded) { unavailable(); return }
+      if (!profile.isAdminAccount) {
+        next({
+          name: 'login',
+          query: {
+            redirect: to.path === '/' ? '/xcmax-admin' : to.fullPath,
+            error: '需要管理员账号登录后访问',
+          },
+          replace: true,
+        })
+        return
+      }
+      if (to.name === 'chat' && to.path === '/' && (_from === START_LOCATION || _from.name === 'login')) {
+        next({ name: ADMIN_OPERATOR_HOME_ROUTE, replace: true })
+        return
+      }
+    } catch {
+      unavailable()
+      return
+    }
+  }
+
+  if (!isAdminConsoleSpa() && !to.meta?.publicAccess) {
+    const { useAccountProfileStore } = await import('@/stores/accountProfile')
+    const profile = useAccountProfileStore()
+    // Settings is safe during the desktop session hint's background refresh.
+    const identityMissing = !profile.loaded || profile.workspaceReady === false
+    if (profile.loaded && profile.sessionCheckUnavailable && !identityMissing) {
+      refreshSignedInProfile(profile)
+      if (!profile.loaded) {
+        next({ name: 'login', query: { redirect: to.fullPath !== '/login' ? to.fullPath : '/' } })
+        return
+      }
+    }
+    if ((identityMissing || profile.sessionCheckUnavailable) && !(profile.loaded && profile.sessionCheckUnavailable && !identityMissing) && !(isDesktopShell() && to.name === 'settings')) {
+      const sku = await fetchProductSku().catch(() => null)
+      if (profile.sessionCheckUnavailable || sku === null || isEnterpriseEdition(sku)) {
+        try { await profile.refreshFromServer() } catch { unavailable(); return }
+        if (profile.sessionCheckUnavailable) { unavailable(); return }
+        // Hydration can still be false while /api/auth/me is 200. That is not logout.
+        if (!profile.loaded) {
+          next({ name: 'login', query: { redirect: to.fullPath }, replace: true })
+          return
+        }
+      }
+    }
+    if (to.name && UNSCOPED_HOST_BUSINESS_KEYS.has(String(to.name)) && profile.loaded && profile.tenantId != null) {
+      const modPage = tenantScopedBusinessPath(String(to.name))
+      if (modPage && router.resolve(modPage).matched.length === 0) {
+        const { ensureGlobModRoutes } = await import('@/router/registerModRoutes')
+        if (typeof ensureGlobModRoutes === 'function') {
+          await ensureGlobModRoutes(router).catch(() => undefined)
+        }
+      }
+      if (modPage && router.resolve(modPage).matched.length > 0 && to.path !== modPage) {
+        next({ path: modPage, query: to.query, hash: to.hash, replace: true })
+        return
+      }
+      next({ name: 'settings', replace: true })
+      return
+    }
+    const member = profile.loaded && String(profile.userRole || '').startsWith('tenant:')
+    const allowed = to.name === 'settings'
+      || (to.name === 'business-docking' && profile.permissions?.includes('etl.read'))
+      || (to.name === 'tenant-roles' && profile.permissions?.includes('tenant.manage_roles'))
+    if (member && !allowed) {
+      next({ name: 'settings', replace: true })
+      return
+    }
+  }
+
+  if (!isAdminConsoleSpa() && (to.name === 'workflow-visualization' || to.name === 'mod-workflow-visualization')) {
+    try {
+      const { useAccountProfileStore } = await import('@/stores/accountProfile')
+      const profileStore = useAccountProfileStore()
+      if (!profileStore.loaded) await profileStore.refreshFromServer()
+      const modsStore = useModsStore()
+      const menuProfile = buildRoleMenuProfile(
+        {
+          accountKind: profileStore.accountKind,
+          marketIsAdmin: profileStore.marketIsAdmin,
+          marketIsEnterprise: profileStore.marketIsEnterprise,
+          isAdminAccount: profileStore.isAdminAccount,
+        },
+        isClientErpSidebarContext(
+          (modsStore.mods || []).map((m) => String(m.id || '').trim()),
+          modsStore.activeModId,
+        ),
+      )
+      if (!canShowCoreMenuKey(menuProfile, 'workflow-visualization')) {
+        next({ name: 'workflow-employee-space', replace: true })
+        return
+      }
+    } catch {
+      next({ name: 'workflow-employee-space', replace: true })
+      return
+    }
+  }
+
+  if (to.matched.length === 0 && to.path.startsWith('/mod/')) {
+    const csHost = customerServiceHostPathFromModPath(to.path)
+    if (csHost) {
+      next({ path: csHost, query: to.query, hash: to.hash, replace: true })
+      return
+    }
+    if (to.path.startsWith('/mod/xcagi-planner-bridge/') && isProtectedClientModId(readActiveExtensionModId())) {
+      next({ path: '/', query: to.query, hash: to.hash, replace: true })
+      return
+    }
+    // Mod routes register after the first navigation. A cold load of a real
+    // business URL must wait for that registration instead of being sent home.
+    const { ensureGlobModRoutes } = await import('@/router/registerModRoutes')
+    if (typeof ensureGlobModRoutes === 'function') {
+      await ensureGlobModRoutes(router).catch(() => undefined)
+    }
+    if (router.resolve(to.fullPath).matched.length > 0) {
+      next({ path: to.path, query: to.query, hash: to.hash, replace: true })
+      return
+    }
+    next({ path: '/', replace: true })
+    return
+  }
+
+  if (to.path.startsWith('/mod/xcagi-planner-bridge/') && isProtectedClientModId(readActiveExtensionModId())) {
+    next({ path: '/', query: to.query, hash: to.hash, replace: true })
+    return
+  }
+
+  // 局域网授权守卫仅作用于主机管理员控制台（避免影响其他业务页面）
+  // 独立 admin-console SPA 已由账号会话鉴权，不再弹出局域网密钥框
+  const requiresLanGate = !isAdminConsoleSpa() && to.matched.some((r) => Boolean(r.meta?.hostAdmin))
+  if (requiresLanGate && !to.meta.publicAccess) {
+    try {
+      const lan = useLanGate()
+      const status = await lan.refresh()
+      if (status?.enabled && !status.authorized) {
+        lan.openLanGateModal(to.fullPath)
+        next(false)
+        return
+      }
+    } catch {
+      /* 状态接口异常时不阻断；后端 401 会兜底拦截 */
+    }
+  }
+
+  try {
+    const modsStore = useModsStore()
+    if (modsStore.clientModsUiOff && to.matched.some((r) => Boolean(r.meta?.mod))) {
+      next(resolvePlannerChatHomePath())
+      return
+    }
+  } catch {
+    /* Pinia 未就绪时忽略 */
+  }
+
+  if (to.path === '/' || to.name === 'chat') {
+    const modChat = resolvePlannerPagePath('/')
+    const modChatPath = modChat.split('?')[0] || modChat
+    if (modChat !== '/' && to.path !== modChatPath) {
+      if (router.resolve(modChatPath).matched.length === 0) {
+        next()
+        return
+      }
+      next({ path: modChat, query: to.query, hash: to.hash })
+      return
+    }
+  }
+
+  // SSOT：桌面壳禁止 admin（须早于 requiresAdminAccount / 管理端客服侧，避免企业构建内 /admin/entitlements 可达）
+  if (!to.meta?.publicAccess && isDesktopShell() && !isAdminConsoleSpa()) {
+    try {
+      const { useAccountProfileStore } = await import('@/stores/accountProfile')
+      const profile = useAccountProfileStore()
+      const useSessionHint = !profile.loaded && (hasRecentEnterpriseSessionHint() || (await consumeDesktopSessionBootstrapHint()))
+      if (useSessionHint) {
+        provisionalDesktopEntry = true
+        refreshDesktopSessionInBackground(router, profile, to.fullPath !== '/login' ? to.fullPath : '/')
+      } else if (!profile.loaded) {
+        await profile.refreshFromServer()
+      } else if (profile.sessionCheckUnavailable) {
+        refreshSignedInProfile(profile)
+      }
+      if (profile.sessionCheckUnavailable && !profile.loaded) { unavailable(); return }
+      if (!provisionalDesktopEntry && profile.isAdminAccount && to.name !== 'login') {
+        try {
+          const { authApi } = await import('@/api/auth')
+          await authApi.logout().catch(() => undefined)
+        } catch {
+          /* ignore */
+        }
+        next({
+          name: 'login',
+          query: {
+            redirect: '/',
+            error: DESKTOP_ADMIN_FORBIDDEN_MESSAGE,
+          },
+        })
+        return
+      }
+    } catch {
+      unavailable()
+      return
+    }
+  }
+
+  if (to.meta?.requiresAdminAccount && !isAdminConsoleSpa()) {
+    try {
+      const { useAccountProfileStore } = await import('@/stores/accountProfile')
+      const profile = useAccountProfileStore()
+      if (!profile.loaded) await profile.refreshFromServer()
+      else if (profile.sessionCheckUnavailable) refreshSignedInProfile(profile)
+      if (profile.sessionCheckUnavailable && !profile.loaded) { unavailable(); return }
+      if (!profile.isAdminAccount) {
+        next({ name: 'chat' })
+        return
+      }
+    } catch {
+      next({ name: 'chat' })
+      return
+    }
+  }
+
+  if (!to.meta?.publicAccess) {
+    try {
+      const sku = await fetchProductSku()
+      if (isEnterpriseEdition(sku)) {
+        const useSessionHint = isDesktopShell() && provisionalDesktopEntry
+        if (useSessionHint) {
+          provisionalDesktopEntry = true
+        }
+        const { useAccountProfileStore } = await import('@/stores/accountProfile')
+        const profile = useAccountProfileStore()
+        const valid = useSessionHint || (profile.workspaceReady && profile.workspaceHydrationReady)
+          ? true
+          : await validateEnterpriseSessionCached()
+        if (!valid) {
+          next({
+            name: 'login',
+            query: { redirect: to.fullPath !== '/login' ? to.fullPath : '/' },
+          })
+          return
+        }
+        try {
+          if (provisionalDesktopEntry && !profile.loaded) {
+            refreshDesktopSessionInBackground(router, profile, to.fullPath !== '/login' ? to.fullPath : '/')
+          } else if (!profile.loaded) {
+            await profile.refreshFromServer()
+          } else if (profile.sessionCheckUnavailable) {
+            refreshSignedInProfile(profile)
+          }
+          if (profile.sessionCheckUnavailable && !profile.loaded) { unavailable(); return }
+          if (!provisionalDesktopEntry && !isAdminConsoleSpa() && profile.isAdminAccount && to.name !== 'login') {
+            // 非桌面：网页企业壳把 admin 会话导向独立管理端；桌面已在上方拒入
+            if (isDesktopShell()) {
+              try {
+                const { authApi } = await import('@/api/auth')
+                await authApi.logout().catch(() => undefined)
+              } catch {
+                /* ignore */
+              }
+              next({
+                name: 'login',
+                query: {
+                  redirect: '/',
+                  error: DESKTOP_ADMIN_FORBIDDEN_MESSAGE,
+                },
+              })
+              return
+            }
+            const adminHome = resolveAdminConsoleHomeUrl()
+            if (!adminHome) {
+              next({
+                name: 'login',
+                query: {
+                  redirect: '/',
+                  error: DESKTOP_ADMIN_FORBIDDEN_MESSAGE,
+                },
+              })
+              return
+            }
+            window.location.href = adminHome
+            next(false)
+            return
+          }
+        } catch {
+          unavailable()
+          return
+        }
+      }
+    } catch {
+      unavailable()
+      return
+    }
+  }
+
+  // Do not turn an existing desktop user into a first-run user while the
+  // background validation and tenant preference hydration are still running.
+  if (provisionalDesktopEntry) {
+    next()
+    return
+  }
+
+  if (shouldRouteToProductOnboarding(to.name) && !to.meta?.publicAccess && !isAdminConsoleSpa()) {
+    const sku = await fetchProductSku().catch(() => 'generic')
+    if (!isEnterpriseEdition(sku)) {
+      const { resolveProductFlowEntryStep } = await import('@/constants/productFlow')
+      const step = resolveProductFlowEntryStep(to.query?.step)
+      next({ name: 'product-onboarding', query: { step, redirect: to.fullPath } })
+      return
+    }
+  }
+
+  if (shouldRouteToHostPackOnboarding(to.name) && !to.meta?.publicAccess && !isAdminConsoleSpa()) {
+    const current = router.currentRoute.value
+    const alreadyInWorkspace = shouldRouteToHostPackOnboarding(current.name) && !current.meta?.publicAccess
+    const onboardingTarget = (step: string) => ({
+      name: 'product-onboarding' as const,
+      query: {
+        step,
+        redirect: to.fullPath !== '/onboarding' ? to.fullPath : '/',
+      },
+    })
+    if (alreadyInWorkspace) {
+      // 已经在工作台里切页时，补基础线检查在后台做，不挡住侧栏。
+      void resolveHostPackOnboardingStep(false).then((step) => {
+        if (!step || generation !== getSidebarNavigationGeneration()) return
+        void router.replace(onboardingTarget(step))
+      }).catch(() => undefined)
+    } else {
+      if (generation !== getSidebarNavigationGeneration()) {
+        next(false)
+        return
+      }
+      try {
+        const onboardingStep = await resolveHostPackOnboardingStep(false)
+        if (onboardingStep) {
+          next(onboardingTarget(onboardingStep))
+          return
+        }
+      } catch {
+        /* API 异常时不阻断主流程 */
+      }
+    }
+  }
+
+  next()
+})
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('xcagi:enterprise-session-invalid', () => {
+    const current = router.currentRoute.value
+    if (current.meta?.publicAccess || current.name === 'login') return
+    void router.replace({ name: 'login', query: { redirect: current.fullPath && current.fullPath !== '/login' ? current.fullPath : '/' } })
+  })
+}
+
+router.afterEach((to, _from, failure) => {
+  const nextTitle = committedRouteTitle(to, failure, router.currentRoute.value.fullPath)
+  if (nextTitle) document.title = nextTitle
+})
+
+// 管理端：懒加载页面文件失败时（断网 / 刚发版旧分包已下线）给出可见提示和刷新入口，
+// 不再停在原页面无反馈。只影响展示，不改守卫与权限。
+router.onError((error, to) => {
+  if (isChunkLoadError(error)) markRouteChunkError(to?.fullPath)
+})
+// 加载失败只走 onError、不会触发 afterEach；之后任何一次导航（含点当前页）都收起提示
+router.afterEach(() => {
+  clearRouteChunkError()
+})
+
+export default router

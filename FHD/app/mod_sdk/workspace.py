@@ -1,0 +1,19 @@
+"""工作区相对路径安全解析（SDK re-export）。
+
+``resolve_safe_workspace_relpath(rel)`` 防止 Mod 误用 ``../`` 越狱到工作区外；
+始终返回一个解析到工作区根下的绝对 ``Path``，遇到越界会抛 ``ValueError``。
+"""
+
+from __future__ import annotations
+
+from app.infrastructure.workspace import (
+    allocate_generated_workspace_file,
+    resolve_existing_workspace_file,
+    resolve_safe_workspace_relpath,
+)
+
+__all__ = [
+    "allocate_generated_workspace_file",
+    "resolve_existing_workspace_file",
+    "resolve_safe_workspace_relpath",
+]

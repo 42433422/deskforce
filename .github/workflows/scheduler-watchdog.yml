@@ -1,0 +1,233 @@
+name: Scheduler Watchdog
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '只探测，不重启服务'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: scheduler-watchdog
+  cancel-in-progress: false
+
+permissions:
+  issues: write
+  contents: read
+
+env:
+  HEALTH_URL: http://127.0.0.1:9990/api/xcmax/scheduler/health
+  SERVICE_NAME: modstore-scheduler
+  CURL_TIMEOUT: 20
+
+jobs:
+  probe-and-restart:
+    name: Probe scheduler health, restart if stuck
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require CVM SSH secrets
+        env:
+          FHD_PUSH_HOST: ${{ secrets.FHD_PUSH_HOST }}
+          FHD_PUSH_SSH_KEY: ${{ secrets.FHD_PUSH_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${FHD_PUSH_HOST:-}" ] || [ -z "${FHD_PUSH_SSH_KEY:-}" ]; then
+            echo "::error::FHD_PUSH_HOST and FHD_PUSH_SSH_KEY are required for scheduler-watchdog."
+            echo "::error::Configure repo Secrets (default host 119.27.178.147)."
+            exit 1
+          fi
+
+      - name: SSH probe + restart on failure
+        id: probe
+        env:
+          FHD_PUSH_HOST: ${{ secrets.FHD_PUSH_HOST }}
+          FHD_PUSH_USER: ${{ secrets.FHD_PUSH_USER }}
+          FHD_PUSH_SSH_KEY_RAW: ${{ secrets.FHD_PUSH_SSH_KEY }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          HEALTH_URL: ${{ env.HEALTH_URL }}
+          SERVICE_NAME: ${{ env.SERVICE_NAME }}
+          CURL_TIMEOUT: ${{ env.CURL_TIMEOUT }}
+        run: |
+          set -uo pipefail
+          HOST="${FHD_PUSH_HOST:-119.27.178.147}"
+          USER="${FHD_PUSH_USER:-root}"
+          KEY_FILE="${RUNNER_TEMP}/scheduler_watchdog_key"
+          printf '%s\n' "$FHD_PUSH_SSH_KEY_RAW" > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+          trap 'rm -f "$KEY_FILE"' EXIT
+
+          REMOTE_CMD=$(cat <<'EOF'
+          set -uo pipefail
+          URL="${HEALTH_URL:-http://127.0.0.1:9990/api/xcmax/scheduler/health}"
+          SVC="${SERVICE_NAME:-modstore-scheduler}"
+          TIMEOUT="${CURL_TIMEOUT:-20}"
+          DRY="${DRY_RUN:-false}"
+
+          probe() {
+            resp="$(curl -sS --max-time "$TIMEOUT" -w '\n__HTTP_CODE__%{http_code}' "$URL" 2>/dev/null || true)"
+            code="$(printf '%s' "$resp" | sed -n 's/.*__HTTP_CODE__//p' | tail -n1)"
+            body="$(printf '%s' "$resp" | sed 's/__HTTP_CODE__[0-9]*$//')"
+            reason="http=${code:-unknown}"
+            [ "$code" = "200" ] || return 1
+            reason="$(printf '%s' "$body" | python3 -c '
+          import json, sys
+          payload = json.load(sys.stdin)
+          data = payload.get("data") or {}
+          pending = data.get("pending_job_count")
+          checks = {
+              "ok": payload.get("ok") is True,
+              **{key: data.get(key) is True for key in (
+                  "scheduler_running", "registration_complete", "runtime_healthy")},
+              "pending_jobs": type(pending) is int and pending >= 1,
+              "required_jobs": data.get("missing_required_jobs") == [],
+              "runtime_jobs": data.get("unhealthy_runtime_jobs") == [],
+              "runtime_recovered": data.get("recovering_runtime_jobs") == [],
+          }
+          safe_chars = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_:.-+")
+          def safe(value, limit=160):
+              text = str(value or "")
+              if not text or len(text) > limit or any(char not in safe_chars for char in text):
+                  return ""
+              return text
+          rows = {}
+          for item in data.get("runtime_jobs") or []:
+              if isinstance(item, dict):
+                  job_key = safe(item.get("job_id"))
+                  if job_key:
+                      rows[job_key] = item
+          bits = []
+          recovering = data.get("recovering_runtime_jobs")
+          affected = list(data.get("unhealthy_runtime_jobs") or [])
+          for job_id in affected + (recovering if isinstance(recovering, list) else []):
+              job_key = safe(job_id)
+              if not job_key:
+                  continue
+              row = rows.get(job_key) or {}
+              bits.append(":".join((
+                  job_key,
+                  safe(row.get("state") or "unhealthy") or "unhealthy",
+                  safe(row.get("last_status") or ""),
+                  safe(row.get("last_error_code") or ""),
+                  "last_run_at=" + safe(row.get("last_run_at") or ""),
+                  "last_success_at=" + safe(row.get("last_success_at") or ""),
+              )))
+          detail = (" jobs=" + ",".join(bits)) if bits else ""
+          waiting = isinstance(recovering, list) and bool(recovering) and all(
+              isinstance(job, str) and bool(job) for job in recovering
+          ) and all(value for key, value in checks.items() if key != "runtime_recovered")
+          label = "healthy" if all(checks.values()) else "recovering" if waiting else "unhealthy"
+          print(label, " ".join(f"{key}={value}" for key, value in checks.items()) + detail)
+          ' 2>/dev/null)" || reason="invalid_health_response"
+            [ "${reason%% *}" = "healthy" ] || [ "${reason%% *}" = "recovering" ]
+          }
+
+          echo "::restart_triggered::false"
+          if probe; then
+            echo "::health::${reason%% *}"
+            echo "::reason::$reason"
+            exit 0
+          fi
+          initial_reason="$reason"
+          echo "::health::unhealthy"
+          echo "::reason::$reason"
+          if [ "$DRY" = "true" ]; then
+            echo "[dry-run] would restart $SVC; no action taken"
+            exit 0
+          fi
+          if ! systemctl restart "$SVC"; then
+            echo "::reason::restart_failed; $reason"
+            exit 1
+          fi
+          echo "::restart_triggered::true"
+          for _attempt in $(seq 1 24); do
+            sleep 5
+            if probe; then
+              echo "::health::${reason%% *}"
+              echo "::reason::post_restart $reason; initial_probe=$initial_reason; awaiting next independent probe"
+              exit 0
+            fi
+          done
+          echo "::reason::still_unhealthy_after_restart; $reason; initial_probe=$initial_reason"
+          EOF
+          )
+
+          # 通过 SSH 在 CVM 上执行；环境变量通过 ssh 命令前置 export 传入
+          # 注意：不用 ssh -tt（不需要 TTY），让远端 stdout 直接喂给本步的 stdout
+          ssh_status=0
+          ssh_output="$(ssh -i "$KEY_FILE" \
+            -o StrictHostKeyChecking=accept-new \
+            -o ConnectTimeout=30 \
+            "${USER}@${HOST}" \
+            "HEALTH_URL='$HEALTH_URL' SERVICE_NAME='$SERVICE_NAME' CURL_TIMEOUT='$CURL_TIMEOUT' DRY_RUN='$DRY_RUN' bash -s" <<< "$REMOTE_CMD" 2>&1)" || ssh_status=$?
+
+          echo "$ssh_output"
+
+          # 解析远端输出的 ::marker:: 行，写入 $GITHUB_OUTPUT
+          restart_triggered="$(printf '%s\n' "$ssh_output" | sed -n 's/^::restart_triggered:://p' | tail -n1)"
+          reason="$(printf '%s\n' "$ssh_output" | sed -n 's/^::reason:://p' | tail -n1)"
+          health="$(printf '%s\n' "$ssh_output" | sed -n 's/^::health:://p' | tail -n1)"
+          [ -n "$restart_triggered" ] || restart_triggered="unknown"
+          [ -n "$health" ] || health="unknown"
+          if [ "$ssh_status" -ne 0 ]; then
+            health="unknown"
+            reason="ssh_or_remote_failed=$ssh_status; $reason"
+          fi
+          [ -n "$reason" ] || reason="unknown (marker not found in ssh output)"
+
+          {
+            echo "health=$health"
+            echo "restart_triggered=${restart_triggered}"
+            echo "reason<<EOF"
+            printf '%s\n' "$reason"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "final: health=$health restart_triggered=$restart_triggered reason=$reason"
+
+      - name: Open or update incident issue
+        if: inputs.dry_run != true && steps.probe.outputs.health != '' && (steps.probe.outputs.health != 'healthy' || steps.probe.outputs.restart_triggered == 'true')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REASON: ${{ steps.probe.outputs.reason }}
+          HEALTH: ${{ steps.probe.outputs.health }}
+          RESTARTED: ${{ steps.probe.outputs.restart_triggered }}
+          SERVICE_NAME: ${{ env.SERVICE_NAME }}
+        run: |
+          set -uo pipefail
+          gh label create scheduler-watchdog --description "调度器健康检查与处置事故" --color B60205 --force || true
+          BODY="$(printf '调度器探测/处置回执；重启后的健康结果需下轮独立探测确认。\n\n- **健康状态**: %s\n- **重启命令成功**: %s\n- **服务**: %s\n- **原因**: %s\n- **健康端点**: %s\n- **运行**: %s/%s/actions/runs/%s\n\n处置手册: 见 docs/runbooks/release-checklist.md 调度器章节' \
+            "$HEALTH" "$RESTARTED" "$SERVICE_NAME" "$REASON" "${HEALTH_URL}" "$GITHUB_SERVER_URL" "$GH_REPO" "$GITHUB_RUN_ID")"
+          EXISTING="$(gh issue list --label scheduler-watchdog --state open --json number --jq '.[0].number // ""')"
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "$BODY"
+          else
+            gh issue create \
+              --title "🔴 modstore-scheduler 健康异常待复核" \
+              --label scheduler-watchdog \
+              --body "$BODY"
+          fi
+
+      - name: Close incident on recovery
+        if: inputs.dry_run != true && steps.probe.outputs.health == 'healthy' && steps.probe.outputs.restart_triggered == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          EXISTING="$(gh issue list --label scheduler-watchdog --state open --json number --jq '.[0].number // ""')"
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "✅ 调度器独立健康检查通过 ($(date -u '+%Y-%m-%d %H:%M UTC'))，自动关闭。"
+            gh issue close "$EXISTING"
+          fi
+
+      - name: Fail when health is unverified
+        if: always() && steps.probe.outputs.health != 'healthy'
+        run: |
+          echo "::error::Scheduler health is unhealthy or unknown; incident remains open."
+          exit 1

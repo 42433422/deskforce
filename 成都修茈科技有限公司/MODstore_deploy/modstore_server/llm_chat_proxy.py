@@ -1,0 +1,474 @@
+# mypy: disable-error-code="arg-type"
+"""统一聊天代理：OpenAI 兼容 / Anthropic / Google Gemini。"""
+
+from __future__ import annotations
+
+import os
+from typing import Any, AsyncIterator, Dict, List, Optional
+from urllib.parse import urlsplit
+
+import httpx
+
+from modstore_server.llm_chat_providers import _oai_to_anthropic as _oai_to_anthropic
+from modstore_server.llm_chat_providers import _oai_to_gemini as _oai_to_gemini
+from modstore_server.llm_chat_providers import chat_anthropic as chat_anthropic
+from modstore_server.llm_chat_providers import (
+    chat_anthropic_compatible as chat_anthropic_compatible,
+)
+from modstore_server.llm_chat_providers import chat_google as chat_google
+from modstore_server.llm_chat_providers import chat_openai_compatible as chat_openai_compatible
+from modstore_server.llm_chat_providers import stream_openai_compatible as stream_openai_compatible
+from modstore_server.llm_key_resolver import (
+    OAI_COMPAT_OPENAI_STYLE_PROVIDERS,
+    is_minimax_token_plan_key,
+    minimax_anthropic_base_url,
+    normalize_minimax_api_key,
+    openai_compat_default_root,
+)
+from modstore_server.llm_media_proxy import _first_video_url as _first_video_url
+from modstore_server.llm_media_proxy import image_dispatch as image_dispatch
+from modstore_server.llm_media_proxy import image_openai_compatible as image_openai_compatible
+from modstore_server.llm_media_proxy import video_dispatch as video_dispatch
+from modstore_server.llm_media_proxy import video_openai_compatible as video_openai_compatible
+from modstore_server.multimodal_llm import messages_use_openai_multipart_content
+from modstore_server.operational_errors import BOUNDARY_ERRORS, RECOVERABLE_ERRORS
+from modstore_server.platform_model_config import PlatformApiKey
+
+_MODEL_ALIASES: dict[tuple[str, str], str] = {
+    # 官方 V2.5 于 2026-10-21 下线；保留原账号凭证和私有兼容端点。
+    ("xiaomi", "mimo-v2.5-pro"): "mimo-v2.6-pro",
+    ("xiaomi", "mimo-v2.5"): "mimo-v2.6-flash",
+    ("xiaomi", "mimo-v2-base"): "mimo-v2.6-pro",
+    ("xiaomi", "MiMo-7B-RL-Think"): "mimo-v2.6-pro",
+    ("xiaomi", "mimo-v2-flash"): "mimo-v2.6-pro",
+    ("xiaomi", "mimo-v2-pro"): "mimo-v2.6-pro",
+    ("xiaomi", "mimo-v2-omni"): "mimo-v2.6-flash",
+    ("xiaomi", "mimo-v2-tts"): "mimo-v2.5-tts",
+    ("minimax", "abab6.5s-chat"): "MiniMax-M2.7",
+}
+
+# 禁止使用进程级单例 AsyncClient：会在 ``asyncio.run()`` / 线程池等多事件循环场景下
+# 绑定已关闭的 loop，触发 ``RuntimeError: Event loop is closed``（httpx aclose）。
+_LLM_LIMITS = httpx.Limits(max_connections=1000, max_keepalive_connections=200)
+
+
+def _timeout_seconds(name: str, default: float) -> float:
+    try:
+        return max(5.0, float(os.environ.get(name, default)))
+    except ValueError:
+        return default
+
+
+_LLM_TIMEOUT = httpx.Timeout(
+    connect=15.0,
+    read=_timeout_seconds("MODSTORE_LLM_READ_TIMEOUT", 60.0),
+    write=60.0,
+    pool=30.0,
+)
+_STREAM_LIMITS = httpx.Limits(max_connections=1000, max_keepalive_connections=200)
+_STREAM_TIMEOUT = httpx.Timeout(
+    connect=15.0,
+    read=_timeout_seconds("MODSTORE_LLM_STREAM_READ_TIMEOUT", 180.0),
+    write=60.0,
+    pool=30.0,
+)
+# 同一条上游流还没吐出下一块时，按这个间隔回「仍在处理」，不另开调用。
+_STATUS_INTERVAL_S = 15.0
+
+
+def _primary_max_attempts() -> int:
+    try:
+        n = int(os.environ.get("MODSTORE_LLM_PRIMARY_MAX_ATTEMPTS", "2"))
+    except ValueError:
+        n = 2
+    return max(1, min(n, 5))
+
+
+def _normalize_openai_base(
+    provider: str, base_url: Optional[str], api_key: Optional[str] = None
+) -> str:
+    if isinstance(api_key, PlatformApiKey) and api_key.configuration["provider"] != provider:
+        raise ValueError("平台密钥不允许跨供应商使用")
+    if isinstance(api_key, PlatformApiKey) and api_key.managed:
+        return str(api_key.configuration["base_url"])
+    if isinstance(api_key, PlatformApiKey):
+        base_url = api_key.configuration["base_url"]
+    b = (base_url or openai_compat_default_root(provider)).rstrip("/")
+    if not (b.endswith("/v1") or b.endswith("/v2") or b.endswith("/v3") or b.endswith("/v4")):
+        b = b + "/v1"
+    return b
+
+
+def normalize_model(provider: str, model: str, base_url: str | None = None) -> str:
+    if provider == "xiaomi" and base_url:
+        host = (urlsplit(base_url).hostname or "").lower()
+        if host != "xiaomimimo.com" and not host.endswith(".xiaomimimo.com"):
+            return model
+    return _MODEL_ALIASES.get((provider, model), model)
+
+
+def _openai_request_headers(provider: str, api_key: str) -> Dict[str, str]:
+    """MiMo Token Plan 文档推荐 api-key；其余厂商用 Bearer。"""
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
+    if provider == "xiaomi":
+        headers["api-key"] = api_key
+    else:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
+def _openai_chat_body(
+    provider: str,
+    model: str,
+    messages: List[Dict[str, Any]],
+    *,
+    max_tokens: Optional[int] = None,
+    response_format: Optional[Dict[str, str]] = None,
+    stream: bool = False,
+    tools: Optional[List[Dict[str, Any]]] = None,
+    tool_choice: Any = None,
+) -> Dict[str, Any]:
+    body: Dict[str, Any] = {"model": model, "messages": messages}
+    if stream:
+        body["stream"] = True
+        body["stream_options"] = {"include_usage": True}
+    if max_tokens is not None:
+        body["max_tokens"] = max_tokens
+        if provider == "xiaomi":
+            body["max_completion_tokens"] = max_tokens
+            body.setdefault("thinking", {"type": "disabled"})
+    if response_format:
+        body["response_format"] = response_format
+    if tools:
+        body["tools"] = tools
+    if tool_choice is not None:
+        body["tool_choice"] = tool_choice
+    return body
+
+
+def _openai_assistant_message_parts(msg: Dict[str, Any]) -> tuple[str, str]:
+    """Extract visible answer and reasoning trace from an OpenAI-style assistant message.
+
+    Thinking/reasoning models (DeepSeek-R1、MiMo、部分兼容网关) 常在 ``reasoning_content``
+    中返回长链推理，正式回复仍在 ``content``；若 ``max_tokens`` 预算不足，可能出现
+    ``content`` 为空仅保留推理段 —— 下游若只读 ``content`` 会得到「像没有思考」或解析失败。
+    """
+    if not isinstance(msg, dict):
+        return "", ""
+    content = str(msg.get("content") or "").strip()
+    reasoning = str(
+        msg.get("reasoning_content") or msg.get("reasoning") or msg.get("thinking") or ""
+    ).strip()
+    return content, reasoning
+
+
+async def chat_dispatch(
+    provider: str,
+    *,
+    api_key: str,
+    base_url: Optional[str],
+    model: str,
+    messages: List[Dict[str, Any]],
+    max_tokens: Optional[int] = None,
+    forbid_reasoning_fallback: bool = False,
+    response_format: Optional[Dict[str, str]] = None,
+    total_timeout_s: Optional[float] = None,
+    # Timeout fallback: if primary call exceeds this (seconds), retry with fallback_provider/model
+    timeout_fallback_s: Optional[float] = None,
+    fallback_provider: Optional[str] = None,
+    fallback_model: Optional[str] = None,
+    fallback_api_key: Optional[str] = None,
+    fallback_base_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    if isinstance(api_key, PlatformApiKey) and api_key.configuration["provider"] != provider:
+        return {"ok": False, "error": "平台密钥不允许跨供应商使用"}
+    if isinstance(api_key, PlatformApiKey):
+        base_url = api_key.configuration["base_url"]
+    model = normalize_model(provider, model, base_url)
+    has_fallback = bool(timeout_fallback_s and fallback_provider and fallback_model)
+
+    async def _primary() -> Dict[str, Any]:
+        if messages_use_openai_multipart_content(messages):
+            if provider == "minimax" and is_minimax_token_plan_key(api_key):
+                return {
+                    "ok": False,
+                    "error": "MiniMax Token Plan 的 Anthropic 兼容入口当前只接收纯文本消息。",
+                }
+            if provider not in OAI_COMPAT_OPENAI_STYLE_PROVIDERS:
+                return {
+                    "ok": False,
+                    "error": "图文多模态输入仅支持 OpenAI 兼容接口（chat/completions）；"
+                    "请切换供应商或使用纯文本消息。",
+                }
+        if provider == "minimax" and is_minimax_token_plan_key(api_key):
+            return await chat_anthropic_compatible(
+                minimax_anthropic_base_url(
+                    base_url,
+                    prefer_base=isinstance(api_key, PlatformApiKey) and api_key.managed,
+                ),
+                normalize_minimax_api_key(api_key),
+                model,
+                messages,
+                max_tokens=max_tokens or 1024,
+            )
+        if provider in OAI_COMPAT_OPENAI_STYLE_PROVIDERS:
+            b = _normalize_openai_base(provider, base_url, api_key)
+            return await chat_openai_compatible(
+                b,
+                api_key,
+                model,
+                messages,
+                provider=provider,
+                max_tokens=max_tokens,
+                forbid_reasoning_fallback=forbid_reasoning_fallback,
+                response_format=response_format,
+            )
+        if provider == "anthropic":
+            return await chat_anthropic(api_key, model, messages, max_tokens=max_tokens or 1024)
+        if provider == "google":
+            return await chat_google(api_key, model, messages)
+        return {"ok": False, "error": f"unsupported provider: {provider}"}
+
+    async def _primary_with_retries() -> Dict[str, Any]:
+        import asyncio as _asyncio
+
+        last: Dict[str, Any] = {"ok": False, "error": "no primary attempt"}
+        attempts = _primary_max_attempts()
+        for attempt in range(attempts):
+            transient_exc = False
+            try:
+                last = await _primary()
+            except httpx.TransportError as exc:
+                # 对端中断连接 / 读写超时 / 协议错误（RemoteProtocolError 等）等瞬时网络故障：
+                # 当作可重试，转成错误 dict 而非向上抛，避免无 fallback 的调用方（如员工大会）直接判为异常。
+                last = {
+                    "ok": False,
+                    "error": f"模型网络连接失败（{type(exc).__name__}）",
+                }
+                transient_exc = True
+            if last.get("ok"):
+                return last
+            err = str(last.get("error") or "")
+            st = last.get("status")
+            retryable = (
+                transient_exc
+                or st in (429, 500, 502, 503, 504)
+                or any(
+                    x in err.lower()
+                    for x in (
+                        "timeout",
+                        "timed out",
+                        "connection",
+                        "rate limit",
+                        "disconnect",
+                        "protocol",
+                    )
+                )
+            )
+            if attempt < attempts - 1 and retryable:
+                await _asyncio.sleep(0.35 * (2**attempt))
+                continue
+            break
+        return last
+
+    if not has_fallback:
+        if total_timeout_s and total_timeout_s > 0:
+            import asyncio as _asyncio
+
+            try:
+                return await _asyncio.wait_for(
+                    _primary_with_retries(), timeout=float(total_timeout_s)
+                )
+            except _asyncio.TimeoutError:
+                return {
+                    "ok": False,
+                    "status": 504,
+                    "error": f"上游调用超过总预算 {float(total_timeout_s):.1f}s，已中止",
+                }
+        return await _primary_with_retries()
+
+    import asyncio as _asyncio
+
+    try:
+        result = await _asyncio.wait_for(_primary_with_retries(), timeout=float(timeout_fallback_s))
+        if result.get("ok"):
+            return result
+        # provider returned error — fall through to fallback
+        primary_error = result.get("error") or "primary returned error"
+    except RECOVERABLE_ERRORS as exc:
+        primary_error = f"模型请求失败（{type(exc).__name__}）"
+
+    # ---- fallback
+    fb_provider = str(fallback_provider)
+    fb_key = fallback_api_key or api_key
+    if isinstance(fb_key, PlatformApiKey) and fb_key.configuration["provider"] != fb_provider:
+        return {"ok": False, "error": "备用供应商必须配置其独立的平台密钥"}
+    fb_base = (
+        fb_key.configuration["base_url"]
+        if isinstance(fb_key, PlatformApiKey)
+        else fallback_base_url or base_url
+    )
+    fb_model = normalize_model(fb_provider, str(fallback_model), fb_base)
+    try:
+        if fb_provider == "minimax" and is_minimax_token_plan_key(fb_key):
+            fb_result = await chat_anthropic_compatible(
+                minimax_anthropic_base_url(
+                    fb_base,
+                    prefer_base=isinstance(fb_key, PlatformApiKey) and fb_key.managed,
+                ),
+                normalize_minimax_api_key(fb_key),
+                fb_model,
+                messages,
+                max_tokens=max_tokens or 1024,
+            )
+        elif fb_provider in OAI_COMPAT_OPENAI_STYLE_PROVIDERS:
+            fb_b = _normalize_openai_base(fb_provider, fb_base, fb_key)
+            fb_result = await chat_openai_compatible(
+                fb_b,
+                fb_key,
+                fb_model,
+                messages,
+                provider=fb_provider,
+                max_tokens=max_tokens,
+                forbid_reasoning_fallback=forbid_reasoning_fallback,
+                response_format=response_format,
+            )
+        elif fb_provider == "anthropic":
+            fb_result = await chat_anthropic(
+                fb_key, fb_model, messages, max_tokens=max_tokens or 1024
+            )
+        elif fb_provider == "google":
+            fb_result = await chat_google(fb_key, fb_model, messages)
+        else:
+            fb_result = {
+                "ok": False,
+                "error": f"unsupported fallback provider: {fb_provider}",
+            }
+    except BOUNDARY_ERRORS as exc2:  # noqa: BLE001
+        fb_result = {"ok": False, "error": f"备用模型请求失败（{type(exc2).__name__}）"}
+
+    if fb_result.get("ok"):
+        fb_result["_fallback_used"] = True
+        fb_result["_primary_error"] = primary_error
+    return fb_result
+
+
+async def _with_processing_status(
+    source: AsyncIterator[Dict[str, Any]], interval: float = _STATUS_INTERVAL_S
+) -> AsyncIterator[Dict[str, Any]]:
+    """同一迭代器还在等下一块时回报处理中，不取消这条调用。"""
+    import asyncio
+
+    agen = source.__aiter__()
+    pending: asyncio.Task | None = None
+    try:
+        pending = asyncio.create_task(agen.__anext__())
+        while True:
+            done, _pending = await asyncio.wait({pending}, timeout=interval)
+            if pending not in done:
+                yield {"type": "status", "state": "processing"}
+                continue
+            try:
+                item = pending.result()
+            except StopAsyncIteration:
+                return
+            yield item
+            pending = asyncio.create_task(agen.__anext__())
+    finally:
+        if pending is not None and not pending.done():
+            pending.cancel()
+        closer = getattr(agen, "aclose", None)
+        if closer is not None:
+            await closer()
+
+
+async def _events_from_completion(result: Dict[str, Any]) -> AsyncIterator[Dict[str, Any]]:
+    if not result.get("ok"):
+        yield {
+            "type": "error",
+            "error": result.get("error") or "upstream error",
+            "status": result.get("status"),
+        }
+        return
+    content = str(result.get("content") or "")
+    if content:
+        yield {"type": "delta", "delta": content}
+    if result.get("usage"):
+        yield {"type": "usage", "usage": result.get("usage") or {}}
+
+
+async def chat_dispatch_stream(
+    provider: str,
+    *,
+    api_key: str,
+    base_url: Optional[str],
+    model: str,
+    messages: List[Dict[str, Any]],
+    max_tokens: Optional[int] = None,
+    tools: Optional[List[Dict[str, Any]]] = None,
+    tool_choice: Any = None,
+) -> AsyncIterator[Dict[str, Any]]:
+    if isinstance(api_key, PlatformApiKey) and api_key.configuration["provider"] != provider:
+        yield {"type": "error", "error": "平台密钥不允许跨供应商使用"}
+        return
+    if isinstance(api_key, PlatformApiKey):
+        base_url = api_key.configuration["base_url"]
+    model = normalize_model(provider, model, base_url)
+    if messages_use_openai_multipart_content(messages) and (
+        provider not in OAI_COMPAT_OPENAI_STYLE_PROVIDERS
+        or (provider == "minimax" and is_minimax_token_plan_key(api_key))
+    ):
+        yield {
+            "type": "error",
+            "error": "图文多模态输入仅支持 OpenAI 兼容接口；请切换供应商或使用纯文本。",
+        }
+        return
+    if provider == "minimax" and is_minimax_token_plan_key(api_key):
+
+        async def _minimax():
+            result = await chat_dispatch(
+                provider,
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+            )
+            async for ev in _events_from_completion(result):
+                yield ev
+
+        async for ev in _with_processing_status(_minimax()):
+            yield ev
+        return
+    if provider in OAI_COMPAT_OPENAI_STYLE_PROVIDERS:
+        b = _normalize_openai_base(provider, base_url, api_key)
+        async for ev in _with_processing_status(
+            stream_openai_compatible(
+                b,
+                api_key,
+                model,
+                messages,
+                provider=provider,
+                max_tokens=max_tokens,
+                tools=tools,
+                tool_choice=tool_choice,
+            )
+        ):
+            yield ev
+        return
+
+    async def _once():
+        result = await chat_dispatch(
+            provider,
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            messages=messages,
+            max_tokens=max_tokens,
+        )
+        async for ev in _events_from_completion(result):
+            yield ev
+
+    # Anthropic / Google 后续可接各自原生 stream；当前保持兼容，回退成一次性结果。
+    async for ev in _with_processing_status(_once()):
+        yield ev

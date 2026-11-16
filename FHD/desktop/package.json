@@ -1,0 +1,58 @@
+{
+  "name": "xcagi-desktop",
+  "version": "1.0.0",
+  "private": true,
+  "author": "XCAGI",
+  "description": "XCAGI desktop shell for Windows and macOS",
+  "main": "dist/main.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "dev": "npm run build && electron .",
+    "build": "node scripts/inject-version.cjs && tsc -p tsconfig.json && cp resources/splash.html dist/splash.html",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "pack": "npm run build && electron-builder --dir --config electron-builder.yml",
+    "dist": "npm run build && electron-builder --config electron-builder.yml",
+    "dist:win": "npm run build && electron-builder --win --config electron-builder.yml",
+    "dist:mac": "npm run build && electron-builder --mac --config electron-builder.yml",
+    "test": "XCAGI_DESKTOP_TEST=1 vitest run",
+    "test:watch": "XCAGI_DESKTOP_TEST=1 vitest",
+    "test:coverage": "XCAGI_DESKTOP_TEST=1 vitest run --coverage",
+    "test:e2e": "npm run build && playwright test",
+    "security:scan": "bash scripts/security-scan.sh",
+    "security:scan:medium": "bash scripts/security-scan.sh --gate-severity medium"
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.11"
+  },
+  "devDependencies": {
+    "@electron/notarize": "3.1.2",
+    "@noble/hashes": "^2.4.0",
+    "@playwright/test": "^1.65.0",
+    "@types/node": "26.6.6",
+    "@vitest/coverage-v8": "^5.1.0",
+    "electron": "45.3.0",
+    "electron-builder": "26.18.0",
+    "typescript": "6.0.3",
+    "vitest": "^5.0.4"
+  },
+  "overrides": {
+    "brace-expansion@^1.0.0": "1.1.21",
+    "brace-expansion@^2.0.0": "2.1.7",
+    "brace-expansion@>=5.0.0": "5.0.12",
+    "builder-util-runtime": "9.7.0",
+    "fast-uri": "3.1.8",
+    "form-data": "4.0.6",
+    "js-yaml": "4.3.2",
+    "nanoid": "3.3.18",
+    "tar": "7.5.21",
+    "postcss": "8.5.25",
+    "tmp": "0.2.7",
+    "undici": "6.29.1",
+    "@xmldom/xmldom": "0.8.15",
+    "source-map-js": "1.2.2",
+    "@noble/hashes@<2": "1.8.0"
+  }
+}

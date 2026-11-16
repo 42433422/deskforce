@@ -1,0 +1,201 @@
+from __future__ import annotations
+
+import os
+import secrets
+
+from starlette.concurrency import run_in_threadpool
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
+
+MUTATING_HTTP_METHODS = frozenset({"POST", "PUT", "DELETE", "PATCH"})
+SAFE_HTTP_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def generate_csrf_token() -> str:
+    """Generate a cryptographically secure double-submit cookie token."""
+    return secrets.token_hex(32)
+
+
+def csrf_tokens_match(header_token: str | None, cookie_token: str | None) -> bool:
+    """Compare CSRF tokens in constant time after normalizing whitespace."""
+    if not header_token or not cookie_token:
+        return False
+    return secrets.compare_digest(str(header_token).strip(), str(cookie_token).strip())
+
+
+# 匿名即可调用的认证入口：无法要求「先 GET 再带 X-CSRF-Token」（首跳即登录页时常见）。
+_CSRF_EXEMPT_PATHS = frozenset(
+    {
+        "/api/auth/login",
+        "/api/auth/register",
+        "/api/auth/login-with-code",
+        "/api/auth/login-with-phone-code",
+        "/api/auth/send-phone-code",
+        "/api/auth/send-code",
+        "/api/auth/send-register-code",
+        "/api/auth/send-reset-password-code",
+        "/api/auth/reset-password",
+        "/api/auth/refresh",
+        # One-use code authenticates the first browser POST, before any cookie exists.
+        "/api/auth/browser-handoff/consume",
+        "/api/auth/verify-admin-digest-code",
+        # 运维密钥接口：无用户 Cookie 场景（脚本 / TestClient），由 X-Modstore-Recharge-Token 单独鉴权
+        "/api/admin/reset-user-password",
+        "/api/csp-report",
+        # 机器对机器同步入口：本地管理端强制推送账号权益到企业端，无浏览器 csrf_token。
+        "/api/xcmax/sync/receive",
+        "/api/agent/butler/corp-chat",
+        "/api/agent/butler/corp-tts",
+        "/api/agent/butler/corp-translate",
+        "/api/agent/butler/corp-intake-fill",
+    }
+)
+
+# 前缀豁免：历史 QQ Bot webhook 已下线；保留空元组以免调用方假设该常量存在。
+_CSRF_EXEMPT_PREFIXES: tuple[str, ...] = ()
+
+
+def _csrf_exempt_path(path: str) -> bool:
+    raw = (path or "").split("?", 1)[0]
+    p = raw.rstrip("/") or "/"
+    if p in {x.rstrip("/") or "/" for x in _CSRF_EXEMPT_PATHS}:
+        return True
+    for prefix in _CSRF_EXEMPT_PREFIXES:
+        if (raw + "").startswith(prefix) and raw.endswith("/webhook"):
+            return True
+    return False
+
+
+def _machine_webhook_path(path: str) -> bool:
+    """Only fixed protocol receivers; their routes must validate signatures/tokens."""
+    path = path.rstrip("/")
+    if path in {
+        "/api/inbound/webhooks/github",
+        "/api/inbound/webhooks/feishu",
+        "/api/inbound/webhooks/dingtalk",
+        "/api/inbound/webhooks/generic",
+    }:
+        return True
+    prefix = "/api/workflow-hooks/webhook/"
+    key = path.removeprefix(prefix)
+    return path.startswith(prefix) and bool(key) and "/" not in key
+
+
+def _csrf_disabled_for_tests() -> bool:
+    """仅用于自动化测试（``conftest`` 设置 ``MODSTORE_DISABLE_CSRF=1``）；生产环境禁止开启。"""
+    return (os.environ.get("MODSTORE_DISABLE_CSRF") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _bearer_authenticates(authorization: str) -> bool:
+    """True only for a user access token or PAT that the auth service accepts."""
+    from modstore_server.application.auth import (
+        AuthApplicationService,
+        AuthenticationError,
+    )
+    from modstore_server.auth_service import PAT_PREFIX, resolve_pat_identity
+    from modstore_server.operational_errors import RECOVERABLE_ERRORS
+
+    try:
+        raw = authorization.strip()
+        token = raw[7:].strip() if raw.startswith("Bearer ") else ""
+        if token.startswith(PAT_PREFIX):
+            return resolve_pat_identity(token) is not None
+        AuthApplicationService().current_user_from_authorization(authorization)
+    except AuthenticationError:
+        return False
+    except RECOVERABLE_ERRORS:
+        return False
+    return True
+
+
+class CSRFMiddleware:
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        request = Request(scope, receive, send)
+        if _csrf_disabled_for_tests():
+            await self.app(scope, receive, send)
+            return
+
+        method = request.method.upper()
+
+        if method in ("GET", "HEAD", "OPTIONS"):
+            csrf_cookie = request.cookies.get("csrf_token")
+            if not csrf_cookie:
+                await self._set_csrf_cookie(scope, receive, send)
+                return
+            await self.app(scope, receive, send)
+            return
+
+        # A bearer header only skips the double-submit check when it authenticates, or
+        # when the request carries no cookies (a non-browser caller with no ambient
+        # credential to forge; the route's own auth decides). A browser request with
+        # cookies and a forged bearer still needs a matching X-CSRF-Token.
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.lower().startswith("bearer ") and (
+            not request.headers.get("cookie")
+            or await run_in_threadpool(_bearer_authenticates, auth_header)
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        # External protocols have no ambient browser credentials. Cookie-bearing
+        # requests still require CSRF; path matching alone never authenticates them.
+        if (
+            method == "POST"
+            and not request.headers.get("cookie")
+            and _machine_webhook_path(request.url.path)
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        if _csrf_exempt_path(request.url.path):
+            await self.app(scope, receive, send)
+            return
+
+        csrf_cookie = request.cookies.get("csrf_token")
+        csrf_header = request.headers.get("x-csrf-token", "")
+
+        if not csrf_cookie or not csrf_header:
+            response = JSONResponse({"detail": "CSRF token missing"}, status_code=403)
+            await response(scope, receive, send)
+            return
+
+        if not csrf_tokens_match(csrf_header, csrf_cookie):
+            response = JSONResponse({"detail": "CSRF token mismatch"}, status_code=403)
+            await response(scope, receive, send)
+            return
+
+        await self.app(scope, receive, send)
+
+    async def _set_csrf_cookie(self, scope, receive, send):
+        token = generate_csrf_token()
+        # 双提交 Cookie：须允许前端 JS 读取并回传 X-CSRF-Token，故不能 HttpOnly。
+        secure = os.environ.get("MODSTORE_ENV", "development").lower() == "production"
+        raw_sec = os.environ.get("MODSTORE_CSRF_COOKIE_SECURE", "").strip().lower()
+        if raw_sec in ("1", "true", "yes", "on"):
+            secure = True
+        elif raw_sec in ("0", "false", "no", "off"):
+            secure = False
+        sec = "; Secure" if secure else ""
+
+        async def send_with_cookie(message):
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers", []))
+                cookie = f"csrf_token={token}; Path=/; SameSite=Lax{sec}"
+                headers.append((b"set-cookie", cookie.encode("latin-1")))
+                message["headers"] = headers
+            await send(message)
+
+        await self.app(scope, receive, send_with_cookie)

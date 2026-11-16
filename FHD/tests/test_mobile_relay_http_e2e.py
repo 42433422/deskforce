@@ -1,0 +1,199 @@
+from __future__ import annotations
+
+from contextlib import contextmanager
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from app.utils.operational_errors import BOUNDARY_ERRORS
+
+
+def test_mobile_server_desktop_codex_relay_http_round_trip(monkeypatch, tmp_path):
+    from app.fastapi_routes import mobile_api
+    from app.fastapi_routes import mobile_api_extensions as ext
+    from app.services import mobile_relay_service as relay
+
+    notify = Mock()
+    monkeypatch.setattr("app.domain.shared_services.mobile_push.notify_user", notify)
+    engine = create_engine(f"sqlite:///{tmp_path / 'relay-http.db'}")
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+
+    @contextmanager
+    def test_db():
+        db = session_factory()
+        try:
+            yield db
+            db.commit()
+        except BOUNDARY_ERRORS:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    monkeypatch.setattr(relay, "get_db", test_db)
+    app = FastAPI()
+    app.include_router(ext.extension_router, prefix="/api/mobile/v1")
+    mobile_user = SimpleNamespace(
+        id=7,
+        username="admin",
+        display_name="管理员",
+        role="admin",
+        is_active=True,
+        account_id="account-7",
+        tenant_id="tenant-a",
+    )
+    app.dependency_overrides[ext.get_mobile_user] = lambda: mobile_user
+    client = TestClient(app, client=("127.0.0.1", 50000))
+
+    registered_response = client.post(
+        "/api/mobile/v1/relay/desktop/register",
+        json={
+            "label": "真实桌面执行端",
+            "device_id": "desktop-1",
+            "relay_base_url": "https://relay.example.test/api",
+            "capabilities": {
+                "codex": True,
+                "codex_cli": True,
+                "host": "192.168.1.8",
+                "port": 17500,
+            },
+        },
+    )
+    assert registered_response.status_code == 200
+    registered = registered_response.json()["data"]
+
+    malformed_response = client.post(
+        "/api/mobile/v1/relay/mobile/bind-account", json={"pairing_code": "123"}
+    )
+    assert malformed_response.status_code == 400
+
+    missing_code_response = client.post(
+        "/api/mobile/v1/relay/mobile/bind-account",
+        json={"relay_id": registered["relay_id"]},
+    )
+    assert missing_code_response.status_code == 400
+
+    with monkeypatch.context() as limiter_patch:
+        limiter_patch.setattr(
+            "app.utils.resilience.rate_limiter.check_rate_limit",
+            lambda *args: {"allowed": False},
+        )
+        throttled_response = client.post(
+            "/api/mobile/v1/relay/mobile/bind-account",
+            json={"pairing_code": registered["pairing_code"]},
+        )
+    assert throttled_response.status_code == 429
+
+    invalid_response = client.post(
+        "/api/mobile/v1/relay/mobile/bind-account",
+        json={"relay_id": registered["relay_id"], "pairing_code": "000000"},
+    )
+    assert invalid_response.status_code == 404
+
+    confirm_response = client.post(
+        "/api/mobile/v1/relay/mobile/bind-account",
+        json={"pairing_code": registered["pairing_code"]},
+    )
+    assert confirm_response.status_code == 200
+    binding = confirm_response.json()["data"]
+    assert binding["account_id"] == "account-7"
+    assert binding["tenant_id"] == "tenant-a"
+    assert binding["session_token"]
+    assert binding["relay_base_url"] == "https://relay.example.test/api/"
+    assert binding["local_base_url"] == "http://192.168.1.8:17500"
+    assert binding["paired_at"]
+
+    repeated_response = client.post(
+        "/api/mobile/v1/relay/mobile/bind-account",
+        json={"relay_id": registered["relay_id"], "pairing_code": registered["pairing_code"]},
+    )
+    assert repeated_response.status_code == 200
+
+    wrong_renewal = client.post(
+        "/api/mobile/v1/relay/desktop/renew",
+        json={"relay_id": registered["relay_id"], "desktop_token": "wrong-token-value-123"},
+    )
+    assert wrong_renewal.status_code == 404
+    renewed_response = client.post(
+        "/api/mobile/v1/relay/desktop/renew",
+        json={
+            "relay_id": registered["relay_id"],
+            "desktop_token": registered["desktop_token"],
+        },
+    )
+    assert renewed_response.status_code == 200
+    renewed = renewed_response.json()["data"]
+    assert renewed["relay_id"] == registered["relay_id"]
+    assert renewed["pairing_code"] != registered["pairing_code"]
+    stale_response = client.post(
+        "/api/mobile/v1/relay/mobile/bind-account",
+        json={"relay_id": registered["relay_id"], "pairing_code": registered["pairing_code"]},
+    )
+    assert stale_response.status_code == 404
+    assert (
+        client.post(
+            "/api/mobile/v1/relay/mobile/bind-account",
+            json={"relay_id": registered["relay_id"], "pairing_code": renewed["pairing_code"]},
+        ).status_code
+        == 200
+    )
+
+    mobile_user.id = 8
+    other_account_response = client.post(
+        "/api/mobile/v1/relay/mobile/bind-account",
+        json={"pairing_code": registered["pairing_code"]},
+    )
+    assert other_account_response.status_code == 404
+    mobile_user.id = 7
+
+    create_response = client.post(
+        "/api/mobile/v1/relay/tasks",
+        json={
+            "relay_id": registered["relay_id"],
+            "kind": "codex.invoke",
+            "payload": {"message": "修复并运行测试"},
+        },
+    )
+    assert create_response.status_code == 200
+    task = create_response.json()["data"]["task"]
+    assert task["status"] == "queued"
+
+    poll_response = client.post(
+        "/api/mobile/v1/relay/desktop/poll",
+        json={
+            "relay_id": registered["relay_id"],
+            "desktop_token": registered["desktop_token"],
+            "max_tasks": 5,
+        },
+    )
+    assert poll_response.status_code == 200
+    assert poll_response.json()["data"]["tasks"][0]["status"] == "running"
+
+    complete_response = client.post(
+        f"/api/mobile/v1/relay/desktop/tasks/{task['task_id']}/complete",
+        json={
+            "relay_id": registered["relay_id"],
+            "desktop_token": registered["desktop_token"],
+            "status": "completed",
+            "result": {
+                "ok": True,
+                "codex": {"assistant_message": {"body": "真实 Codex 已完成并回写"}},
+            },
+        },
+    )
+    assert complete_response.status_code == 200
+    assert complete_response.json()["data"]["task"]["status"] == "completed"
+    notify.assert_called_once()
+    assert notify.call_args.args == (7,)
+    assert notify.call_args.kwargs["data"]["task_id"] == task["task_id"]
+    assert notify.call_args.kwargs["data"]["task_status"] == "completed"
+
+    status_response = client.get(f"/api/mobile/v1/relay/tasks/{task['task_id']}")
+    assert status_response.status_code == 200
+    final_task = status_response.json()["data"]["task"]
+    assert final_task["status"] == "completed"
+    assert final_task["result"]["codex"]["assistant_message"]["body"] == "真实 Codex 已完成并回写"

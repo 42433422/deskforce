@@ -1,0 +1,128 @@
+"""员工写操作审批门，使用确定性风险策略和审批服务。"""
+
+from __future__ import annotations
+
+import logging
+import uuid
+from typing import Any, cast
+
+from app.application.employee_runtime.tool_scope import CODE_WRITE_TOOLS, WRITE_TOOLS
+from app.application.workflow.workflow_types import normalize_workflow_risk
+from app.utils.operational_errors import RECOVERABLE_ERRORS
+
+logger = logging.getLogger(__name__)
+
+
+def build_write_approval_gate(
+    employee_id: str,
+    input_data: dict[str, Any] | None = None,
+):
+    """返回 agent_loop gate：(tool_name, args) -> {ok, reason}。
+
+    代码修改工具（``patch_file`` / ``write_file``）统一委托 autonomy_guard；
+    写库类业务工具（``import_excel_to_database`` / ``products_bulk_import``）只能由
+    ApprovalService 创建并持久化审批记录。模型参数和员工输入不能自我声明批准，
+    也不能携带服务端写令牌绕过审批。
+    """
+    payload = dict(input_data or {})
+
+    def gate(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+        name = str(tool_name or "").strip()
+        if name not in WRITE_TOOLS and name not in CODE_WRITE_TOOLS:
+            return {"ok": True}
+        if name in CODE_WRITE_TOOLS:
+            from app.domain.autonomy.autonomy_guard import evaluate_risk
+
+            decision = evaluate_risk(
+                "code_write",
+                {**payload, "tool": name},
+                action_id=str(payload.get("action_id") or "") or None,
+                source=f"employee_write:{employee_id}",
+            )
+            if decision.allowed:
+                return {"ok": True, "risk_decision": decision.to_dict()}
+            return {
+                "ok": False,
+                "reason": decision.reason,
+                "blocked": not decision.requires_confirmation,
+                "pending_approval": decision.requires_confirmation,
+                "risk_decision": decision.to_dict(),
+            }
+        try:
+            from app.application.workflow.approval_policy import WorkflowApprovalPolicy
+            from app.application.workflow.workflow_types import PlanGraph, WorkflowNode
+            from resources.config.risk_actions_loader import get_action_risk
+
+            write_action = "execute"
+            if name in ("import_excel_to_database", "products_bulk_import"):
+                write_action = "import"
+            risk = get_action_risk(name, write_action, default="high")
+            plan = PlanGraph(
+                plan_id=f"emp-write-{employee_id}-{uuid.uuid4().hex[:8]}",
+                intent=f"员工 {employee_id} 写操作审批",
+                nodes=[
+                    WorkflowNode(
+                        node_id="write",
+                        tool_id=name,
+                        action=write_action,
+                        params=dict(args or {}),
+                        risk=normalize_workflow_risk(risk),
+                    )
+                ],
+                risk_level=normalize_workflow_risk(risk),
+            )
+            gated = WorkflowApprovalPolicy()
+            gated_decision = gated.evaluate_plan(plan, runtime_context=payload)
+            if gated_decision.all_approved and not gated_decision.any_rejected:
+                return {"ok": True}
+            if gated_decision.pending_approval:
+                return {
+                    "ok": False,
+                    "reason": "写操作待审批（请在审批工作台通过后重试）",
+                    "pending_approval": True,
+                    "approval_request_ids": list(gated_decision.approval_request_ids or []),
+                }
+        except RECOVERABLE_ERRORS:
+            logger.debug(
+                "write approval gate fallback emp=%s tool=%s",
+                employee_id,
+                name,
+                exc_info=True,
+            )
+
+        try:
+            from app.application.employee_runtime.metrics import record_write_block
+
+            record_write_block(employee_id)
+        except RECOVERABLE_ERRORS:
+            pass
+        return {
+            "ok": False,
+            "reason": (f"写库工具 {name} 被审批门拦截：需在审批工作台通过"),
+        }
+
+    return gate
+
+
+def compose_gates(*gates: Any) -> Any:
+    """合并多个 gate（WorkspaceGuard + write approval 等）。"""
+    active = [g for g in gates if g is not None]
+    if not active:
+        return None
+
+    def combined(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+        for g in active:
+            try:
+                verdict = g(tool_name, args)
+            except RECOVERABLE_ERRORS:
+                return {"ok": False, "reason": "工具授权检查失败，未执行"}
+            if not isinstance(verdict, dict) or type(verdict.get("ok")) is not bool:
+                return {"ok": False, "reason": "工具授权结果无效，未执行"}
+            if verdict["ok"] is not True:
+                return cast("dict[str, Any]", verdict)
+        return {"ok": True}
+
+    return combined
+
+
+__all__ = ["build_write_approval_gate", "compose_gates"]

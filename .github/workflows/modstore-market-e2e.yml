@@ -1,0 +1,60 @@
+# CI SSOT: generated from MODstore_deploy/.github/workflows/market-e2e.yml — DO NOT edit here.
+# Edit that source, then run: python scripts/dev/publish_ci_workflows_to_root.py
+name: Market E2E (Playwright)
+
+# P1-4 · market 表层 Playwright E2E 接入 PR（日更 PR 表层冒烟）
+on:
+  push:
+    paths:
+      - "成都修茈科技有限公司/MODstore_deploy/market/**"
+      - ".github/workflows/modstore-market-e2e.yml"
+  pull_request:
+    paths:
+      - "成都修茈科技有限公司/MODstore_deploy/market/**"
+      - ".github/workflows/modstore-market-e2e.yml"
+
+
+defaults:
+  run:
+    working-directory: 成都修茈科技有限公司/MODstore_deploy
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: 成都修茈科技有限公司/MODstore_deploy/market
+    env:
+      CI: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24.19.0"
+          cache: "npm"
+          cache-dependency-path: 成都修茈科技有限公司/MODstore_deploy/market/package-lock.json
+
+      - name: Install deps
+        env:
+          # Browser ASR uses WASM. Keep npm hooks and bundled CPU bindings;
+          # omit only optional CUDA/TensorRT downloads on this CPU runner.
+          # https://github.com/microsoft/onnxruntime/blob/v1.30.0/js/node/README.md#cuda-ep-installation
+          ONNXRUNTIME_NODE_INSTALL: skip
+        run: |
+          npm ci
+          node --input-type=module -e "import { listSupportedBackends } from 'onnxruntime-node'; if (!listSupportedBackends().some(({ name, bundled }) => name === 'cpu' && bundled)) throw new Error('ONNX CPU binding unavailable')"
+
+      - name: Install Playwright Chromium
+        run: npm run test:e2e:install
+
+      - name: Run Playwright E2E
+        run: npm run test:e2e
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: market-playwright-report
+          path: 成都修茈科技有限公司/MODstore_deploy/market/playwright-report/
+          retention-days: 7

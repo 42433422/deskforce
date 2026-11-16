@@ -1,0 +1,243 @@
+name: SLO metrics collect (daily)
+
+on:
+  schedule:
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+    inputs:
+      window:
+        description: "Prometheus window"
+        required: false
+        default: "30d"
+        type: choice
+        options: ["1d", "7d", "30d", "90d"]
+      mode:
+        description: "preflight before SHA convergence; formal only after Day 0 approval"
+        required: true
+        default: "preflight"
+        type: choice
+        options: ["preflight", "formal"]
+      release_id:
+        description: "Required in formal mode: xcagi-<version>-<40sha>"
+        required: false
+        default: ""
+        type: string
+      evidence_at:
+        description: "Optional ISO UTC evidence time for a <=24h raw-telemetry backfill"
+        required: false
+        default: ""
+        type: string
+      backfill_reason:
+        description: "Required when evidence_at is supplied"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+  pull-requests: write
+
+concurrency:
+  group: slo-metrics-collect
+  cancel-in-progress: false
+
+env:
+  SLO_MODE: ${{ inputs.mode || (vars.SLO_FORMAL_RELEASE_ID != '' && 'formal' || 'preflight') }}
+  SLO_RELEASE_ID: ${{ inputs.release_id || vars.SLO_FORMAL_RELEASE_ID || '' }}
+  SLO_WINDOW: ${{ inputs.window || ((inputs.mode == 'formal' || (inputs.mode == '' && vars.SLO_FORMAL_RELEASE_ID != '')) && '90d' || '30d') }}
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.CI_COMMIT_TOKEN || github.token }}
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Authorize formal Day 0 from live release convergence
+        if: ${{ env.SLO_MODE == 'formal' }}
+        env:
+          MODSTORE_ADMIN_API_BASE: ${{ secrets.MODSTORE_ADMIN_API_BASE }}
+          MODSTORE_ADMIN_BEARER_TOKEN: ${{ secrets.MODSTORE_ADMIN_BEARER_TOKEN }}
+          EXPECTED_RELEASE_ID: ${{ env.SLO_RELEASE_ID }}
+        run: |
+          set -euo pipefail
+          test -n "${MODSTORE_ADMIN_API_BASE:-}"
+          test -n "${MODSTORE_ADMIN_BEARER_TOKEN:-}"
+          test -n "${EXPECTED_RELEASE_ID:-}"
+          response="${RUNNER_TEMP}/release-convergence.json"
+          curl -fsSL --retry 3 --connect-timeout 10 --max-time 45 \
+            -H "Authorization: Bearer ${MODSTORE_ADMIN_BEARER_TOKEN}" \
+            "${MODSTORE_ADMIN_API_BASE%/}/api/admin/release-convergence" -o "$response"
+          jq -e --arg release_id "$EXPECTED_RELEASE_ID" '
+            .ok == true and .data.converged == true and .data.release_id == $release_id
+          ' "$response" >/dev/null || {
+            echo "::error::Formal Day 0 is forbidden until the live convergence endpoint matches release_id."
+            jq '.data | {state, release_id, blockers}' "$response" || true
+            exit 1
+          }
+
+      - name: Open production SSH channel and ensure Prometheus is serving
+        id: prometheus_channel
+        continue-on-error: true
+        env:
+          FHD_PUSH_HOST: ${{ secrets.FHD_PUSH_HOST }}
+          FHD_PUSH_USER: ${{ secrets.FHD_PUSH_USER }}
+          FHD_PUSH_SSH_KEY_RAW: ${{ secrets.FHD_PUSH_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "${FHD_PUSH_HOST:-}"
+          test -n "${FHD_PUSH_SSH_KEY_RAW:-}"
+          key_file="${RUNNER_TEMP}/fhd_prometheus_metrics_key"
+          control_socket="${RUNNER_TEMP}/fhd_prometheus_metrics_ssh"
+          remote="${FHD_PUSH_USER:-root}@${FHD_PUSH_HOST}"
+          printf '%s\n' "$FHD_PUSH_SSH_KEY_RAW" > "$key_file"
+          chmod 600 "$key_file"
+          # Exec channel only: since 2026-10-17 every forwarded connection to
+          # :9091 was reset, so queries run as `ssh host curl` instead of -L.
+          ssh -i "$key_file" \
+            -o StrictHostKeyChecking=accept-new \
+            -o ConnectTimeout=30 \
+            -o ServerAliveInterval=10 \
+            -o ServerAliveCountMax=6 \
+            -M -S "$control_socket" -fN "$remote"
+          echo "PRODUCTION_PROMETHEUS_SSH_CONTROL=$control_socket" >> "$GITHUB_ENV"
+          echo "PRODUCTION_PROMETHEUS_SSH_TARGET=$remote" >> "$GITHUB_ENV"
+          ssh -S "$control_socket" "$remote" 'bash -s' \
+            < scripts/observability/ensure_production_prometheus.sh \
+            | tee "${RUNNER_TEMP}/prometheus-health.json"
+
+      - name: Collect SLO from Prometheus
+        id: slo_collect
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          args=(
+            --window "$SLO_WINDOW"
+            --mode "$SLO_MODE"
+            --release-id "$SLO_RELEASE_ID"
+          )
+          if [ -n "${{ inputs.evidence_at || '' }}" ]; then
+            args+=(
+              --evidence-at "${{ inputs.evidence_at }}"
+              --backfill-reason "${{ inputs.backfill_reason || '' }}"
+            )
+          fi
+          python3 scripts/observability/collect_slo_metrics.py "${args[@]}"
+
+      - name: Close production SSH channel
+        if: always()
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          trap 'rm -f "${RUNNER_TEMP}/fhd_prometheus_metrics_key"' EXIT
+          if [ -n "${PRODUCTION_PROMETHEUS_SSH_CONTROL:-}" ]; then
+            ssh -S "$PRODUCTION_PROMETHEUS_SSH_CONTROL" -O exit "$PRODUCTION_PROMETHEUS_SSH_TARGET"
+          fi
+
+      - name: Upload Prometheus host health
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-prometheus-health-${{ github.run_id }}
+          path: ${{ runner.temp }}/prometheus-health.json
+          retention-days: 120
+          if-no-files-found: warn
+
+      - name: Fetch authoritative production deploy events
+        id: dora_source
+        continue-on-error: true
+        env:
+          FHD_PUSH_HOST: ${{ secrets.FHD_PUSH_HOST }}
+          FHD_PUSH_USER: ${{ secrets.FHD_PUSH_USER }}
+          FHD_PUSH_SSH_KEY_RAW: ${{ secrets.FHD_PUSH_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${FHD_PUSH_HOST:-}" ] || [ -z "${FHD_PUSH_SSH_KEY_RAW:-}" ]; then
+            echo "::error::FHD_PUSH_HOST and FHD_PUSH_SSH_KEY are required for authoritative DORA collection."
+            exit 1
+          fi
+          key_file="${RUNNER_TEMP}/fhd_dora_metrics_key"
+          tmp_events="${RUNNER_TEMP}/dora-deploy-events.jsonl"
+          printf '%s\n' "$FHD_PUSH_SSH_KEY_RAW" > "$key_file"
+          chmod 600 "$key_file"
+          ssh -i "$key_file" \
+            -o StrictHostKeyChecking=accept-new \
+            -o ConnectTimeout=30 \
+            "${FHD_PUSH_USER:-root}@${FHD_PUSH_HOST}" \
+            "test -r /var/lib/xcagi/autonomy/dora-deploy-events.jsonl && cat /var/lib/xcagi/autonomy/dora-deploy-events.jsonl" \
+            > "$tmp_events"
+          python3 - "$tmp_events" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+          if not lines:
+              raise SystemExit("production DORA event source is empty")
+          for line in lines:
+              event = json.loads(line)
+              for key in ("deploy_id", "deployed_at", "status", "environment", "git_sha"):
+                  if not event.get(key):
+                      raise SystemExit(f"invalid DORA event: missing {key}")
+          print(f"validated {len(lines)} production deployment events")
+          PY
+          mv "$tmp_events" metrics/deploy_events.jsonl
+
+      - name: Collect DORA metrics
+        if: steps.dora_source.outcome == 'success'
+        run: |
+          python3 scripts/observability/collect_dora.py \
+            --window-days 7 \
+            --environment production
+
+      - name: Report unavailable DORA source
+        if: steps.dora_source.outcome != 'success'
+        run: |
+          echo "::warning::Production deployment evidence was unavailable; preserving the last DORA snapshot instead of publishing a false zero."
+
+      - name: Open metrics PR and enable auto-merge
+        env:
+          GH_TOKEN: ${{ secrets.CI_COMMIT_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::CI_COMMIT_TOKEN is required to open a protected-main metrics PR."
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # 同步重生成「声称 vs 实测」对照文档，保持与 metrics 快照一致
+          # （arch-fitness 的 claimed-vs-actual-freshness 门禁要求二者一致）。
+          python scripts/dev/gen_claimed_vs_actual.py
+          git add metrics/slo-production/*.json metrics/deploy_events.jsonl metrics/dora-*.json docs/CLAIMED_VS_ACTUAL.md
+          if git diff --staged --quiet; then
+            exit 0
+          fi
+          snapshot_date="$(date -u +%Y%m%d)"
+          branch="automation/slo-metrics-${GITHUB_RUN_ID}"
+          title="chore(metrics): SLO snapshot ${snapshot_date} (see body for pass/fail-closed)"
+          git switch -c "$branch"
+          git commit -m "$title"
+          git pull --rebase origin "$GITHUB_REF_NAME"
+          git push --set-upstream origin "$branch"
+          pr_url="$(gh pr create \
+            --base "$GITHUB_REF_NAME" \
+            --head "$branch" \
+            --title "$title" \
+            --body "Daily SLO and authoritative production DORA snapshot generated by workflow run ${GITHUB_RUN_ID}. Protected main remains gated by the required CI checks.")"
+          gh pr merge "$pr_url" --auto --squash --delete-branch
+
+      - name: Fail closed when production SLO evidence is not admissible
+        if: always() && steps.slo_collect.outcome != 'success'
+        run: |
+          echo "::error::Production SLO evidence is unavailable, empty, or formal targets/sample floors failed; no PASS was emitted."
+          exit 1

@@ -1,0 +1,229 @@
+"""Owned background preview jobs; public parsing hooks remain on the preview facade."""
+
+from __future__ import annotations
+
+import importlib
+import logging
+import time
+from contextvars import copy_context
+from typing import TYPE_CHECKING, Any
+
+from app.application.elt.errors import EltError
+from app.application.elt.operation_owner import (
+    activate_operation,
+    bind_owner,
+    claim_operation,
+    fail_operation,
+    finish_operation,
+    unbind_owner,
+)
+from app.application.elt.preview_confirmation import publish_preview
+from app.application.elt.service_support import dump_json, load_json, safe_error
+from app.infrastructure.tenant_scope import tenant_scope
+from app.utils.operational_errors import BOUNDARY_ERRORS, RECOVERABLE_ERRORS
+
+logger = logging.getLogger(__name__)
+
+
+def _facade():
+    return importlib.import_module("app.application.elt.service_preview")
+
+
+class PreviewWorkerMixin:
+    if TYPE_CHECKING:
+        _owned_run: Any
+        _owned_upload: Any
+        _suggest_mappings: Any
+        _persist_source_snapshot: Any
+        _load_source_snapshot: Any
+        _owned_upload_record: Any
+        _revalidate_existing_rows: Any
+        _update_linked_companion_summary: Any
+        _record_preview_metrics: Any
+
+    def _submit_preview(
+        self, run_id: str, tenant_id: int, owner_user_id: int, *, operation_token: str | None = None
+    ) -> None:
+        facade = _facade()
+        with facade.SUBMITTED_LOCK:
+            if run_id in facade.SUBMITTED and operation_token is None:
+                return
+            facade.SUBMITTED.add(run_id)
+
+        def work() -> None:
+            try:
+                with tenant_scope(tenant_id):
+                    self._preview_worker(run_id, owner_user_id, operation_token=operation_token)
+            finally:
+                with facade.SUBMITTED_LOCK:
+                    facade.SUBMITTED.discard(run_id)
+
+        try:
+            facade.EXECUTOR.submit(copy_context().run, work)
+        except RECOVERABLE_ERRORS:
+            with facade.SUBMITTED_LOCK:
+                facade.SUBMITTED.discard(run_id)
+            raise
+
+    def _preview_worker(
+        self, run_id: str, owner_user_id: int, *, operation_token: str | None = None
+    ) -> None:
+        from app.application.elt.llm_session_provider import (
+            bind_etl_llm_owner,
+            reset_etl_llm_owner,
+        )
+
+        llm_owner_token = bind_etl_llm_owner(owner_user_id)
+        db = _facade().new_session()
+        started_at = time.monotonic()
+        operation = None
+        dataset = None
+        try:
+            run = self._owned_run(db, run_id, owner_user_id)
+            operation = (
+                activate_operation(db, run, "preview", operation_token)
+                if operation_token
+                else claim_operation(
+                    db,
+                    run,
+                    "preview",
+                    allowed_statuses={"queued", "previewing"},
+                    require_unrolled_back=True,
+                )
+            )
+            bind_owner(db, operation)
+            upload = self._owned_upload_record(db, run.upload_id, owner_user_id)
+            run.status = "previewing"
+            run.stage = "parsing"
+            run.progress = 5
+            run.error_code = None
+            run.error_message = None
+            db.commit()
+
+            draft = load_json(run.draft_json, {})
+            compatibility_preset_id = str(draft.get("compatibility_preset_id") or "").strip()
+            dataset = self._load_source_snapshot(db, run)
+            if (
+                dataset is None
+                and load_json(run.summary_json, {}).get("intake_source") == "reviewed_candidate"
+            ):
+                raise EltError(
+                    "ELT_CANDIDATE_SOURCE_MISSING",
+                    "所选候选没有可预演的记录",
+                    status_code=409,
+                )
+            if dataset is None:
+                upload = self._owned_upload(db, run.upload_id, owner_user_id)
+                dataset = _facade().parse_file(
+                    upload.storage_path,
+                    target_type=run.target_type,
+                    compatibility_preset_id=compatibility_preset_id or None,
+                )
+                run.stage = "loading"
+                self._persist_source_snapshot(db, run, dataset)
+                dataset.close()
+                dataset = self._load_source_snapshot(db, run)
+                assert dataset is not None
+            run = self._owned_run(db, run_id, owner_user_id)
+            draft = load_json(run.draft_json, {})
+            source_features = dict(dataset.source_features or {})
+            summary = load_json(run.summary_json, {})
+            if summary.get("target_detection"):
+                source_features["target_detection"] = summary["target_detection"]
+            if compatibility_preset_id:
+                source_features["compatibility_preset_id"] = compatibility_preset_id
+            if run.target_type == "shipment_records":
+                # Surface an auditable, non-persistent layout candidate with
+                # the preview.  The user must still explicitly save it before
+                # it enters their private template library.
+                from app.application.elt.service_shipment_templates import (
+                    shipment_template_candidates,
+                )
+
+                candidates = shipment_template_candidates(source_features, upload.file_name)
+                if candidates:
+                    # Keep the legacy scalar for callers released before
+                    # multi-layout selection, while exposing every auditable
+                    # layout to the data-docking UI and chat resolver.
+                    source_features["shipment_template_candidates"] = candidates
+                    source_features["shipment_template_candidate"] = dict(candidates[0])
+            if not draft.get("field_mappings"):
+                deterministic_mappings = self._suggest_mappings(
+                    dataset, _facade().get_adapter(run.target_type)
+                )
+                draft["field_mappings"], llm_mapping = _facade().enhance_mappings_with_llm(
+                    dataset,
+                    _facade().get_adapter(run.target_type),
+                    deterministic_mappings,
+                )
+                source_features["llm_mapping"] = llm_mapping
+                run.draft_json = dump_json(draft)
+            run.total_rows = len(dataset.rows)
+            run.source_features_json = dump_json(source_features)
+            if not dataset.rows:
+                summary["confirmable"] = False
+                summary["empty_preview"] = {
+                    "code": "ELT_PREVIEW_EMPTY",
+                    "message": "没有识别出可入库的数据，不能确认或入库",
+                }
+            run.summary_json = dump_json(
+                {
+                    **summary,
+                    "warnings": dataset.warnings,
+                    "row_reconciliation": source_features.get("row_reconciliation") or {},
+                }
+            )
+            run.stage = "transforming"
+            run.progress = 20
+            db.commit()
+            self._revalidate_existing_rows(db, run.id, owner_user_id, publish=False)
+            run = self._owned_run(db, run_id, owner_user_id)
+            run.status = "preview_ready"
+            run.stage = "preview_ready"
+            run.progress = 100
+            run.processed_rows = run.total_rows
+            from app.application.elt.audit import record_elt_audit
+
+            snapshot = load_json(run.summary_json, {}).get("source_snapshot") or {}
+            record_elt_audit(
+                db,
+                actor=owner_user_id,
+                action="elt_clean",
+                payload={
+                    "run_id": run.id,
+                    "upload_id": run.upload_id,
+                    "file_sha256": run.file_sha256,
+                    "snapshot_sha256": snapshot.get("sha256"),
+                    "rows": run.total_rows,
+                    "target_type": run.target_type,
+                    "outcome": "preview_ready",
+                },
+            )
+            self._update_linked_companion_summary(db, run, status="preview_ready")
+            if int(run.total_rows or 0) > 0:
+                publish_preview(db, run)
+            finish_operation(db, operation)
+            db.commit()
+            self._record_preview_metrics(run, started_at, status="success")
+        except BOUNDARY_ERRORS as exc:  # Background task boundary has no HTTP error handler.
+            db.rollback()
+            code, message = safe_error(exc)
+            try:
+                if operation is not None and fail_operation(
+                    db, operation, code=code, message=message
+                ):
+                    run = self._owned_run(db, run_id, owner_user_id)
+                    self._update_linked_companion_summary(db, run, status="failed")
+                    db.commit()
+                    self._record_preview_metrics(run, started_at, status="failed")
+            except RECOVERABLE_ERRORS:
+                db.rollback()
+                logger.exception("Unable to persist ETL preview failure for run %s", run_id)
+        finally:
+            try:
+                if dataset is not None:
+                    dataset.close()
+            finally:
+                unbind_owner(db)
+                db.close()
+                reset_etl_llm_owner(llm_owner_token)

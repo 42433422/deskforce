@@ -1,0 +1,23 @@
+{
+  "vendor": "langgraph-checkpoint",
+  "upstream_repo": "https://github.com/langchain-ai/langgraph",
+  "upstream_pkg": "langgraph-checkpoint",
+  "license": "MIT",
+  "license_file": "LICENSE",
+  "version": "4.3.0",
+  "upstream_tag": "1.2.10",
+  "upstream_commit_sha": "41341457342327166d72fc11952ab28fb61ec0bf",
+  "patch_file": "upstream-backport.patch.b64",
+  "patch_sha256": "ec4a13b4699c89a048dce4f10971fb7c96561fbecfbeb1a257c805a05a9a6497",
+  "source_path": "libs/checkpoint",
+  "vendored_path": "langgraph/",
+  "sha256_manifest": "MANIFEST.sha256",
+  "verify_script": "verify_vendor.py",
+  "fetch_time_utc": "2026-08-10T00:00:00Z",
+  "verification": {
+    "method": "从锁定上游 tag 重建源码，应用 SHA-256 锁定的 XCAGI 补丁，再逐文件比对；同时验证 MANIFEST.sha256 与 LICENSE",
+    "note": "4.3.0 是本仓 fork 的包元数据版本，不表示副本等同上游 4.3.0。源码基线仍为 1.2.10，补丁包含本仓兼容改动及官方 namespace 修复的回补。"
+  },
+  "security_patch_commit": "bfcfea554ed5c7f7be562cebf8825e911b493ab1",
+  "version_origin": "XCAGI fork package metadata; not an upstream release claim"
+}

@@ -1,0 +1,1208 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>更新日志 | XCAGI 产品下载</title>
+    <meta name="description" content="查看 XCAGI 版本演进记录、历史发布状态与当前各平台制品校验结果。" />
+    <link rel="canonical" href="https://xiu-ci.com/download/releases" />
+    <link rel="icon" href="/assets/xiu-ci-logo.png" type="image/png" />
+    <style>
+      :root {
+        color-scheme: light;
+        --ink: #111318;
+        --muted: #626b78;
+        --soft: #f5f7fa;
+        --line: #e2e6ec;
+        --line-dark: #cfd5dd;
+        --blue: #1267e8;
+        --blue-soft: #edf4ff;
+        --violet: #7257e8;
+        --violet-soft: #f2efff;
+        --cyan: #087f9a;
+        --cyan-soft: #eaf9fc;
+        --amber: #a85b00;
+        --amber-soft: #fff4e2;
+        --green: #118866;
+        --green-soft: #eaf8f3;
+        --shadow: 0 24px 70px rgba(25, 38, 58, 0.11);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+      html {
+        scroll-behavior: smooth;
+      }
+      body {
+        margin: 0;
+        min-width: 320px;
+        color: var(--ink);
+        background: #fbfcfe;
+        font-family: Inter, 'SF Pro Display', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+      a {
+        color: inherit;
+      }
+      .container {
+        width: min(1180px, calc(100% - 40px));
+        margin: 0 auto;
+      }
+
+      .site-header {
+        position: sticky;
+        top: 0;
+        z-index: 40;
+        border-bottom: 1px solid rgba(17, 19, 24, 0.08);
+        background: rgba(255, 255, 255, 0.9);
+        backdrop-filter: blur(18px);
+        -webkit-backdrop-filter: blur(18px);
+      }
+      .header-inner {
+        min-height: 66px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 20px;
+      }
+      .brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 11px;
+        text-decoration: none;
+      }
+      .brand img {
+        width: 38px;
+        height: 38px;
+        padding: 3px;
+        border: 1px solid var(--line);
+        border-radius: 11px;
+        background: #fff;
+        object-fit: contain;
+      }
+      .brand-copy {
+        display: grid;
+        gap: 1px;
+      }
+      .brand-copy strong {
+        font-size: 14px;
+        letter-spacing: -0.01em;
+      }
+      .brand-copy span {
+        color: #8b94a0;
+        font-size: 9px;
+        font-weight: 700;
+        letter-spacing: 0.13em;
+        text-transform: uppercase;
+      }
+      .header-nav {
+        display: flex;
+        align-items: center;
+        gap: 3px;
+      }
+      .header-nav a {
+        padding: 8px 12px;
+        border-radius: 9px;
+        color: #5f6874;
+        font-size: 13px;
+        font-weight: 650;
+        text-decoration: none;
+      }
+      .header-nav a:hover {
+        color: var(--ink);
+        background: var(--soft);
+      }
+      .header-nav .is-current {
+        color: var(--blue);
+        background: var(--blue-soft);
+      }
+
+      .release-hero {
+        overflow: hidden;
+        border-bottom: 1px solid var(--line);
+        background:
+          linear-gradient(rgba(18, 103, 232, 0.035) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(18, 103, 232, 0.035) 1px, transparent 1px),
+          radial-gradient(720px 420px at 84% 0%, rgba(18, 103, 232, 0.18), transparent 68%),
+          radial-gradient(560px 360px at 8% 100%, rgba(114, 87, 232, 0.1), transparent 70%), #f7f9fc;
+        background-size:
+          32px 32px,
+          32px 32px,
+          auto,
+          auto,
+          auto;
+      }
+      .hero-grid {
+        min-height: 420px;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(300px, 0.52fr);
+        gap: clamp(56px, 8vw, 112px);
+        align-items: center;
+        padding: 76px 0 72px;
+      }
+      .eyebrow {
+        margin: 0 0 16px;
+        color: var(--green);
+        font-size: 11px;
+        font-weight: 800;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+      }
+      h1 {
+        margin: 0;
+        font-size: clamp(48px, 6vw, 72px);
+        line-height: 1.02;
+        letter-spacing: -0.06em;
+      }
+      .hero-lead {
+        max-width: 620px;
+        margin: 22px 0 0;
+        color: var(--muted);
+        font-size: 17px;
+        line-height: 1.75;
+      }
+      .hero-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-top: 28px;
+      }
+      .hero-actions a {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 40px;
+        padding: 0 15px;
+        border: 1px solid var(--line-dark);
+        border-radius: 10px;
+        color: #4e5864;
+        background: rgba(255, 255, 255, 0.76);
+        font-size: 12px;
+        font-weight: 750;
+        text-decoration: none;
+      }
+      .hero-actions a:first-child {
+        border-color: var(--blue);
+        color: #fff;
+        background: var(--blue);
+      }
+      .hero-actions a:first-child:hover {
+        background: #0757ca;
+      }
+      .hero-proof {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0;
+        margin-top: 34px;
+      }
+      .hero-proof div {
+        display: grid;
+        gap: 3px;
+        min-width: 116px;
+        padding-right: 24px;
+        margin-right: 24px;
+        border-right: 1px solid var(--line-dark);
+      }
+      .hero-proof div:last-child {
+        border-right: 0;
+      }
+      .hero-proof strong {
+        font-size: 19px;
+        letter-spacing: -0.03em;
+      }
+      .hero-proof span {
+        color: #7b8490;
+        font-size: 10px;
+        font-weight: 700;
+      }
+
+      .version-summary {
+        position: relative;
+        overflow: hidden;
+        padding: 28px;
+        border: 1px solid rgba(18, 103, 232, 0.18);
+        border-radius: 24px;
+        background: rgba(255, 255, 255, 0.9);
+        box-shadow: var(--shadow);
+      }
+      .version-summary::after {
+        content: '';
+        position: absolute;
+        top: -56px;
+        right: -42px;
+        width: 146px;
+        height: 146px;
+        border: 24px solid rgba(18, 103, 232, 0.07);
+        border-radius: 50%;
+      }
+      .summary-label {
+        color: #818a96;
+        font-size: 10px;
+        font-weight: 750;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+      .summary-version {
+        margin: 9px 0 0;
+        font-size: 36px;
+        font-weight: 780;
+        letter-spacing: -0.04em;
+      }
+      .summary-status {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 15px;
+        color: var(--green);
+        font-size: 12px;
+        font-weight: 700;
+      }
+      .summary-status::before {
+        content: '';
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--green);
+      }
+      .summary-meta {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 16px;
+        margin-top: 23px;
+        padding-top: 20px;
+        border-top: 1px solid var(--line);
+      }
+      .summary-meta span {
+        display: grid;
+        gap: 4px;
+        color: #89929d;
+        font-size: 10px;
+      }
+      .summary-meta b {
+        color: #4e5864;
+        font-size: 12px;
+      }
+      .summary-changes {
+        display: grid;
+        gap: 9px;
+        margin: 20px 0 0;
+        padding: 0;
+        list-style: none;
+      }
+      .summary-changes li {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        color: #53606d;
+        font-size: 11px;
+        font-weight: 650;
+      }
+      .summary-changes li::before {
+        content: '·';
+        display: grid;
+        place-items: center;
+        width: 18px;
+        height: 18px;
+        border-radius: 50%;
+        color: var(--green);
+        background: var(--green-soft);
+        font-size: 10px;
+        font-weight: 900;
+      }
+
+      .release-main {
+        padding: 82px 0 108px;
+        background: radial-gradient(520px 420px at 100% 12%, rgba(114, 87, 232, 0.055), transparent 75%), #fbfcfe;
+      }
+      .evolution-intro {
+        display: flex;
+        align-items: end;
+        justify-content: space-between;
+        gap: 36px;
+        margin-bottom: 28px;
+      }
+      .evolution-intro__copy {
+        max-width: 680px;
+      }
+      .section-kicker {
+        margin: 0 0 10px;
+        color: var(--blue);
+        font-size: 10px;
+        font-weight: 850;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+      }
+      .evolution-intro h2 {
+        margin: 0;
+        font-size: clamp(29px, 3.2vw, 42px);
+        line-height: 1.14;
+        letter-spacing: -0.045em;
+      }
+      .evolution-intro > p {
+        max-width: 350px;
+        margin: 0;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.7;
+      }
+      .evolution-strip {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        overflow: hidden;
+        border: 1px solid rgba(105, 207, 255, 0.16);
+        border-radius: 24px;
+        color: #172231;
+        background:
+          radial-gradient(420px 210px at 100% 0%, rgba(18, 103, 232, 0.12), transparent 74%),
+          radial-gradient(360px 220px at 0% 100%, rgba(114, 87, 232, 0.08), transparent 74%), linear-gradient(145deg, #fbfdff, #f2f7fd);
+        box-shadow:
+          0 24px 64px rgba(30, 61, 99, 0.1),
+          inset 0 1px #fff;
+      }
+      .evolution-phase {
+        position: relative;
+        min-height: 168px;
+        padding: 24px 23px 22px;
+        border-right: 1px solid #dfe7f0;
+      }
+      .evolution-phase:last-child {
+        border-right: 0;
+      }
+      .evolution-phase::before {
+        content: '';
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 4px;
+        background: var(--phase-color, var(--blue));
+      }
+      .evolution-phase:nth-child(1) {
+        --phase-color: var(--blue);
+      }
+      .evolution-phase:nth-child(2) {
+        --phase-color: var(--violet);
+      }
+      .evolution-phase:nth-child(3) {
+        --phase-color: var(--cyan);
+      }
+      .evolution-phase:nth-child(4) {
+        --phase-color: var(--green);
+        background: linear-gradient(145deg, rgba(17, 136, 102, 0.08), rgba(255, 255, 255, 0.55));
+      }
+      .phase-range {
+        display: inline-flex;
+        min-height: 24px;
+        align-items: center;
+        padding: 0 8px;
+        border-radius: 7px;
+        color: var(--phase-color, var(--blue));
+        background: color-mix(in srgb, var(--phase-color, var(--blue)) 10%, white);
+        font-size: 9px;
+        font-weight: 850;
+      }
+      .evolution-phase h3 {
+        margin: 16px 0 7px;
+        font-size: 17px;
+        letter-spacing: -0.025em;
+      }
+      .evolution-phase p {
+        margin: 0;
+        color: #6f7a88;
+        font-size: 11px;
+        line-height: 1.65;
+      }
+      .release-layout {
+        position: relative;
+        margin-top: 74px;
+        padding: 40px 38px 54px;
+        border: 1px solid #dce6f0;
+        border-radius: 30px;
+        background:
+          linear-gradient(rgba(18, 103, 232, 0.025) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(18, 103, 232, 0.025) 1px, transparent 1px),
+          radial-gradient(620px 520px at 50% 0%, rgba(18, 103, 232, 0.1), transparent 73%), linear-gradient(145deg, #f8fbff, #edf4fb);
+        background-size:
+          32px 32px,
+          32px 32px,
+          auto,
+          auto;
+        box-shadow: 0 34px 90px rgba(24, 58, 98, 0.11);
+      }
+      .release-aside {
+        position: static;
+        display: flex;
+        align-items: flex-end;
+        justify-content: space-between;
+        gap: 32px;
+        padding: 0 0 34px;
+        border: 0;
+        border-bottom: 1px solid #dbe5ef;
+        border-radius: 0;
+        background: transparent;
+      }
+      .release-aside__intro {
+        max-width: 560px;
+      }
+      .release-aside__actions {
+        display: grid;
+        justify-items: end;
+        gap: 18px;
+      }
+      .release-aside h2 {
+        margin: 0;
+        color: #172231;
+        font-size: 29px;
+        letter-spacing: -0.035em;
+      }
+      .release-aside p {
+        margin: 12px 0 0;
+        color: #677485;
+        font-size: 12px;
+        line-height: 1.7;
+      }
+      .release-aside a {
+        display: inline-block;
+        margin: 0;
+        padding: 9px 12px;
+        border: 1px solid rgba(18, 103, 232, 0.2);
+        border-radius: 9px;
+        color: var(--blue);
+        background: rgba(18, 103, 232, 0.05);
+        font-size: 12px;
+        font-weight: 750;
+        text-decoration: none;
+      }
+      .release-aside a:hover {
+        border-color: rgba(18, 103, 232, 0.42);
+        background: rgba(18, 103, 232, 0.09);
+      }
+      .release-legend {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        gap: 8px 13px;
+        margin: 0;
+        padding: 0;
+        border: 0;
+      }
+      .release-legend span {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        color: #697789;
+        font-size: 9.5px;
+      }
+      .release-legend i {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--legend-color);
+        box-shadow: 0 0 9px color-mix(in srgb, var(--legend-color) 55%, transparent);
+      }
+      .release-list {
+        position: relative;
+        display: flow-root;
+        padding-top: 42px;
+      }
+      .release-list::before {
+        content: '';
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        left: 50%;
+        width: 2px;
+        transform: translateX(-50%);
+        border-radius: 999px;
+        background: linear-gradient(
+          180deg,
+          rgba(17, 136, 102, 0.95),
+          rgba(8, 127, 154, 0.68) 48%,
+          rgba(114, 87, 232, 0.58) 78%,
+          rgba(18, 103, 232, 0.16)
+        );
+        box-shadow: 0 0 20px rgba(18, 103, 232, 0.14);
+      }
+      .release-entry {
+        --entry-accent: var(--blue);
+        --entry-soft: var(--blue-soft);
+        position: relative;
+        width: calc(50% - 36px);
+        margin: 0 0 30px;
+        overflow: visible;
+        border: 1px solid var(--line);
+        border-top: 3px solid var(--entry-accent);
+        border-radius: 22px;
+        background: rgba(255, 255, 255, 0.98);
+        box-shadow: 0 18px 46px rgba(28, 62, 101, 0.11);
+        transition:
+          transform 220ms ease,
+          box-shadow 220ms ease,
+          border-color 220ms ease;
+      }
+      .release-entry:nth-child(even) {
+        margin-left: calc(50% + 36px);
+      }
+      .release-entry:hover {
+        transform: translateY(-4px);
+        box-shadow: 0 25px 58px rgba(28, 62, 101, 0.18);
+      }
+      .release-entry:last-child {
+        margin-bottom: 0;
+      }
+      .release-entry[data-era='stable'] {
+        --entry-accent: var(--green);
+        --entry-soft: var(--green-soft);
+        border-color: rgba(57, 217, 173, 0.34);
+        box-shadow: 0 20px 54px rgba(17, 136, 102, 0.18);
+      }
+      .release-entry[data-era='hardening'] {
+        --entry-accent: var(--amber);
+        --entry-soft: var(--amber-soft);
+      }
+      .release-entry[data-era='ecosystem'] {
+        --entry-accent: var(--cyan);
+        --entry-soft: var(--cyan-soft);
+      }
+      .release-entry[data-era='platform'] {
+        --entry-accent: var(--violet);
+        --entry-soft: var(--violet-soft);
+      }
+      .release-entry::before {
+        content: '';
+        position: absolute;
+        z-index: 2;
+        top: 30px;
+        right: -44px;
+        width: 14px;
+        height: 14px;
+        border: 3px solid #f1f6fb;
+        border-radius: 50%;
+        background: var(--entry-accent);
+        box-shadow:
+          0 0 0 1px color-mix(in srgb, var(--entry-accent) 62%, transparent),
+          0 0 16px color-mix(in srgb, var(--entry-accent) 45%, transparent);
+      }
+      .release-entry::after {
+        content: '';
+        position: absolute;
+        top: 39px;
+        right: -36px;
+        width: 36px;
+        height: 1px;
+        background: linear-gradient(
+          90deg,
+          color-mix(in srgb, var(--entry-accent) 65%, transparent),
+          color-mix(in srgb, var(--entry-accent) 16%, transparent)
+        );
+      }
+      .release-entry:nth-child(even)::before {
+        right: auto;
+        left: -44px;
+      }
+      .release-entry:nth-child(even)::after {
+        right: auto;
+        left: -36px;
+        transform: rotate(180deg);
+      }
+      .release-entry.is-current::before {
+        animation: release-pulse 2.2s ease-in-out infinite;
+      }
+      .release-entry.is-milestone::before {
+        border-radius: 4px;
+        transform: rotate(45deg);
+      }
+      @keyframes release-pulse {
+        0%,
+        100% {
+          box-shadow:
+            0 0 0 1px rgba(57, 217, 173, 0.65),
+            0 0 15px rgba(57, 217, 173, 0.45);
+        }
+        50% {
+          box-shadow:
+            0 0 0 4px rgba(57, 217, 173, 0.12),
+            0 0 28px rgba(57, 217, 173, 0.78);
+        }
+      }
+      .release-entry__head {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 24px;
+        padding: 28px 31px 23px 34px;
+        padding-bottom: 22px;
+        border-bottom: 1px solid var(--line);
+      }
+      .release-version-line {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 9px;
+      }
+      .release-version-line h3 {
+        margin: 0;
+        font-size: 27px;
+        letter-spacing: -0.04em;
+      }
+      .release-channel {
+        display: inline-flex;
+        align-items: center;
+        min-height: 24px;
+        padding: 0 9px;
+        border-radius: 999px;
+        color: var(--entry-accent);
+        background: var(--entry-soft);
+        font-size: 9px;
+        font-weight: 800;
+      }
+      .release-title {
+        margin: 8px 0 0;
+        color: #586370;
+        font-size: 13px;
+        font-weight: 650;
+      }
+      .release-date {
+        flex: 0 0 auto;
+        color: #8b94a0;
+        font-size: 11px;
+        line-height: 24px;
+      }
+      .release-tags {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-top: 13px;
+      }
+      .release-tags span {
+        padding: 4px 7px;
+        border: 1px solid color-mix(in srgb, var(--entry-accent) 18%, white);
+        border-radius: 6px;
+        color: color-mix(in srgb, var(--entry-accent) 78%, #26313d);
+        background: color-mix(in srgb, var(--entry-accent) 5%, white);
+        font-size: 9px;
+        font-weight: 750;
+      }
+      .release-shift {
+        display: grid;
+        grid-template-columns: 80px minmax(0, 1fr);
+        gap: 15px;
+        align-items: center;
+        margin: 25px 31px 0 34px;
+        padding: 17px 19px;
+        border: 1px solid color-mix(in srgb, var(--entry-accent) 17%, white);
+        border-radius: 13px;
+        background: linear-gradient(120deg, var(--entry-soft), #fff 72%);
+      }
+      .release-shift span {
+        color: var(--entry-accent);
+        font-size: 9px;
+        font-weight: 850;
+        letter-spacing: 0.09em;
+      }
+      .release-shift strong {
+        color: #283340;
+        font-size: 15px;
+        line-height: 1.45;
+        letter-spacing: -0.015em;
+      }
+      .release-notes-label {
+        margin: 24px 34px 0;
+        color: #8a939e;
+        font-size: 9px;
+        font-weight: 850;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+      }
+      .release-notes {
+        display: grid;
+        gap: 10px;
+        margin: 12px 34px 0;
+        padding: 0;
+        list-style: none;
+      }
+      .release-notes li {
+        display: grid;
+        grid-template-columns: 27px minmax(0, 1fr);
+        gap: 11px;
+        align-items: start;
+        color: #4f5966;
+        font-size: 13px;
+        line-height: 1.7;
+      }
+      .release-entry--no-platforms .release-notes {
+        margin-bottom: 29px;
+      }
+      .note-index {
+        display: grid;
+        place-items: center;
+        width: 27px;
+        height: 27px;
+        margin-top: 1px;
+        border-radius: 8px;
+        color: var(--entry-accent);
+        background: var(--entry-soft);
+        font-size: 9px;
+        font-weight: 850;
+      }
+      .release-platforms {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 7px;
+        margin: 25px 34px 0;
+        padding: 20px 0 27px;
+        border-top: 1px solid var(--line);
+      }
+      .release-platforms span {
+        padding: 6px 9px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        color: #78818c;
+        background: #f7f9fb;
+        font-size: 10px;
+        font-weight: 700;
+      }
+      .release-source-note {
+        margin: 24px 2px 0;
+        color: #728398;
+        font-size: 10.5px;
+        line-height: 1.65;
+        text-align: center;
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .release-entry,
+        .release-entry.is-current::before {
+          transition: none;
+          animation: none;
+        }
+      }
+
+      .footer {
+        border-top: 1px solid var(--line);
+        background: var(--soft);
+      }
+      .footer-inner {
+        min-height: 88px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 20px;
+        color: #828b96;
+        font-size: 11px;
+      }
+      .footer-links {
+        display: flex;
+        gap: 18px;
+      }
+      .footer-links a {
+        color: #626b77;
+        text-decoration: none;
+      }
+      a:focus-visible {
+        outline: 2px solid var(--blue);
+        outline-offset: 3px;
+      }
+
+      @media (max-width: 840px) {
+        .hero-grid {
+          grid-template-columns: 1fr;
+          min-height: 0;
+          padding: 64px 0;
+        }
+        .version-summary {
+          max-width: 520px;
+        }
+        .evolution-intro {
+          align-items: flex-start;
+          flex-direction: column;
+          gap: 15px;
+        }
+        .evolution-strip {
+          grid-template-columns: repeat(2, 1fr);
+        }
+        .evolution-phase:nth-child(2) {
+          border-right: 0;
+        }
+        .evolution-phase:nth-child(-n + 2) {
+          border-bottom: 1px solid #dfe7f0;
+        }
+        .release-layout {
+          padding: 32px 24px 42px;
+        }
+        .release-aside {
+          align-items: flex-start;
+          flex-direction: column;
+        }
+        .release-aside__actions {
+          justify-items: start;
+        }
+        .release-legend {
+          justify-content: flex-start;
+        }
+        .release-list::before {
+          left: 18px;
+          transform: none;
+        }
+        .release-entry,
+        .release-entry:nth-child(even) {
+          width: calc(100% - 54px);
+          margin-left: 54px;
+        }
+        .release-entry::before,
+        .release-entry:nth-child(even)::before {
+          right: auto;
+          left: -43px;
+        }
+        .release-entry::after,
+        .release-entry:nth-child(even)::after {
+          right: auto;
+          left: -35px;
+          transform: rotate(180deg);
+        }
+        .release-source-note {
+          margin-left: 54px;
+        }
+      }
+
+      @media (max-width: 640px) {
+        .container {
+          width: min(100% - 28px, 1180px);
+        }
+        .header-inner {
+          min-height: 60px;
+        }
+        .brand-copy strong {
+          font-size: 12px;
+        }
+        .brand-copy span {
+          display: none;
+        }
+        .header-nav a {
+          padding: 7px 8px;
+          font-size: 11px;
+        }
+        .header-nav .nav-home {
+          display: none;
+        }
+        .hero-grid {
+          gap: 34px;
+          padding: 52px 0;
+        }
+        h1 {
+          font-size: clamp(44px, 13vw, 58px);
+        }
+        .hero-lead {
+          font-size: 14px;
+        }
+        .hero-proof {
+          row-gap: 18px;
+        }
+        .hero-proof div {
+          min-width: 96px;
+          padding-right: 15px;
+          margin-right: 15px;
+        }
+        .release-main {
+          padding: 68px 0 76px;
+        }
+        .evolution-strip {
+          grid-template-columns: 1fr;
+        }
+        .evolution-phase {
+          min-height: 0;
+          border-right: 0;
+          border-bottom: 1px solid #dfe7f0;
+        }
+        .evolution-phase:last-child {
+          border-bottom: 0;
+        }
+        .release-layout {
+          margin-top: 52px;
+          padding: 27px 14px 34px;
+          border-radius: 22px;
+        }
+        .release-aside {
+          padding-bottom: 26px;
+        }
+        .release-aside h2 {
+          font-size: 25px;
+        }
+        .release-list {
+          padding-top: 30px;
+        }
+        .release-list::before {
+          left: 10px;
+        }
+        .release-entry,
+        .release-entry:nth-child(even) {
+          width: calc(100% - 36px);
+          margin-left: 36px;
+          margin-bottom: 24px;
+        }
+        .release-entry::before,
+        .release-entry:nth-child(even)::before {
+          left: -33px;
+        }
+        .release-entry::after,
+        .release-entry:nth-child(even)::after {
+          left: -25px;
+          width: 25px;
+        }
+        .release-entry {
+          border-radius: 16px;
+        }
+        .release-entry__head {
+          padding: 23px 20px 20px 24px;
+        }
+        .release-entry__head {
+          gap: 14px;
+        }
+        .release-version-line h3 {
+          font-size: 23px;
+        }
+        .release-date {
+          font-size: 10px;
+        }
+        .release-shift {
+          grid-template-columns: 1fr;
+          gap: 6px;
+          margin: 20px 18px 0 23px;
+          padding: 15px;
+        }
+        .release-shift strong {
+          font-size: 13px;
+        }
+        .release-notes-label {
+          margin: 21px 23px 0;
+        }
+        .release-notes {
+          margin: 11px 20px 0 23px;
+        }
+        .release-notes li {
+          grid-template-columns: 24px minmax(0, 1fr);
+          gap: 9px;
+          font-size: 12px;
+        }
+        .note-index {
+          width: 24px;
+          height: 24px;
+        }
+        .release-platforms {
+          margin: 21px 20px 0 23px;
+          padding-bottom: 22px;
+        }
+        .release-source-note {
+          margin-left: 36px;
+          text-align: left;
+        }
+        .footer-inner {
+          align-items: flex-start;
+          flex-direction: column;
+          padding: 22px 0;
+        }
+      }
+    </style>
+      <meta property="og:site_name" content="XCAGI" />
+    <meta property="og:title" content="XCAGI 产品更新日志" />
+    <meta property="og:description" content="查看 XCAGI 官方版本更新说明与平台状态。" />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://xiu-ci.com/download/releases" />
+    <meta property="og:image" content="https://xiu-ci.com/assets/brand-logo.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="container header-inner">
+        <a class="brand" href="/download" aria-label="产品下载首页">
+          <img src="/assets/xiu-ci-logo.png?v=20260610d" alt="修茈科技 Logo" />
+          <span class="brand-copy"><strong>XCAGI</strong><span>产品更新日志</span></span>
+        </a>
+        <nav class="header-nav" aria-label="下载页导航">
+          <a class="nav-home" href="/index.html">官网</a>
+          <a href="/download#xcagi">产品介绍</a>
+          <a href="/download#platforms">平台与下载</a>
+          <a class="is-current" href="/download/releases" aria-current="page">更新日志</a>
+          <a href="/contact.html">安装支持</a>
+        </nav>
+      </div>
+    </header>
+
+    <main>
+      <section class="release-hero">
+        <div class="container hero-grid">
+          <div>
+            <p class="eyebrow">Release notes</p>
+            <h1>XCAGI 更新日志</h1>
+            <p class="hero-lead">从 Excel 打印工具到企业级 AI 员工平台：历史演进与当前可下载制品分开展示，不以版本条目数冒充正式发布次数。</p>
+            <div class="hero-actions">
+              <a href="/download#xcagi">下载当前版本</a>
+              <a href="/download">返回下载首页</a>
+            </div>
+            <div class="hero-proof" aria-label="版本演进概览" aria-live="polite">
+              <div><strong id="history-count">—</strong><span>去重演进记录</span></div>
+              <div><strong id="milestone-count">—</strong><span>历史里程碑</span></div>
+              <div><strong id="phase-count">—</strong><span>能力阶段（展示分组）</span></div>
+            </div>
+          </div>
+          <aside class="version-summary" aria-label="当前下载指针">
+            <span class="summary-label">Current download pointer</span>
+            <!-- 当前版本不写死在页面里：唯一来源是发布清单 /download-release.json（见页面脚本） -->
+            <p class="summary-version" id="summary-version">—</p>
+            <div class="summary-status" id="summary-status" role="status">版本信息加载中</div>
+            <div class="summary-meta">
+              <span>历史记录日期<b id="summary-date">—</b></span>
+              <span>发布渠道<b id="summary-channel">—</b></span>
+            </div>
+            <ul class="summary-changes" id="summary-changes" aria-label="当前版本重点"></ul>
+          </aside>
+        </div>
+      </section>
+
+      <section class="release-main" aria-labelledby="history-title">
+        <div class="container">
+          <div class="evolution-intro">
+            <div class="evolution-intro__copy">
+              <p class="section-kicker">Product evolution</p>
+              <h2>能力演进，看懂 XCAGI 如何走到今天</h2>
+            </div>
+            <p>版本不是孤立功能的累加，而是一条从效率工具、AI 平台、生态交付到企业稳定性的连续产品路线。</p>
+          </div>
+          <div class="evolution-strip" id="evolution-phases" aria-label="产品能力阶段" aria-live="polite"></div>
+
+          <div class="release-layout">
+            <aside class="release-aside">
+              <div class="release-aside__intro">
+                <p class="section-kicker">All releases</p>
+                <h2 id="history-title">逐版看变化 · 沿时间轨展开</h2>
+                <p>
+                  按 SSOT 中的版本演进顺序展示；历史里程碑、候选记录和历史发布均不保证当前仍有可下载安装包。
+                </p>
+              </div>
+              <div class="release-aside__actions">
+                <div class="release-legend" aria-label="版本阶段颜色图例">
+                  <span><i style="--legend-color: var(--green)"></i>当前指针版本</span>
+                  <span><i style="--legend-color: var(--amber)"></i>工程硬化与收敛</span>
+                  <span><i style="--legend-color: var(--cyan)"></i>生态与多端交付</span>
+                  <span><i style="--legend-color: var(--violet)"></i>AI 平台化</span>
+                  <span><i style="--legend-color: var(--blue)"></i>智能工具起点</span>
+                </div>
+                <a href="/data/release-history.json">查看版本历史 →</a>
+              </div>
+            </aside>
+            <div>
+              <!-- 版本时间线由历史投影 /data/release-history.json 的 release_history 渲染（见页面脚本） -->
+              <div class="release-list" id="release-list" aria-live="polite" aria-label="XCAGI 版本时间线"></div>
+              <p class="release-source-note">历史演进来自 <a href="/data/release-history.json">发布目录历史投影</a>（FHD/config/download_release.json）；当前下载状态、文件大小和校验值独立核对在线指针与制品清单。</p>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <div class="container footer-inner">
+        <span>© 2026 成都修茈科技有限公司 · XCAGI 更新日志</span>
+        <nav class="footer-links" aria-label="页脚导航">
+          <a href="/download">产品下载</a><a href="/contact.html">安装支持</a>
+        </nav>
+      </div>
+    </footer>
+
+    <script src="/release-data.js"></script>
+    <script>
+      ;(function () {
+        'use strict'
+
+        var releases = window.XCReleaseData
+        if (!releases) return
+        var listEl = document.getElementById('release-list')
+        var text = function (id, value) { document.getElementById(id).textContent = value }
+        var fetchJson = releases.fetchJson
+        function node(tag, className, value, children) {
+          var el = Object.assign(document.createElement(tag), { className: className || '', textContent: value || '' })
+          ;(children || []).forEach(function (child) { el.appendChild(child) })
+          return el
+        }
+        function platformLabel(value) {
+          value = String(value)
+          return value.startsWith('Android') ? 'Android ' + ((value.match(/\d+(?:\.\d+){2,3}/) || [''])[0]) + ' 实验版·非签约级' : value
+        }
+        function historicalStatus(release) {
+          if (release.kind === 'milestone') return '历史里程碑（非制品发布证明）'
+          return ({ candidate: '候选（未晋升）', accepted: '历史已验收（未确认发布）',
+            published: '历史已发布（不代表当前可下载）', withdrawn: '已撤回' })[release.publication_state] || '历史记录（发布状态待对账）'
+        }
+        function render(history, pointer, current, presentation) {
+          var historyKnown = Array.isArray(history)
+          history = history || []
+          text('history-count', historyKnown ? String(history.length) : '—')
+          text('milestone-count', historyKnown ? String(history.filter(function (row) { return row.kind === 'milestone' }).length) : '—')
+          var phases = Array.isArray(presentation.phases) ? presentation.phases : []
+          text('phase-count', phases.length ? String(phases.length) : '—')
+          document.getElementById('evolution-phases').replaceChildren(...phases.map(function (phase) {
+            return node('article', 'evolution-phase', '', [node('span', 'phase-range', phase.range), node('h3', '', phase.title), node('p', '', phase.description)])
+          }))
+          listEl.replaceChildren(...history.map(function (release) {
+            var annotation = (presentation.presentationByVersion || {})[release.version] || {}
+            var versionLine = node('div', 'release-version-line', '', [node('h3', '', 'v' + release.version), node('span', 'release-channel', historicalStatus(release))])
+            var identity = node('div', '', '', [versionLine, node('p', 'release-title', release.title || '版本演进记录')])
+            if (release.channel) identity.appendChild(node('p', 'release-title', '历史记录渠道：' + release.channel))
+            if (Array.isArray(annotation.tags)) identity.appendChild(node('div', 'release-tags', '', annotation.tags.map(function (tag) { return node('span', '', tag) })))
+            var date = node('time', 'release-date', release.date || '日期未知')
+            date.dateTime = release.date || ''
+            var entry = node('article', 'release-entry' + (release.version === current.version ? ' is-current' : '') +
+              (release.kind === 'milestone' ? ' is-milestone' : ''), '', [node('div', 'release-entry__head', '', [identity, date])])
+            entry.setAttribute('data-era', annotation.era || 'foundation')
+            if (annotation.shift) entry.appendChild(node('div', 'release-shift', '', [node('span', '', '能力跃迁'), node('strong', '', annotation.shift)]))
+            entry.appendChild(node('p', 'release-notes-label', '历史变化记录（非实时下载状态）'))
+            entry.appendChild(node('ul', 'release-notes', '', (Array.isArray(release.notes) ? release.notes : []).map(function (note, index) {
+              return node('li', '', '', [node('span', 'note-index', String(index + 1).padStart(2, '0')), node('span', '', String(note))])
+            })))
+            if (Array.isArray(release.platforms) && release.platforms.length) {
+              var platforms = node('div', 'release-platforms', '', release.platforms.map(function (platform) { return node('span', '', platformLabel(platform)) }))
+              platforms.setAttribute('aria-label', '历史记录平台（非当前下载状态）')
+              entry.appendChild(platforms)
+            } else entry.className += ' release-entry--no-platforms'
+            return entry
+          }))
+          if (!historyKnown) listEl.replaceChildren(node('p', 'release-source-note', '版本时间线暂不可用：未能读取发布目录历史投影。'))
+          var selected = history.find(function (release) { return release.version === current.version })
+          text('summary-version', current.version ? 'v' + current.version : '—')
+          text('summary-date', selected && selected.date || '—')
+          var platforms = [['Windows x64', 'win'], ['macOS Apple Silicon', 'mac', 'arm64'], ['macOS Intel', 'mac', 'x64'], ['Android', 'android']]
+          var statuses = platforms.map(function (platform) { return { name: platform[0], result: current.platform(platform[1], platform[2]) } })
+          var available = statuses.filter(function (row) { return row.result.artifact })
+          text('summary-status', available.length ? '清单已校验 ' + available.length + ' 个下载入口' : !current.version ? '版本信息暂不可用' : '当前制品未开放或身份待核验')
+          text('summary-channel', '按平台与制品分别核验')
+          document.getElementById('summary-changes').replaceChildren(...statuses.map(function (row) {
+            return node('li', '', row.name + (row.result.version ? ' v' + row.result.version : '') + '：' + row.result.status + (row.result.artifact ? ' · ' + row.result.channel : '') + (row.result.temporary && row.result.temporary.release && row.result.temporary.release.test_only ? ' · 已知问题与范围：' + row.result.temporary.release.notes.join('；') : ''))
+          }))
+        }
+        function unavailable() {
+          ;['summary-version', 'summary-date', 'summary-channel', 'history-count', 'milestone-count', 'phase-count'].forEach(function (id) { text(id, '—') })
+          text('summary-status', '版本信息暂不可用')
+          document.getElementById('summary-changes').replaceChildren()
+          document.getElementById('evolution-phases').replaceChildren()
+          listEl.replaceChildren(node('p', 'release-source-note', '版本时间线暂不可用：未能读取发布清单；请稍后重试或通过上方链接查看清单。'))
+        }
+        unavailable()
+        Promise.all([fetchJson('/download-release.json'), fetchJson('/download-windows-hotfix.json'), fetchJson('/data/release-presentation.json'), fetchJson('/data/release-history.json')]).then(function (results) {
+          var pointer = results[0]
+          var projection = results[3]
+          var history = projection && projection.schema === 'xcagi.release_history.public/v1' && Array.isArray(projection.release_history) ? releases.history(projection.release_history) : null
+          var url = releases.manifestUrl(pointer)
+          return (url ? fetchJson(url) : Promise.resolve(null)).then(function (manifest) {
+            render(history, pointer, releases.view(pointer, manifest, results[1]), results[2] || {})
+          })
+        }).catch(unavailable)
+      })()
+    </script>
+
+    <div id="xc-corp-butler-root"></div>
+    <link rel="stylesheet" href="/corp-butler/corp-butler.css?v=20261103a" data-xc-corp-butler-css="1" />
+    <script type="module" src="/corp-butler/corp-butler.js?v=20261103a" data-xc-corp-butler-js="1"></script>
+    <script src="/main.js?v=20260723h"></script>
+  </body>
+</html>

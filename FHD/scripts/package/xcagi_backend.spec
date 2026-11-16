@@ -1,0 +1,359 @@
+# -*- mode: python ; coding: utf-8 -*-
+
+import importlib.util
+import json
+import os
+import runpy
+from pathlib import Path
+
+import setuptools
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, collect_submodules
+
+ROOT = Path.cwd().resolve()
+
+
+def add_data(relative_path: str):
+    """Bundle data for PyInstaller.
+
+    Files must use the *parent* as dest (often ``.``). Using the filename as
+    dest creates ``_MEIPASS/<name>/<name>`` and breaks frozen lookups such as
+    ``_MEIPASS/alembic.ini``.
+    """
+    src = ROOT / relative_path
+    if not src.exists():
+        return []
+    if src.is_file():
+        parent = str(Path(relative_path).parent).replace("\\", "/")
+        dest = "." if parent in ("", ".") else parent
+        return [(str(src), dest)]
+    return [(str(src), relative_path)]
+
+
+# Label PDFs embed their own CJK glyphs so readers/printers need no language pack.
+# A partial source export must fail before producing an installer with blank labels.
+for required_resource in (
+    "resources/fonts/NotoSansSC-Regular.ttf",
+    "resources/fonts/OFL-NotoSansSC.txt",
+    "resources/templates/标准发货单.xlsx",
+):
+    if not (ROOT / required_resource).is_file():
+        raise FileNotFoundError(f"missing required label font resource: {required_resource}")
+
+datas = []
+binaries = []
+for item in [
+    "templates/vue-dist",
+    # 桌面企业包刻意不携带 admin-vue-dist（管理端仅网页 SSOT）。
+    "static",
+    "resources",
+    "config",
+    "alembic",
+    ".env.example",
+    "alembic.ini",
+    "scripts/backup",
+    # Chat/planner stream loads these via Path(__file__).with_name(...); PYZ
+    # modules alone leave the sibling JSON missing and return 500.
+    "app/application/agent_orchestrator/tool_spec_data/input_schemas.json",
+    "app/application/agent_orchestrator/tool_spec_data/output_schemas.json",
+    # 意图语义兜底模型（可选；缺失时运行时自动降级为纯规则）。
+    "assets/models/fastembed",
+]:
+    datas.extend(add_data(item))
+
+_bundle_policy = runpy.run_path(str(ROOT / "scripts/package/bundled_mod_policy.py"))
+_staged_mods = _bundle_policy["validated_staged_mods"](
+    (os.environ.get("XCAGI_STAGED_MODS_DIR") or "").strip()
+)
+datas.append((str(_staged_mods), "mods"))
+_sku_file = _staged_mods.parent.parent / "build" / "product-sku.json"
+if _sku_file.is_file():
+    datas.append((str(_sku_file.resolve()), "."))
+
+# PyInstaller flattens vendored Python packages into its signed ``_MEIPASS``
+# runtime tree. Preserve the audited provenance records separately so the
+# boot-time LangGraph source gate can remain fail-closed in packaged apps.
+langgraph_vendor_packages = [
+    "xcagi_langgraph_core",
+    "xcagi_langgraph_prebuilt",
+    "xcagi_langgraph_checkpoint",
+    "xcagi_langgraph_checkpoint_backends/checkpoint-sqlite",
+    "xcagi_langgraph_checkpoint_backends/checkpoint-postgres",
+    "xcagi_langgraph_sdk",
+]
+for package_dir in langgraph_vendor_packages:
+    provenance = ROOT / "packages" / package_dir / "PROVENANCE.json"
+    if not provenance.is_file():
+        raise FileNotFoundError(f"missing LangGraph vendor provenance: {provenance}")
+    datas.append((str(provenance), f"vendored-provenance/{package_dir}"))
+
+_staged_industry = (os.environ.get("XCAGI_STAGED_INDUSTRY_SEEDS_DIR") or "").strip()
+if _staged_industry and Path(_staged_industry).is_dir():
+    datas.append((str(Path(_staged_industry).resolve()), "industry-seeds"))
+
+# PyInstaller pkg_resources hook reads jaraco.text demo data at startup.
+jaraco_text = Path(setuptools.__file__).resolve().parent / "_vendor" / "jaraco" / "text"
+if jaraco_text.is_dir():
+    datas.append((str(jaraco_text), "setuptools/_vendor/jaraco/text"))
+try:
+    datas += collect_data_files("setuptools", include_py_files=False)
+except Exception:
+    pass
+
+hiddenimports = []
+for module in [
+    "appdirs",
+    "app.desktop_runtime",
+    "app.fastapi_app",
+    "app.fastapi_routes",
+    "app.legacy.routes",
+    "app.legacy.lan",
+    "app.db",
+    "app.db.models",
+    "app.middleware",
+    "app.infrastructure.mods",
+    "app.mod_sdk",
+    "app.control",
+    "uvicorn",
+    "fastapi",
+    "sqlalchemy",
+    "alembic",
+]:
+    hiddenimports.extend(collect_submodules(module))
+
+# v10-A: fast-start bootstrap imports these lazily; collect_submodules can miss them
+# on some Windows trees, causing deliverable-status 404 in frozen desktop builds.
+hiddenimports.extend(
+    [
+        "app.fastapi_routes.platform_shell_routes",
+        # 意图语义兜底：懒加载，PyInstaller 静态分析可能漏掉编码器与路由子包。
+        "semantic_router",
+        "semantic_router.encoders",
+        "semantic_router.routers",
+        "fastembed",
+        # Office employee vendor packages are loaded at runtime from mods, so
+        # PyInstaller cannot discover this bridge from static imports alone.
+        "app.application.office_plaintext_generate",
+        "app.mod_sdk.deliverable_status",
+        "app.mod_sdk.desktop_deliverable",
+        "app.mod_sdk.platform_shell",
+        "app.mod_sdk.decoupling_progress",
+        "app.mod_sdk.edition_policy",
+        "app.mod_sdk.edition_bootstrap",
+        "app.mod_sdk.product_skus",
+        "app.fastapi_routes.domains.admin_audit.admin_audit_routes",
+        "app.application.attendance_reference_data",
+        "app.application.chat_business_safety",
+        "app.domain.shared_services.ai_action_audit_service",
+        "app.domain.shared_services.ocr_service",
+        # XCMAX sync registers these appliers through importlib strings. Static
+        # analysis cannot see them, but the installed desktop entitlement API
+        # imports xcmax_sync_service and must have both modules available.
+        "app.domain.shared_services.xcmax_sync_basic_appliers",
+        "app.domain.shared_services.xcmax_sync_extended_appliers",
+        "app.runtime_integrity",
+        # debt19: application/*/ports.py → protocols.py; contracts/ports.py loads these via importlib
+        "app.application.admin_control.protocols",
+        "app.application.aiopen.protocols",
+        "app.application.approval_workspace.protocols",
+        "app.application.customer_service.protocols",
+        "app.application.desktop_relay.protocols",
+        "app.application.employee_tools.protocols",
+        "app.application.group_chat.protocols",
+        "app.application.knowledge.protocols",
+        "app.application.market_bridge.protocols",
+        "app.application.market_llm.protocols",
+        "app.application.mobile_extensions.protocols",
+        "app.application.mod_store.protocols",
+        "app.application.planner_compat.protocols",
+        "app.application.shipment_etl.protocols",
+        "app.application.super_employee.protocols",
+        "app.application.user_memory.protocols",
+    ]
+)
+
+# Mods reach host services through the string-keyed map in
+# app.mod_sdk.host_services, and some routes import modules through
+# importlib literals; PyInstaller's static analysis cannot see either, so the
+# frozen desktop backend answered ModuleNotFoundError at request time (the LAN
+# bridge status route 500ed on macOS and Windows 1.0.0.5). Coverage of this
+# dynamic surface is enforced by
+# tests/test_mod_sdk/test_frozen_dynamic_import_coverage.py.
+hiddenimports.extend(
+    [
+        "app.application.employee_circle_sync",
+        "app.application.user_cs_demand_intake_bridge",
+        "app.domain.shared_services.service_contract_fill",
+        "app.domain.shared_services.user_cs_connected_welcome",
+        "app.domain.shared_services.user_cs_delivery",
+        "app.domain.shared_services.user_cs_enterprise_credentials",
+        "app.domain.shared_services.user_cs_landing_crm",
+        "app.domain.shared_services.user_cs_software_delivery",
+    ]
+)
+
+# The boot-time vendored-source gate imports these modules dynamically from a
+# declarative mapping. PyInstaller cannot infer those imports from string keys,
+# so keep the exact audited runtime surface explicit in the frozen bundle.
+hiddenimports.extend(
+    [
+        "langgraph.graph.state",
+        "langgraph.prebuilt.tool_node",
+        "langgraph.checkpoint.base",
+        "langgraph.checkpoint.sqlite",
+        "langgraph.checkpoint.postgres",
+        "langgraph_sdk.client",
+    ]
+)
+
+# 主聊天“按住说话”是桌面端正式功能，不能把运行时依赖从安装包里排除。
+# faster-whisper 依赖 ctranslate2 + PyAV 的原生扩展；显式收集可避免 PyInstaller
+# 只看到 voice_routes 中的懒导入而漏包，最终在已安装应用里返回 503。
+for module in ["faster_whisper", "ctranslate2", "av", "tokenizers", "huggingface_hub"]:
+    try:
+        hiddenimports.extend(collect_submodules(module))
+    except Exception:
+        pass
+    try:
+        datas.extend(collect_data_files(module, include_py_files=False))
+    except Exception:
+        pass
+for module in ["ctranslate2", "av"]:
+    try:
+        binaries.extend(collect_dynamic_libs(module))
+    except Exception:
+        pass
+
+# 长期记忆：mem0 通过 importlib 字符串加载 LLM/embedder/向量库实现，静态分析
+# 看不到；qdrant-client 本地模式需要随包携带其运行时模块，否则冻结包启动后
+# 长期记忆会静默降级为旧链路。
+for module in ["mem0", "qdrant_client"]:
+    try:
+        hiddenimports.extend(collect_submodules(module))
+    except Exception:
+        pass
+    try:
+        datas.extend(collect_data_files(module, include_py_files=False))
+    except Exception:
+        pass
+
+# Official office employees are dynamically loaded from the bundled MOD pack.
+# Explicitly collect their runtimes so a frozen app has the same Word, Excel,
+# CSV, PDF and presentation capabilities as the checked source tree. pypdf and
+# ReportLab are permissively licensed; do not replace them with the AGPL
+# PyMuPDF/fitz runtime unless a separate commercial license is recorded.
+# xlrd is also required by consent-bound ELT legacy XLS data-test conversion.
+# Reviewed Excel imports this parser lazily when deriving a slice. It is required,
+# so a missing runtime dependency must fail the build rather than skip collection.
+if importlib.util.find_spec("defusedxml") is None:
+    raise ModuleNotFoundError("Required ELT runtime dependency missing: defusedxml")
+hiddenimports.extend(collect_submodules("defusedxml", on_error="raise"))
+for module in ["docx", "openpyxl", "xlrd", "pptx", "xlsxwriter", "pypdf", "reportlab"]:
+    try:
+        hiddenimports.extend(collect_submodules(module))
+    except Exception:
+        pass
+    try:
+        datas.extend(collect_data_files(module, include_py_files=False))
+    except Exception:
+        pass
+# de-dupe while preserving order
+_seen = set()
+_deduped = []
+for _name in hiddenimports:
+    if _name not in _seen:
+        _seen.add(_name)
+        _deduped.append(_name)
+hiddenimports = _deduped
+
+desktop_excludes = [
+    "altair",
+    "bitsandbytes",
+    "IPython",
+    "black",
+    "bokeh",
+    "chromadb",
+    "cv2",
+    "dash",
+    "datasets",
+    "gradio",
+    "grpc",
+    "h5py",
+    "jedi",
+    "keyring",
+    "langchain",
+    "librosa",
+    "lightgbm",
+    "llvmlite",
+    "matplotlib",
+    "mypy",
+    "nbformat",
+    "numba",
+    "onnxruntime",
+    "OpenGL",
+    "patsy",
+    "plotly",
+    "playwright",
+    "prophet",
+    "pygame",
+    "pyarrow",
+    "pypdfium2",
+    "pytest",
+    "scipy",
+    "selenium",
+    "skimage",
+    "sklearn",
+    "soundfile",
+    "statsmodels",
+    "tensorflow",
+    "tensorflow_cpu",
+    "tests",
+    "timm",
+    "tkinter",
+    "torch",
+    "torchaudio",
+    "torchvision",
+    "transformers",
+    "yapf",
+]
+
+a = Analysis(
+    [str(ROOT / "XCAGI" / "run_fastapi.py")],
+    pathex=[str(ROOT), str(ROOT / "XCAGI")],
+    binaries=binaries,
+    datas=datas,
+    hiddenimports=hiddenimports,
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=desktop_excludes,
+    noarchive=False,
+)
+pyz = PYZ(a.pure)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name="xcagi-backend",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=os.environ.get("XCAGI_PYINSTALLER_UPX", "").strip().lower() in {"1", "true", "yes", "on"},
+    console=False,
+    disable_windowed_traceback=True,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=os.environ.get("XCAGI_PYINSTALLER_UPX", "").strip().lower() in {"1", "true", "yes", "on"},
+    upx_exclude=[],
+    name="xcagi-backend",
+)

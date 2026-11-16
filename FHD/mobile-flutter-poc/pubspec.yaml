@@ -1,0 +1,42 @@
+name: xcagi_flutter_poc
+description: XCAGI mobile client for iOS and Android (Flutter).
+publish_to: "none"
+version: 1.0.0+10
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+
+dependencies:
+  camera: ^0.12.0+1
+  flutter:
+    sdk: flutter
+  google_mlkit_barcode_scanning: ^0.14.2
+  image_picker: ^1.2.2
+  speech_to_text: ^7.4.0
+  package_info_plus: ^8.3.0
+  path_provider: ^2.1.5
+  shared_preferences: ^2.5.1
+  url_launcher: ^6.3.2
+  web_socket_channel: ^3.0.2
+  webview_flutter: ^4.14.0
+  drift: ^2.35.4
+  path: ^1.9.1
+  drift_flutter: ^0.3.1
+  flutter_chat_ui: ^2.12.0
+  flutter_chat_core: ^2.9.1
+  material_symbols_icons: ^4.2960.0
+  lpinyin: ^2.0.3
+  cryptography: ^2.9.0
+  flutter_tts: ^4.2.5
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/avatars/
+    - assets/brand/
+    - android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png

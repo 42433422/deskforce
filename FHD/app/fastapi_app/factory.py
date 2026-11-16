@@ -1,0 +1,263 @@
+"""FastAPI 应用工厂：装配中间件、路由、静态资源与 SPA fallback。"""
+
+from __future__ import annotations
+
+import inspect
+import logging
+import os
+import threading
+from contextlib import ExitStack
+from typing import TYPE_CHECKING
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.config import Config, get_config
+from app.infrastructure.mods.mod_auth import ModContextMiddleware
+from app.middleware.auth_rate_limit import AuthRateLimitMiddleware
+from app.middleware.csrf import CSRFMiddleware
+from app.middleware.customer_mod_scope import CustomerModScopeMiddleware
+from app.middleware.global_rate_limit import GlobalRateLimitMiddleware
+from app.middleware.industry_context import IndustryContextMiddleware
+from app.middleware.security_headers import SecurityHeadersMiddleware
+from app.middleware.xss_sanitizer import XSSSanitizerMiddleware
+from app.security import LanCidrGuard, LanLicenseGuard
+from app.utils.operational_errors import RECOVERABLE_ERRORS
+
+from .cors import (
+    lan_origin_regex_enabled,
+    resolve_cors_allow_origin_regex,
+    resolve_cors_allow_origins,
+)
+from .lifespan import lifespan
+from .middleware_extra import register_extra_middleware, register_prometheus_metrics
+from .openapi_enrichment import install_openapi_enrichment
+
+
+def _desktop_fast_start_enabled() -> bool:
+    raw = os.environ.get("XCAGI_DESKTOP_FAST_START", "1").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+from .static_mounts import (
+    mount_admin_console_static,
+    mount_vue_dist_assets_dir,
+    mount_vue_dist_public_static,
+    mount_xcmax_dashboard_static,
+)
+
+if TYPE_CHECKING:
+    from .guarded_catalog import CatalogAdmission
+
+logger = logging.getLogger(__name__)
+
+
+def create_fastapi_app(
+    config_object: type[Config] | None = None,
+    enable_cors: bool = True,
+    enable_docs: bool = True,
+) -> FastAPI:
+    from .guarded_catalog import admit, release
+
+    config_object = config_object or get_config("default")
+    admission = admit(config_object, _app_singleton)
+    with ExitStack() as rollback:
+        rollback.callback(release, admission)
+        app = _create_fastapi_app(config_object, enable_cors, enable_docs, admission)
+        rollback.pop_all()
+        return app
+
+
+def _create_fastapi_app(
+    config_object: type[Config] | None,
+    enable_cors: bool,
+    enable_docs: bool,
+    admission: CatalogAdmission | None,
+) -> FastAPI:
+    global _app_singleton
+    if config_object is None:
+        config_object = get_config("default")
+
+    from app.mod_sdk.edition_policy import configure_edition_defaults
+
+    configure_edition_defaults(
+        desktop=getattr(config_object, "DESKTOP_MODE", False)
+        or (os.environ.get("XCAGI_DESKTOP_MODE") or "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+
+    from app.infrastructure.cache.wiring import wire_cache_port
+
+    wire_cache_port()
+
+    from app.infrastructure.persona.conversation_wiring import wire_conversation_persona
+
+    wire_conversation_persona()
+
+    if not getattr(config_object, "SECRET_KEY", None):
+        is_debug = getattr(config_object, "DEBUG", False)
+        is_desktop = getattr(config_object, "DESKTOP_MODE", False)
+        if not is_debug and not is_desktop:
+            raise RuntimeError(
+                "SECRET_KEY must be set in production. "
+                "Set the SECRET_KEY environment variable or use DevelopmentConfig for local development."
+            )
+
+    app = FastAPI(
+        title="XCAGI FastAPI",
+        description="XCAGI 企业 AI 员工平台 - FastAPI 版本",
+        version="1.0.0.7",
+        docs_url="/docs" if enable_docs else None,
+        redoc_url="/redoc" if enable_docs else None,
+        lifespan=lifespan,
+    )
+
+    app.state.config = config_object
+    app.state.catalog_admission = admission
+
+    from .guarded_catalog import CatalogAdmissionMiddleware
+
+    app.add_middleware(SecurityHeadersMiddleware)
+    app.add_middleware(CSRFMiddleware)
+    app.add_middleware(XSSSanitizerMiddleware)
+
+    if enable_cors:
+        _cors_regex = resolve_cors_allow_origin_regex()
+        _cors_kw: dict = {
+            "allow_origins": resolve_cors_allow_origins(),
+            "allow_credentials": True,
+            "allow_methods": ["*"],
+            "allow_headers": ["*"],
+            "expose_headers": ["*"],
+        }
+        if _cors_regex:
+            _cors_kw["allow_origin_regex"] = _cors_regex
+        if (
+            lan_origin_regex_enabled()
+            and "allow_private_network" in inspect.signature(CORSMiddleware).parameters
+        ):
+            _cors_kw["allow_private_network"] = True
+        app.add_middleware(CORSMiddleware, **_cors_kw)
+
+    app.add_middleware(ModContextMiddleware)
+    # 客户定制 Mod 的接口隔离：注册在 ModContext 之前生效（后注册者更外层），
+    # 使未授权的定制路由在进入 Mod 上下文与业务路由之前就被拒绝。
+    app.add_middleware(CustomerModScopeMiddleware)
+    app.add_middleware(IndustryContextMiddleware)
+    app.add_middleware(LanLicenseGuard)
+    app.add_middleware(LanCidrGuard)
+    app.add_middleware(GlobalRateLimitMiddleware)
+    app.add_middleware(AuthRateLimitMiddleware)
+
+    from app.middleware.desktop_admin_gate import DesktopAdminForbiddenMiddleware
+
+    app.add_middleware(DesktopAdminForbiddenMiddleware)
+
+    logging.basicConfig(
+        level=getattr(config_object, "LOG_LEVEL", "INFO"),
+        format=getattr(
+            config_object, "LOG_FORMAT", "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        ),
+    )
+
+    if admission is None and _desktop_fast_start_enabled():
+        from app.fastapi_routes import register_bootstrap_routes
+
+        register_bootstrap_routes(app)
+        app.state.deferred_routes_pending = True
+    else:
+        from app.fastapi_routes import register_all_routes
+
+        register_all_routes(app)
+
+    from app.middleware.error_handler import register_exception_handlers
+
+    register_exception_handlers(app)
+
+    try:
+        from app.infrastructure.mods.manifest import host_xcagi_version
+        from app.utils.metrics import init_metrics
+
+        init_metrics("XCAGI", os.environ.get("XCAGI_VERSION") or host_xcagi_version())
+    except RECOVERABLE_ERRORS as e:
+        logger.warning("Prometheus init_metrics skipped: %s", e)
+
+    register_extra_middleware(app)
+    register_prometheus_metrics(app)
+
+    try:
+        from app.fastapi_app.mod_startup import bootstrap_mod_extensions_sync
+
+        if admission is not None:
+            # Existing-source admission never installs/repairs Mods at startup.
+            pass
+        elif _desktop_fast_start_enabled():
+            app.state.mods_deferred_bootstrap = True
+        else:
+            # Register the staged routes now, but do not let the background
+            # worker mutate ``app.routes`` while the factory is still adding
+            # static mounts, aliases, and the SPA fallback below.
+            bootstrap_mod_extensions_sync(app, schedule_background=False)
+    except RECOVERABLE_ERRORS as e:
+        logger.warning("Mod extensions staged load failed (lifespan may retry): %s", e)
+
+    mount_xcmax_dashboard_static(app)
+    mount_admin_console_static(app)
+    mount_vue_dist_public_static(app)
+    mount_vue_dist_assets_dir(app)
+
+    try:
+        from app.fastapi_routes.spa_fallback import register_spa_history_fallback
+
+        register_spa_history_fallback(app)
+        logger.info("Registered Vue history fallback (/{fallback:path}) as the last route")
+    except RECOVERABLE_ERRORS as e:
+        logger.exception("Failed to register SPA history fallback: %s", e)
+        raise
+
+    # Apply documentation normalization only after every route has been
+    # registered. Runtime slash aliases stay available, while duplicate schema
+    # entries are hidden and every documented operation receives complete
+    # tags, description and a 2xx response schema.
+    from app.legacy.routes.openapi_route_compat import hide_trailing_slash_openapi_duplicates
+
+    hide_trailing_slash_openapi_duplicates(app)
+    install_openapi_enrichment(app)
+
+    if (
+        admission is None
+        and not _desktop_fast_start_enabled()
+        and not getattr(app.state, "mods_full_load_done", False)
+    ):
+        from app.fastapi_app.mod_startup import schedule_background_mod_load
+
+        schedule_background_mod_load(app)
+
+    # ``create_fastapi_app`` is also called directly by the desktop runner.  Keep
+    # that serving instance as the process singleton so later login/entitlement
+    # callbacks mount dynamic MOD routes on the app that is actually listening.
+    # Previously ``get_fastapi_app()`` created a second, invisible FastAPI app.
+    # Last registered is outermost: reject stale/unready admission before Mod,
+    # industry or authentication middleware can read or refresh session state.
+    # Request id sits just inside admission so every accepted request is traceable
+    # and CatalogAdmissionMiddleware remains user_middleware[0].
+    from app.middleware.request_id import RequestIdMiddleware
+
+    app.add_middleware(RequestIdMiddleware)
+    app.add_middleware(CatalogAdmissionMiddleware, admission=admission)
+    _app_singleton = app
+    return app
+
+
+_app_singleton: FastAPI | None = None
+_app_singleton_lock = threading.Lock()
+
+
+def get_fastapi_app() -> FastAPI:
+    """进程内单例 FastAPI 实例（线程安全，双重检查锁）。"""
+    global _app_singleton
+    if _app_singleton is None:
+        with _app_singleton_lock:
+            if _app_singleton is None:
+                _app_singleton = create_fastapi_app()
+    return _app_singleton

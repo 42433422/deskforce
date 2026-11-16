@@ -1,0 +1,13 @@
+node_modules/
+dist/
+*.log
+# tsc 编译产物（main.js / updater.js / preload.js）由 build 时生成，不入仓
+/main.js
+/updater.js
+/preload.js
+/coverage/
+/.vitest-cache/
+# build-installer.sh 生成的临时 electron-builder 配置，构建后即删除，不入仓
+/.electron-builder.release.yml
+# Playwright-Electron E2E 运行产物
+/test-results/

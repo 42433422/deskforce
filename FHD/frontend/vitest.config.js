@@ -1,0 +1,83 @@
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { defineConfig } from 'vitest/config'
+import vue from '@vitejs/plugin-vue'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+
+export default defineConfig({
+  plugins: [vue()],
+  resolve: {
+    alias: [
+      { find: '@host', replacement: path.resolve(__dirname, './src') },
+      { find: '@/utils/dutyRosterEmployeeList', replacement: path.resolve(__dirname, '../admin-console/src/utils/dutyRosterEmployeeList.ts') },
+      { find: '@/utils/automationPolicyLines', replacement: path.resolve(__dirname, '../admin-console/src/utils/automationPolicyLines.ts') },
+      { find: '@/utils/marketOverviewMetrics', replacement: path.resolve(__dirname, '../admin-console/src/utils/marketOverviewMetrics.ts') },
+      { find: '@/api/xcmaxOps', replacement: path.resolve(__dirname, '../admin-console/src/api/xcmaxOps.ts') },
+      { find: '@/constants/personnelModApi', replacement: path.resolve(__dirname, '../admin-console/src/constants/personnelModApi.ts') },
+      {
+        find: '@/data/workflow-employee-docs.json',
+        replacement: path.resolve(__dirname, './src/data/workflow-employee-docs.json'),
+      },
+      {
+        find: '@/data/workflow-employees.json',
+        replacement: path.resolve(__dirname, './src/data/workflow-employees.json'),
+      },
+      {
+        find: '@admin-console-inject/adminHostRoutes',
+        replacement: path.resolve(__dirname, './src/router/adminHostRoutes.stub.ts'),
+      },
+      {
+        find: '@mod-views/xcagi-planner-bridge/ChatView.vue',
+        replacement: path.resolve(__dirname, './src/test-stubs/ModChatViewStub.vue'),
+      },
+      {
+        find: '@admin-console-inject/views/DutyRosterGraphView.vue',
+        replacement: path.resolve(__dirname, './src/views/adminDutyRosterGraphView.stub.vue'),
+      },
+      { find: '@', replacement: path.resolve(__dirname, './src') },
+      // Real Mod views live outside frontend/src, matching production Vite resolution.
+      { find: 'vue-router', replacement: path.resolve(__dirname, 'node_modules/vue-router') },
+      { find: 'pinia', replacement: path.resolve(__dirname, 'node_modules/pinia') },
+    ],
+    dedupe: ['vue', 'vue-router', 'pinia'],
+  },
+  test: {
+    setupFiles: ['./vitest.setup.ts'],
+    globals: true,
+    environment: 'jsdom',
+    testTimeout: 30_000,
+    include: ['src/**/*.test.js', 'src/**/*.test.ts', 'tests/**/*.test.js', 'tests/**/*.test.ts', 'tests/smoke/**/*.test.js'],
+    exclude: [
+      '**/node_modules/**',
+      '**/dist/**',
+      // ChatView 已薄 shim 至 Mod；原 pro-task-status 用例待迁到 mod 或 useChatView 单测
+      'src/views/ChatView.proTaskStatus.test.js',
+    ],
+    coverage: {
+      provider: 'v8',
+      reporter: ['text', 'json', 'json-summary', 'html'],
+      // 铁律1：全量口径 src/**，禁止再用窄 include 凑数（2026-06-14）。
+      // 覆盖率提升只能靠补测，不得靠缩小统计范围。
+      include: ['src/**/*.{ts,js,vue}'],
+      exclude: [
+        'src/**/*.test.{js,ts}',
+        'src/**/*.spec.{js,ts}',
+        'src/**/*.d.ts',
+        'src/**/__tests__/**',
+        'src/test-stubs/**',
+        'src/main.ts',
+        'src/**/*.worker.ts',
+        'src/i18n/locales/**',
+      ],
+      // floor 与 metrics/coverage_ratchet_baseline.json 同步，由
+      // scripts/dev/coverage_ratchet.py 维护，只升不降。
+      thresholds: {
+        lines: 92,
+        branches: 81,
+        functions: 90,
+        statements: 92,
+      },
+    },
+  },
+})

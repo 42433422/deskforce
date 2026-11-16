@@ -1,0 +1,127 @@
+{
+  "id": "excel-generate-employee",
+  "name": "Excel 生成员",
+  "version": "1.0.0",
+  "author": "XCAGI",
+  "description": "Excel生成员工：JSON 为中介，上传 .json（含 sheets 或 columns/rows，兼容 Excel 读取员 workbook.json）写出 outputs/output.xlsx，使用 direct_python，禁止编造表格数据",
+  "artifact": "employee_pack",
+  "scope": "global",
+  "dependencies": {
+    "xcagi": ">=1.0.0"
+  },
+  "employee": {
+    "id": "excel-generate-employee",
+    "label": "Excel 生成员",
+    "capabilities": [
+      "data.json_read",
+      "excel.write"
+    ]
+  },
+  "workflow_employees": [
+    {
+      "id": "excel-generate-employee",
+      "label": "Excel 生成员",
+      "panel_title": "Excel 生成员",
+      "panel_summary": "上传 JSON，按 sheets 写出 outputs/output.xlsx。",
+      "capabilities": [
+        "data.json_read",
+        "excel.write"
+      ],
+      "api_base_path": "employees/excel-generate-employee",
+      "entry_action": "run"
+    }
+  ],
+  "backend": {
+    "entry": "blueprints",
+    "init": "mod_init"
+  },
+  "employee_config_v2": {
+    "identity": {
+      "id": "excel-generate-employee",
+      "version": "1.0.0",
+      "artifact": "employee_pack",
+      "name": "Excel 生成员",
+      "description": "Excel生成员工：JSON 为中介，上传 .json（含 sheets 或 columns/rows，兼容 Excel 读取员 workbook.json）写出 outputs/output.xlsx，使用 direct_python，禁止编造表格数据"
+    },
+    "perception": {
+      "type": "json",
+      "accepted_extensions": [
+        ".json",
+        ".txt"
+      ]
+    },
+    "memory": {
+      "type": "session"
+    },
+    "cognition": {
+      "agent": {
+        "system_prompt": "你是Excel 生成员。你负责根据 JSON（sheets/columns/rows，兼容 Excel 读取员 workbook.json）写出 outputs/output.xlsx。JSON 为中介；必须真实执行 direct_python，禁止编造表格内容。",
+        "role": {
+          "name": "Excel 生成员",
+          "persona": "严谨的 Excel 生成员工",
+          "tone": "professional",
+          "expertise": [
+            "JSON 解析",
+            "Excel 写出",
+            "多 sheet"
+          ]
+        },
+        "behavior_rules": [
+          "必须根据 JSON sheets/rows 写出 xlsx。",
+          "成功必须以写出 output.xlsx 为准。"
+        ],
+        "few_shot_examples": [],
+        "model": {
+          "provider": "auto",
+          "model_name": "auto",
+          "temperature": 0.1,
+          "max_tokens": 2000,
+          "top_p": 0.9
+        }
+      },
+      "skills": [
+        {
+          "name": "excel.write",
+          "brief": "JSON 中介 → 写出 output.xlsx。"
+        }
+      ]
+    },
+    "collaboration": {
+      "workflow": {
+        "workflow_id": 0,
+        "name": "Excel 生成员"
+      }
+    },
+    "actions": {
+      "handlers": [
+        "direct_python"
+      ],
+      "direct_python": {
+        "module": "excel_generate_employee",
+        "action": "convert",
+        "default_output_relpath": "outputs/output.xlsx",
+        "default_template_relpath": "",
+        "default_use_personnel_roster": false
+      }
+    }
+  },
+  "metadata": {
+    "framework_version": "2.0.0",
+    "created_by": "asset_pipeline",
+    "legacy_manual_dev": true,
+    "migration_status": "candidate_for_auto_generation",
+    "migration_note": "人工开发的 mod，已纳入进化状态退役计划。新 mod 应通过 generate_mod_from_description.py 自动生成；本 mod 在自动生成器覆盖其 direct_python 能力后将标记 deprecated。"
+  },
+  "actions": {
+    "handlers": [
+      "direct_python"
+    ],
+    "direct_python": {
+      "module": "excel_generate_employee",
+      "action": "convert",
+      "default_output_relpath": "outputs/output.xlsx",
+      "default_template_relpath": "",
+      "default_use_personnel_roster": false
+    }
+  }
+}

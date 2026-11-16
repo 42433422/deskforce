@@ -1,0 +1,155 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { flushPromises, mount } from '@vue/test-utils'
+import { createHash } from 'node:crypto'
+import ApprovalHubView from '../../../admin-console/src/views/ApprovalHubView.vue'
+
+const fetchOwnerWorkOrders = vi.fn()
+const decideOwnerWorkOrder = vi.fn()
+const fetchCustomerTicket = vi.fn()
+const appAlert = vi.fn().mockResolvedValue(undefined)
+const appPrompt = vi.fn().mockResolvedValue('已复核证据')
+
+vi.mock('@/api/xcmaxAdmin', () => ({
+  xcmaxAdminApi: {
+    fetchOwnerWorkOrders: (...args: unknown[]) => fetchOwnerWorkOrders(...args),
+    decideOwnerWorkOrder: (...args: unknown[]) => decideOwnerWorkOrder(...args),
+    fetchCustomerTicket: (...args: unknown[]) => fetchCustomerTicket(...args),
+  },
+}))
+
+vi.mock('@/utils/appDialog', () => ({
+  appAlert: (...args: unknown[]) => appAlert(...args),
+  appPrompt: (...args: unknown[]) => appPrompt(...args),
+}))
+
+const lockedOrder = {
+  wo_id: 'WO-20260926-0001',
+  status: 'in_dev',
+  reason: '客户无法提交产品问题工单',
+  context: {
+    customer_user_id: 'xcagi-enterprise-demo',
+    client_instance_id: 'test-client-01',
+    product_version: '1.0.0.5',
+    git_sha: 'a'.repeat(40),
+    platform: 'macOS',
+    expected: '创建工单并上传支持包',
+    actual: '没有工单编号和支持包摘要',
+  },
+  gates: { repro: 'RED' },
+  can_decide: false,
+}
+
+const readyOrder = {
+  ...lockedOrder,
+  wo_id: 'WO-20260926-0002',
+  gates: { repro: 'RED', fix: 'FIX_VALIDATED_IN_DEV', owner_instance: 'OWNER_INSTANCE_VERIFIED' },
+  can_decide: true,
+}
+
+describe('ApprovalHubView', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    fetchOwnerWorkOrders.mockResolvedValue({ ok: true, count: 1, items: [lockedOrder] })
+    decideOwnerWorkOrder.mockResolvedValue({
+      ok: true,
+      wo_id: readyOrder.wo_id,
+      decision: 'approved',
+      actor: 'owner:42',
+    })
+  })
+
+  it('shows customer and evidence context while keeping incomplete work orders locked', async () => {
+    const wrapper = mount(ApprovalHubView)
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('产品问题工单审批')
+    expect(wrapper.text()).toContain(lockedOrder.wo_id)
+    expect(wrapper.text()).toContain('xcagi-enterprise-demo')
+    expect(wrapper.text()).toContain('客户无法提交产品问题工单')
+    expect(wrapper.text()).toContain('决策锁定')
+    expect(wrapper.findAll('.drawer-actions')).toHaveLength(0)
+    expect(fetchOwnerWorkOrders).toHaveBeenCalledOnce()
+    wrapper.unmount()
+  })
+
+  it('records an Owner decision only when all required receipts unlock the order', async () => {
+    fetchOwnerWorkOrders.mockResolvedValue({ ok: true, count: 1, items: [readyOrder] })
+    const wrapper = mount(ApprovalHubView)
+    await flushPromises()
+
+    await wrapper.find('.btn-primary').trigger('click')
+    await flushPromises()
+
+    expect(decideOwnerWorkOrder).toHaveBeenCalledWith(readyOrder.wo_id, 'approved', '')
+    expect(appAlert).toHaveBeenCalledWith(
+      `工单 ${readyOrder.wo_id} 已记录为 approved，操作人 owner:42`,
+    )
+    wrapper.unmount()
+  })
+
+  it('asks for a reason on non-approval decisions and reports refresh errors', async () => {
+    fetchOwnerWorkOrders
+      .mockResolvedValueOnce({ ok: true, count: 1, items: [readyOrder] })
+      .mockRejectedValueOnce(new Error('service unavailable'))
+    const wrapper = mount(ApprovalHubView)
+    await flushPromises()
+
+    await wrapper.find('.work-order .btn-secondary').trigger('click')
+    await flushPromises()
+    expect(appPrompt).toHaveBeenCalledWith('暂缓说明（可选）', '')
+    expect(decideOwnerWorkOrder).toHaveBeenCalledWith(readyOrder.wo_id, 'held', '已复核证据')
+    expect(wrapper.text()).toContain('工单刷新失败：service unavailable')
+
+    wrapper.unmount()
+  })
+
+  it('builds the customer ticket timeline and downloads the bundle only after its SHA256 matches', async () => {
+    const bytes = new TextEncoder().encode('PK redacted support bundle')
+    const sha = createHash('sha256').update(bytes).digest('hex')
+    const order = {
+      ...lockedOrder,
+      history: [
+        { event: 'gate', at: '2026-10-06T10:02:00+00:00', ref: { gate: 'evidence', gate_status: 'COLLECTED', evidence: { support_bundle_sha256: sha } } },
+        { event: 'transition', from: 'candidate', to: 'routed', at: '2026-10-06T10:01:00+00:00', ref: { customer_ticket_id: 41 } },
+      ],
+    }
+    const ticket = { ticket_no: 'CI41', status: 'processing', lifecycle_label: '处理中', evidence: { support_bundle_base64: btoa(String.fromCharCode(...bytes)), support_bundle_sha256: sha } }
+    fetchOwnerWorkOrders.mockResolvedValue({ ok: true, count: 1, items: [order] })
+    fetchCustomerTicket.mockResolvedValue({ ticket, execution_overview: { blocker: 'execution_pending', responsible: { label: '真实员工' }, next_step: { label: '查询原任务结果' }, receipts: [{ role: 'fix', task_id: 'real-task', accepted: true, completed: false, state: 'pending' }] }, audit_logs: [{ event_type: 'customer_issue_reopen', created_at: '2026-10-06T10:05:00', detail: { note: '导出还是报错' } }] })
+    const createObjectURL = vi.fn(() => 'blob:bundle')
+    Object.assign(URL, { createObjectURL, revokeObjectURL: vi.fn() })
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined)
+    const wrapper = mount(ApprovalHubView)
+    await flushPromises()
+
+    await wrapper.get('.ticket-trail .btn-secondary').trigger('click')
+    await flushPromises()
+    expect(fetchCustomerTicket).toHaveBeenCalledWith(41)
+    expect(wrapper.findAll('.timeline li').map((row) => row.text().replace(/^.*?(?=工单|闸门|客户)/, ''))).toEqual([
+      '工单状态 candidate → routed', '闸门 evidence：COLLECTED', '客户重新打开工单：导出还是报错',
+    ])
+    expect(wrapper.text()).toContain('CI41 · 处理中')
+    expect(wrapper.text()).not.toContain('（processing）')
+    expect(wrapper.get('[aria-label="审批后实际执行进度"]').text()).toContain('real-task · 派发已受理 · 领取：未提供独立领取凭证 · 执行：待执行')
+    expect(wrapper.text()).not.toContain('已真实接单')
+    await wrapper.findAll('.ticket-trail .btn-secondary')[1].trigger('click')
+    await vi.waitFor(() => expect(createObjectURL).toHaveBeenCalledOnce())
+    expect(click).toHaveBeenCalledOnce()
+
+    fetchCustomerTicket.mockResolvedValue({ ticket: { ...ticket, evidence: { ...ticket.evidence, support_bundle_sha256: '0'.repeat(64) } }, audit_logs: [] })
+    await wrapper.get('.ticket-trail .btn-secondary').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('[aria-label="审批后实际执行进度"]').exists()).toBe(false)
+    expect(wrapper.text()).toContain('未返回执行证据')
+    await wrapper.findAll('.ticket-trail .btn-secondary')[1].trigger('click')
+    await vi.waitFor(() => expect(wrapper.find('.ticket-trail .banner-error').text()).toContain('SHA256 校验失败'))
+    expect(createObjectURL).toHaveBeenCalledOnce()
+    fetchCustomerTicket.mockResolvedValue({ ticket, execution_overview: { receipts: [{ role: 'fix', task_id: 'real-task', accepted: true, completed: true, state: 'completed' }] } })
+    await wrapper.get('.header-actions button').trigger('click'); await flushPromises()
+    expect(fetchCustomerTicket).toHaveBeenCalledTimes(3)
+    expect(wrapper.get('[aria-label="审批后实际执行进度"]').text()).toContain('任务结果已返回')
+    expect(wrapper.text()).toContain('未提供独立领取凭证')
+    click.mockRestore()
+    wrapper.unmount()
+  })
+})

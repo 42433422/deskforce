@@ -1,0 +1,83 @@
+import type { WorkflowEmployeeRegistryEntry, WorkflowEmployeeRegistryV1 } from '@/types/workflow-employee'
+import {
+  buildModWorkflowPanelMeta,
+  isNonWorkflowDeskEmployeeId,
+  filterWorkflowRegistrySourceMods,
+  type ModWithWorkflowEmployees,
+} from '@/utils/modWorkflowEmployees'
+
+let cachedRegistry: Promise<WorkflowEmployeeRegistryV1> | null = null
+
+/** 宿主不再内置员工行；注册表由已安装 Mod 的 manifest 注入。 */
+export async function loadWorkflowEmployeeRegistry(): Promise<WorkflowEmployeeRegistryV1> {
+  return { schemaVersion: 1, employees: [] }
+}
+
+export function invalidateWorkflowEmployeeRegistryCache(): void {
+  cachedRegistry = null
+}
+
+export async function loadWorkflowEmployeeRegistryCached(): Promise<WorkflowEmployeeRegistryV1> {
+  if (!cachedRegistry) {
+    cachedRegistry = loadWorkflowEmployeeRegistry()
+  }
+  return cachedRegistry
+}
+
+export function mergeModManifestEntries(
+  registry: WorkflowEmployeeRegistryV1,
+  mods: ModWithWorkflowEmployees[],
+): WorkflowEmployeeRegistryEntry[] {
+  const baseMap = new Map(registry.employees.filter((e) => !isNonWorkflowDeskEmployeeId(e.id)).map((e) => [e.id, e]))
+  const modMeta = buildModWorkflowPanelMeta(filterWorkflowRegistrySourceMods(mods))
+
+  for (const m of filterWorkflowRegistrySourceMods(mods)) {
+    const declaringModId = String(m.id || '').trim()
+    for (const e of m.workflow_employees || []) {
+      const id = String(e?.id || '').trim()
+      if (!id || isNonWorkflowDeskEmployeeId(id)) continue
+      const explicitHost = String(e.host_mod_id || e.enterprise_mod_id || '').trim()
+      const resolvedHost = explicitHost || declaringModId
+      if (baseMap.has(id)) {
+        const cur = baseMap.get(id)!
+        if (!cur.carrierModId && declaringModId) cur.carrierModId = declaringModId
+        if (!cur.hostModId && resolvedHost) cur.hostModId = resolvedHost
+        continue
+      }
+      const meta = modMeta[id]
+      const t = (meta?.title || '').replace(/^工作流 ·\s*/, '').trim()
+      baseMap.set(id, {
+        id,
+        label: t || String(e.label || '').trim() || id,
+        kind: 'mod_extension',
+        order: 100 + baseMap.size,
+        source: 'mod_manifest',
+        carrierModId: declaringModId || undefined,
+        hostModId: resolvedHost || undefined,
+      })
+    }
+  }
+
+  for (const [id, meta] of Object.entries(modMeta)) {
+    if (isNonWorkflowDeskEmployeeId(id)) continue
+    if (baseMap.has(id)) continue
+    const t = (meta.title || '').replace(/^工作流 ·\s*/, '').trim()
+    baseMap.set(id, {
+      id,
+      label: t || id,
+      kind: 'mod_extension',
+      order: 100 + baseMap.size,
+      source: 'mod_manifest',
+    })
+  }
+
+  return Array.from(baseMap.values()).sort((a, b) => a.order - b.order)
+}
+
+export function resolveLabel(entry: WorkflowEmployeeRegistryEntry, i18nResolver?: (key: string) => string): string {
+  if (entry.labelI18nKey && i18nResolver) {
+    const resolved = i18nResolver(entry.labelI18nKey)
+    if (resolved && resolved !== entry.labelI18nKey) return resolved
+  }
+  return entry.label
+}

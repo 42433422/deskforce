@@ -1,0 +1,339 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any, cast
+
+from app.application.agent_orchestrator.execution_lease import DurableExecutionLeaseMixin
+from app.application.agent_orchestrator.run_models import AgentRun, utc_now_iso
+from app.application.agent_orchestrator.runtime_context import merge_runtime_context
+
+
+def requires_retry_reconciliation(run: AgentRun) -> bool:
+    recovery = run.metadata.get("recovery")
+    return bool(run.metadata.get("non_retryable")) or (
+        isinstance(recovery, dict) and recovery.get("state") == "manual_reconciliation_required"
+    )
+
+
+class RunLifecycleMixin(DurableExecutionLeaseMixin):
+    """Cooperative pause, resume, and cancellation for an agent orchestrator."""
+
+    if TYPE_CHECKING:
+        plan_from_snapshot: Any
+        start_run: Any
+        start_task_from_plan: Any
+
+    _repo: Any
+
+    def _persist_control(
+        self, expected: AgentRun, control: str, *, requested_by: str, command_id: str
+    ) -> AgentRun | None:
+        """Rebase control changes on the latest same-generation audit snapshot."""
+        import copy
+
+        from app.application.agent_orchestrator.run_sql_repository import same_run_generation
+
+        for _attempt in range(8):
+            previous = self._repo.get(expected.run_id)
+            if previous is None:
+                return None
+            if not same_run_generation(previous, expected):
+                return cast("AgentRun", previous)
+            if previous.status in {"completed", "failed", "cancelled", "rejected"}:
+                return cast("AgentRun", previous)
+            run = copy.deepcopy(previous)
+            self._mark_controlled(run, control, requested_by=requested_by, command_id=command_id)
+            if control == "pause":
+                run.metadata["control"]["resume_status"] = (
+                    "waiting_user" if previous.status == "waiting_user" else "running"
+                )
+            if self._repo.save_control_if_unchanged(run, previous):
+                return cast("AgentRun", self._repo.get(run.run_id))
+        raise RuntimeError("agent run changed repeatedly while recording control")
+
+    def pause_run(self, run_id: str, *, requested_by: str = "") -> AgentRun | None:
+        run = self._repo.get(run_id)
+        if run is None:
+            return None
+        if run.status in {"completed", "failed", "cancelled"}:
+            return cast("AgentRun | None", run)
+        command = self._repo.request_task_control(run_id, "pause", requested_by=requested_by)
+        execution = run.metadata.get("execution")
+        execution_active = isinstance(execution, dict) and execution.get("state") == "active"
+        if execution_active:
+            run.metadata["control_request"] = {
+                "action": "pause",
+                "status": "requested",
+                "requested_by": requested_by,
+                "command_id": command.command_id,
+            }
+            return cast("AgentRun | None", run)
+        stored = self._persist_control(
+            run, "pause", requested_by=requested_by, command_id=command.command_id
+        )
+        self._repo.mark_task_control(
+            command.command_id,
+            "applied"
+            if stored is not None
+            and (stored.metadata.get("control") or {}).get("state") == "paused"
+            else "rejected",
+            applied_at=utc_now_iso(),
+        )
+        return cast("AgentRun | None", stored)
+
+    def cancel_run(self, run_id: str, *, requested_by: str = "") -> AgentRun | None:
+        run = self._repo.get(run_id)
+        if run is None:
+            return None
+        if run.status in {"completed", "failed", "cancelled", "rejected"}:
+            return cast("AgentRun | None", run)
+        command = self._repo.request_task_control(run_id, "cancel", requested_by=requested_by)
+        execution = run.metadata.get("execution")
+        execution_active = isinstance(execution, dict) and execution.get("state") == "active"
+        if execution_active:
+            run.metadata["control_request"] = {
+                "action": "cancel",
+                "status": "requested",
+                "requested_by": requested_by,
+                "command_id": command.command_id,
+            }
+            return cast("AgentRun | None", run)
+        stored = self._persist_control(
+            run, "cancel", requested_by=requested_by, command_id=command.command_id
+        )
+        if stored is not None and stored.status == "cancelled":
+            self._cancel_queued_execution(run_id)
+        self._repo.mark_task_control(
+            command.command_id,
+            "applied"
+            if stored is not None
+            and (stored.metadata.get("control") or {}).get("state") == "cancelled"
+            else "rejected",
+            applied_at=utc_now_iso(),
+        )
+        return cast("AgentRun | None", stored)
+
+    def resume_run(
+        self,
+        run_id: str,
+        *,
+        requested_by: str = "",
+        runtime_context: dict[str, Any] | None = None,
+    ) -> AgentRun | None:
+        run = self._repo.get(run_id)
+        if run is None:
+            return None
+        if run.status != "paused":
+            return cast("AgentRun | None", run)
+        if requires_retry_reconciliation(run):
+            raise ValueError("任务执行结果尚需人工核对，不能恢复执行")
+        control = run.metadata.get("control")
+        resume_status = str(control.get("resume_status") or "") if isinstance(control, dict) else ""
+        context = merge_runtime_context(run, runtime_context)
+        command = self._repo.request_task_control(run_id, "resume", requested_by=requested_by)
+        run.metadata["runtime_context"] = context
+        run.metadata["control"] = {
+            "state": "running",
+            "requested_by": requested_by,
+            "command_id": command.command_id,
+        }
+        run.status = "waiting_user" if resume_status == "waiting_user" else "running"
+        run.add_event(
+            "run.resumed",
+            "Agent run 已恢复",
+            {"requested_by": requested_by, "command_id": command.command_id},
+        )
+        self._repo.save(run)
+        self._repo.mark_task_control(command.command_id, "applied", applied_at=utc_now_iso())
+        if run.status == "waiting_user":
+            return cast("AgentRun | None", self._repo.save(run))
+        self._execute_with_durable_lease(run, runtime_context=context)
+        return cast("AgentRun | None", self._repo.save(run))
+
+    def retry_run(
+        self,
+        run_id: str,
+        *,
+        requested_by: str = "",
+        runtime_context: dict[str, Any] | None = None,
+        auto_execute: bool = True,
+    ) -> AgentRun | None:
+        previous = self._repo.get(run_id)
+        if previous is None:
+            return None
+        if requires_retry_reconciliation(previous):
+            raise ValueError("任务执行结果尚需人工核对，不能创建重试任务")
+        for event in reversed(previous.events):
+            if event.event_type != "run.retry_created":
+                continue
+            existing_retry_id = str(event.data.get("retry_run_id") or "").strip()
+            existing_retry = self._repo.get(existing_retry_id) if existing_retry_id else None
+            if existing_retry is not None:
+                return cast("AgentRun | None", existing_retry)
+        if previous.status not in {"failed", "cancelled", "blocked"}:
+            return cast("AgentRun | None", previous)
+
+        previous_task = previous.metadata.get("task_context")
+        task = dict(previous_task) if isinstance(previous_task, dict) else {}
+        context = merge_runtime_context(previous, runtime_context)
+        context.update(
+            {
+                "task_id": task.get("task_id") or context.get("task_id"),
+                "conversation_id": task.get("conversation_id") or context.get("conversation_id"),
+                "parent_run_id": previous.run_id,
+                "root_run_id": task.get("root_run_id") or previous.run_id,
+                "task_attempt": int(task.get("attempt") or 1) + 1,
+                "task_title": task.get("title") or previous.message,
+                "workspace_id": task.get("workspace_id") or context.get("workspace_id"),
+                "workspace_path": task.get("workspace_path") or context.get("workspace_path"),
+                "workspace_isolation": task.get("isolation") or context.get("workspace_isolation"),
+            }
+        )
+        provided_plan = previous.metadata.get("provided_plan") or previous.metadata.get("plan")
+        if isinstance(provided_plan, dict) and provided_plan.get("nodes"):
+            retry_plan = self.plan_from_snapshot(provided_plan)
+            retry_plan.plan_id = f"{retry_plan.plan_id}:retry:{previous.run_id}"
+            retried = self.start_task_from_plan(
+                user_id=previous.user_id,
+                message=previous.message,
+                plan=retry_plan,
+                runtime_context=context,
+            )
+        else:
+            retried = self.start_run(
+                user_id=previous.user_id,
+                message=previous.message,
+                runtime_context=context,
+                auto_execute=auto_execute,
+            )
+        for key in ("task_model", "task_request", "task_request_fingerprint"):
+            if key in previous.metadata:
+                retried.metadata[key] = previous.metadata[key]
+        retried.add_event(
+            "run.retried",
+            "任务已重新执行",
+            {"parent_run_id": previous.run_id, "requested_by": requested_by},
+        )
+        previous.add_event(
+            "run.retry_created",
+            "已创建新的重试任务",
+            {"retry_run_id": retried.run_id, "requested_by": requested_by},
+        )
+        self._repo.save(previous)
+        return cast("AgentRun | None", self._repo.save(retried))
+
+    def _apply_requested_control(self, run: AgentRun) -> bool:
+        command = self._repo.latest_task_control(run.run_id)
+        if (
+            command is None
+            or command.status != "requested"
+            or command.action not in {"pause", "cancel"}
+        ):
+            return False
+        if run.status not in {"completed", "failed", "cancelled"}:
+            # Preserve execution facts held only by this worker before rebasing
+            # the control delta on the current same-generation snapshot.
+            self._repo.save(run)
+        stored = self._persist_control(
+            run, command.action, requested_by=command.requested_by, command_id=command.command_id
+        )
+        if stored is None:
+            return False
+        import copy
+
+        run.__dict__.update(copy.deepcopy(stored.__dict__))
+        control = run.metadata.get("control") or {}
+        applied = control.get("command_id") == command.command_id and run.status == (
+            "cancelled" if command.action == "cancel" else "paused"
+        )
+        self._repo.mark_task_control(
+            command.command_id, "applied" if applied else "rejected", applied_at=utc_now_iso()
+        )
+        return True
+
+    @staticmethod
+    def _cancel_queued_execution(run_id: str) -> None:
+        from app.application.agent_orchestrator.task_execution_repository import (
+            get_task_execution_repository,
+        )
+
+        queue = get_task_execution_repository()
+        current = queue.get(run_id)
+        if current is None or current.state not in {
+            "queued",
+            "waiting_approval",
+            "paused",
+            "blocked",
+        }:
+            return
+        queue.transition(run_id, "cancelled", error_code="cancelled")
+
+    @staticmethod
+    def _mark_controlled(
+        run: AgentRun,
+        control: str,
+        *,
+        requested_by: str = "",
+        command_id: str = "",
+    ) -> None:
+        channel = str(run.metadata.get("channel") or "").strip().lower()
+        if (
+            run.metadata.get("trace_mode")
+            in {"legacy_planner_run", "legacy_planner_run_with_tools"}
+            or channel in {"compat_chat_stream", "compat_chat_stream_langgraph"}
+        ) and run.status in {"planning", "running", "retrying"}:
+            # The observation callback may not have run yet. Persist the replay
+            # gate atomically with control while the original stream can write.
+            run.metadata["non_retryable"] = True
+            run.metadata["recovery"] = {
+                **(run.metadata.get("recovery") or {}),
+                "state": "manual_reconciliation_required",
+                "error_code": "legacy_stream_control_unsettled",
+            }
+        if control == "cancel":
+            for step in run.steps:
+                if step.status in {"pending", "retrying", "waiting_user"}:
+                    step.status = "skipped"
+                    step.error = "run cancelled before execution"
+            run.status = "cancelled"
+            run.error = (
+                "任务已停止继续执行；已有调用结果仍需人工核对"
+                if requires_retry_reconciliation(run)
+                else "run cancelled"
+            )
+            run.metadata["control"] = {
+                "state": "cancelled",
+                "requested_by": requested_by,
+                "command_id": command_id,
+            }
+            run.final_output = {
+                **dict(run.final_output or {}),
+                "cancelled": True,
+                "completed_step_ids": [
+                    step.step_id for step in run.steps if step.status == "completed"
+                ],
+            }
+            if not any(event.event_type == "run.cancelled" for event in run.events):
+                run.add_event(
+                    "run.cancelled",
+                    "Agent run 已取消",
+                    {
+                        "requested_by": requested_by,
+                        "execution_status": "cancelled",
+                        "task_id": str(
+                            (run.metadata.get("runtime_context") or {}).get("task_id") or run.run_id
+                        ),
+                        "tenant_id": str(
+                            (run.metadata.get("runtime_context") or {}).get("tenant_id") or ""
+                        ),
+                        "trace_id": run.run_id,
+                    },
+                )
+            return
+        run.status = "paused"
+        run.metadata["control"] = {
+            "state": "paused",
+            "requested_by": requested_by,
+            "command_id": command_id,
+        }
+        if not any(event.event_type == "run.paused" for event in run.events):
+            run.add_event("run.paused", "Agent run 已暂停", {"requested_by": requested_by})

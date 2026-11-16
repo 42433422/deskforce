@@ -1,0 +1,465 @@
+#!/usr/bin/env bash
+# 应用已校验的发布包、备份并按健康身份回滚；由 push / updater 调用。
+# XCMAX_PRESERVE_RELEASE_HISTORY=1 本次保留全部历史；其余配置与默认值见下文。
+set -euo pipefail
+case "${XCMAX_PRESERVE_RELEASE_HISTORY:-0}" in 0|1) ;; *) echo "XCMAX_PRESERVE_RELEASE_HISTORY must be 0 or 1" >&2; exit 64 ;; esac
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+if [[ -f "$SCRIPT_DIR/lib/deploy_emit.sh" ]]; then
+  # shellcheck source=lib/deploy_emit.sh
+  . "$SCRIPT_DIR/lib/deploy_emit.sh"
+else
+  deploy_emit() { echo "[deploy] $*"; }
+fi
+if [[ -f "$SCRIPT_DIR/lib/autonomy_gate.sh" ]]; then
+  # shellcheck source=lib/autonomy_gate.sh
+  . "$SCRIPT_DIR/lib/autonomy_gate.sh"
+else
+  echo "[deploy] ERROR: autonomy gate bridge is missing" >&2
+  exit 78
+fi
+if [[ -f "$SCRIPT_DIR/lib/service_quiescence.sh" ]]; then
+  # shellcheck source=lib/service_quiescence.sh
+  . "$SCRIPT_DIR/lib/service_quiescence.sh"
+else
+  echo "[deploy] ERROR: service quiescence helper is missing" >&2
+  exit 78
+fi
+if [[ -f "$SCRIPT_DIR/lib/apply_recovery.sh" ]]; then
+  # shellcheck source=lib/apply_recovery.sh
+  . "$SCRIPT_DIR/lib/apply_recovery.sh"
+else
+  echo "[deploy] ERROR: apply recovery helper is missing" >&2
+  exit 78
+fi
+if [[ -f "$SCRIPT_DIR/lib/verify_release_identity.sh" ]]; then
+  # shellcheck source=lib/verify_release_identity.sh
+  . "$SCRIPT_DIR/lib/verify_release_identity.sh"
+else
+  echo "[deploy] ERROR: release identity verifier is missing" >&2
+  exit 78
+fi
+export DEPLOY_SCRIPT_ID="fhd_apply_release"
+
+DEPLOY_ROOT="${FHD_DEPLOY_ROOT:-/opt/fhd-full}"
+SERVICE="${FHD_SERVICE_NAME:-fhd-full.service}"
+HEALTH_PORT="${FHD_HEALTH_PORT:-5100}"
+VENV="${FHD_VENV:-$DEPLOY_ROOT/.venv}"
+LOG="${FHD_DEPLOY_LOG:-/var/log/fhd-auto-update.log}"
+EXPECTED_GIT_SHA="${FHD_GIT_SHA:-}"
+
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"
+}
+
+if [[ "${FHD_REQUIRE_EXACT_IDENTITY:-1}" == "1" && -z "$EXPECTED_GIT_SHA" ]]; then
+  log "ERROR: FHD_GIT_SHA is required for exact-SHA deployment"
+  exit 78
+fi
+
+TARBALL="${FHD_RELEASE_TARBALL:-}"
+if [[ -z "$TARBALL" || ! -f "$TARBALL" ]]; then
+  log "ERROR: FHD_RELEASE_TARBALL 不存在: ${TARBALL:-<empty>}"
+  deploy_emit apply failed "missing_tarball"
+  exit 1
+fi
+
+TARBALL_SHA256="$(python3 - <<'PY' "$TARBALL"
+import hashlib, sys
+h = hashlib.sha256()
+with open(sys.argv[1], "rb") as f:
+    for chunk in iter(lambda: f.read(1024 * 1024), b""):
+        h.update(chunk)
+print(h.hexdigest())
+PY
+)"
+
+EXPECTED_SHA="${FHD_EXPECTED_SHA256:-}"
+if [[ -n "$EXPECTED_SHA" && "$TARBALL_SHA256" != "$EXPECTED_SHA" ]]; then
+  log "ERROR: tarball sha256 与期望不符 (file=$TARBALL_SHA256 expected=$EXPECTED_SHA)"
+  deploy_emit apply failed "sha256_mismatch"
+  exit 1
+fi
+
+deploy_emit apply started "tarball=$TARBALL"
+log "开始应用发布包: $TARBALL sha256=${TARBALL_SHA256:0:16}..."
+if [[ -e "$DEPLOY_ROOT/.deploy-identity-pending" ]]; then
+  log "ERROR: 上次发布身份事务未完成，拒绝覆盖并保留恢复材料: $DEPLOY_ROOT/.deploy-identity-pending"
+  exit 78
+fi
+ARCHIVE_VERIFY="$SCRIPT_DIR/lib/verify_release_archive.py"
+EXPECTED_ARCHIVE_VERIFY_SHA256="${FHD_ARCHIVE_VERIFY_SHA256:-}"
+[[ "$EXPECTED_ARCHIVE_VERIFY_SHA256" =~ ^[0-9a-f]{64}$ && -f "$ARCHIVE_VERIFY" && ! -L "$ARCHIVE_VERIFY" ]] || {
+  log "ERROR: trusted release archive verifier identity is missing or unsafe"
+  exit 78
+}
+ACTUAL_ARCHIVE_VERIFY_SHA256="$(python3 - "$ARCHIVE_VERIFY" <<'PY'
+import hashlib, sys
+with open(sys.argv[1], "rb") as stream:
+    print(hashlib.sha256(stream.read()).hexdigest())
+PY
+)"
+[[ "$ACTUAL_ARCHIVE_VERIFY_SHA256" == "$EXPECTED_ARCHIVE_VERIFY_SHA256" ]] || {
+  log "ERROR: installed archive verifier differs from exact candidate source"
+  exit 78
+}
+python3 "$ARCHIVE_VERIFY" --archive "$TARBALL"
+
+TS="$(date +%Y%m%d-%H%M%S)"
+BACKUP_ROOT="${FHD_BACKUP_ROOT:-/opt/fhd-full-backups}"
+mkdir -p "$BACKUP_ROOT"
+BACKUP="$BACKUP_ROOT/pre-$TS"
+mkdir -p "$BACKUP"
+
+for item in .build-identity.json app XCAGI alembic alembic.ini config mods xcagi_common resources packages requirements-langgraph-runtime.txt requirements-base.txt requirements.txt pyproject.toml; do
+  if [[ -e "$DEPLOY_ROOT/$item" ]]; then
+    rsync -a "$DEPLOY_ROOT/$item" "$BACKUP/"
+  fi
+done
+if [[ -d "$DEPLOY_ROOT/scripts/autonomy" ]]; then
+  mkdir -p "$BACKUP/scripts"
+  rsync -a "$DEPLOY_ROOT/scripts/autonomy" "$BACKUP/scripts/"
+fi
+if [[ -d "$DEPLOY_ROOT/scripts/ci" ]]; then
+  mkdir -p "$BACKUP/scripts"
+  rsync -a "$DEPLOY_ROOT/scripts/ci" "$BACKUP/scripts/"
+fi
+ADMIN_BACKUP_PRESENT=0
+if [[ -d "$DEPLOY_ROOT/templates/admin-vue-dist" ]]; then
+  mkdir -p "$BACKUP/templates"
+  rsync -a "$DEPLOY_ROOT/templates/admin-vue-dist" "$BACKUP/templates/"
+  ADMIN_BACKUP_PRESENT=1
+fi
+for stamp in .deploy-last.tar.gz .deploy-git-sha .deploy-sha256 .deploy-admin-console-sha256; do
+  [[ -f "$DEPLOY_ROOT/$stamp" ]] && cp "$DEPLOY_ROOT/$stamp" "$BACKUP/$stamp"
+done
+log "已备份至 $BACKUP"
+
+# 本次显式保留历史时不执行容量清理；日常发布仍按回滚窗口保留。
+if [[ "${XCMAX_PRESERVE_RELEASE_HISTORY:-0}" != 1 ]]; then
+  PYTHONPATH="$SCRIPT_DIR" python3 -c \
+    'from prune_release_cache import prune_backups; import sys; print(prune_backups(sys.argv[1], retain_backups=int(sys.argv[2])))' \
+    "$BACKUP_ROOT" "${FHD_BACKUP_RETAIN:-10}"
+fi
+
+rollback_from_backup() {
+  autonomy_evaluate_action "rollback_release" "rollback:${TARBALL_SHA256:0:16}" || return $?
+  fhd_stop_service_for_release "$SERVICE" "restart:rollback:${TARBALL_SHA256:0:16}" || return $?
+  log "执行回滚: $BACKUP"
+  for item in .build-identity.json app XCAGI alembic alembic.ini config xcagi_common packages requirements-langgraph-runtime.txt requirements-base.txt requirements.txt pyproject.toml; do
+    if [[ -e "$BACKUP/$item" ]]; then
+      rsync -a --delete "$BACKUP/$item" "$DEPLOY_ROOT/" || return $?
+    fi
+  done
+  if [[ -d "$MODS_UPDATE_STATE" ]]; then
+    local mods_guard="$TMP/scripts/deploy/lib/mod_tree_guard.py"
+    if [[ ! -f "$mods_guard" ]]; then
+      log "ERROR: release Mod ownership guard is missing; cannot safely roll back mods"
+      return 1
+    fi
+    python3 "$mods_guard" rollback --target "$DEPLOY_ROOT/mods" --state "$MODS_UPDATE_STATE" || return $?
+  fi
+  if [[ -d "$BACKUP/resources" ]]; then
+    mkdir -p "$DEPLOY_ROOT/resources" || return $?
+    rsync -a --delete \
+      --exclude 'routing_policies/routing_decisions.jsonl' \
+      --exclude 'routing_policies/.online_update_state.json' \
+      "$BACKUP/resources/" "$DEPLOY_ROOT/resources/" || return $?
+  fi
+  if [[ "$ADMIN_BACKUP_PRESENT" == "1" ]]; then
+    mkdir -p "$DEPLOY_ROOT/templates/admin-vue-dist" || return $?
+    rsync -a --delete "$BACKUP/templates/admin-vue-dist/" "$DEPLOY_ROOT/templates/admin-vue-dist/" || return $?
+  else
+    rm -rf -- "$DEPLOY_ROOT/templates/admin-vue-dist" || return $?
+  fi
+  if [[ -d "$BACKUP/scripts/autonomy" ]]; then
+    mkdir -p "$DEPLOY_ROOT/scripts/autonomy" || return $?
+    rsync -a --delete "$BACKUP/scripts/autonomy/" "$DEPLOY_ROOT/scripts/autonomy/" || return $?
+  else
+    rm -rf -- "$DEPLOY_ROOT/scripts/autonomy" || return $?
+  fi
+  if [[ -d "$BACKUP/scripts/ci" ]]; then
+    mkdir -p "$DEPLOY_ROOT/scripts/ci" || return $?
+    rsync -a --delete "$BACKUP/scripts/ci/" "$DEPLOY_ROOT/scripts/ci/" || return $?
+  else
+    rm -rf -- "$DEPLOY_ROOT/scripts/ci" || return $?
+  fi
+  fhd_restore_release_identity "$DEPLOY_ROOT" "$BACKUP" || return $?
+  systemctl restart "$SERVICE" || return $?
+  systemctl is-active --quiet "$SERVICE" || return 1
+  FHD_SERVICE_QUIESCED=0
+}
+
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/fhd-apply.XXXXXX")"
+MODS_UPDATE_STATE="$TMP/mods-update-state"
+MUTATION_STARTED=0
+ROLLBACK_DONE=0
+ROLLBACK_CONFIRMED=0
+cleanup_apply() {
+  local status=$?
+  local rollback_status=0
+  local restore_status=0
+  local preserve_recovery=0
+  trap - EXIT
+  set +e
+  if [[ "$status" != "0" && "$MUTATION_STARTED" == "1" && "$ROLLBACK_DONE" == "0" ]]; then
+    ROLLBACK_DONE=1
+    rollback_from_backup
+    rollback_status=$?
+    if [[ "$rollback_status" == "0" ]]; then
+      ROLLBACK_CONFIRMED=1
+    else
+      log "ERROR: rollback did not complete (status=$rollback_status)"
+    fi
+  fi
+  if [[ "$status" != "0" && "${FHD_SERVICE_STOP_ATTEMPTED:-0}" == "1" && "${FHD_SERVICE_WAS_ACTIVE:-0}" == "1" ]]; then
+    fhd_restore_service_after_failed_apply "$SERVICE" "restart:release:${TARBALL_SHA256:0:16}"
+    restore_status=$?
+    if [[ "$restore_status" != "0" ]]; then
+      log "ERROR: service recovery failed after deployment error (status=$restore_status)"
+      preserve_recovery=1
+    fi
+  fi
+  if [[ "$status" != "0" && ( "$ROLLBACK_CONFIRMED" != "1" && "$MUTATION_STARTED" == "1" || -d "$MODS_UPDATE_STATE" ) ]]; then
+    preserve_recovery=1
+  fi
+  if [[ "$preserve_recovery" == "1" ]]; then
+    if fhd_preserve_recovery_material "$TMP" "$BACKUP" "$TS"; then
+      if ! rm -rf -- "$TMP"; then
+        log "ERROR: verified recovery copy exists; original TMP could not be removed and remains at $TMP"
+      fi
+    else
+      log "ERROR: rollback is unconfirmed; original recovery material retained at $TMP"
+    fi
+  else
+    rm -rf -- "$TMP"
+  fi
+  exit "$status"
+}
+trap cleanup_apply EXIT
+tar -xzf "$TARBALL" -C "$TMP"
+BUNDLED_ARCHIVE_VERIFY_SHA256="$(python3 - "$TMP/scripts/deploy/lib/verify_release_archive.py" <<'PY'
+import hashlib, sys
+with open(sys.argv[1], "rb") as stream:
+    print(hashlib.sha256(stream.read()).hexdigest())
+PY
+)"
+[[ "$BUNDLED_ARCHIVE_VERIFY_SHA256" == "$EXPECTED_ARCHIVE_VERIFY_SHA256" ]] || {
+  log "ERROR: release bundle archive verifier differs from exact candidate source"
+  exit 1
+}
+
+ADMIN_VERIFY="$TMP/scripts/deploy/lib/verify_admin_console.py"
+EXPECTED_ADMIN_CONSOLE_SHA256="$(
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("admin_console_sha256", ""))' "$TMP/.build-identity.json"
+)"
+[[ "$EXPECTED_ADMIN_CONSOLE_SHA256" =~ ^[0-9a-f]{64}$ ]] || {
+  log "ERROR: release is missing the immutable admin console identity"
+  exit 1
+}
+python3 "$ADMIN_VERIFY" \
+  --root "$TMP/templates/admin-vue-dist" \
+  --expected-git-sha "$EXPECTED_GIT_SHA" \
+  --expected-sha256 "$EXPECTED_ADMIN_CONSOLE_SHA256"
+MODS_GUARD="$TMP/scripts/deploy/lib/mod_tree_guard.py"
+[[ -f "$MODS_GUARD" ]] || {
+  log "ERROR: release Mod ownership guard is missing"
+  exit 1
+}
+
+fhd_stop_service_for_release "$SERVICE" "restart:release:${TARBALL_SHA256:0:16}"
+MUTATION_STARTED=1
+python3 "$MODS_GUARD" apply \
+  --source "$TMP/mods" \
+  --target "$DEPLOY_ROOT/mods" \
+  --state "$MODS_UPDATE_STATE" \
+  --previous-archive "$DEPLOY_ROOT/.deploy-last.tar.gz" \
+  --deploy-root "$DEPLOY_ROOT"
+for item in .build-identity.json app XCAGI alembic alembic.ini config xcagi_common packages requirements-langgraph-runtime.txt requirements-base.txt requirements.txt pyproject.toml; do
+  if [[ -e "$TMP/$item" ]]; then
+    rsync -a --delete "$TMP/$item" "$DEPLOY_ROOT/"
+  fi
+done
+if [[ -d "$TMP/resources" ]]; then
+  mkdir -p "$DEPLOY_ROOT/resources"
+  rsync -a --delete \
+    --exclude 'routing_policies/routing_decisions.jsonl' \
+    --exclude 'routing_policies/.online_update_state.json' \
+    "$TMP/resources/" "$DEPLOY_ROOT/resources/"
+fi
+mkdir -p "$DEPLOY_ROOT/templates/admin-vue-dist"
+rsync -a --delete "$TMP/templates/admin-vue-dist/" "$DEPLOY_ROOT/templates/admin-vue-dist/"
+if [[ -d "$TMP/scripts/deploy" ]]; then
+  mkdir -p "$DEPLOY_ROOT/scripts"
+  rsync -a --delete "$TMP/scripts/deploy/" "$DEPLOY_ROOT/scripts/deploy/"
+fi
+if [[ -d "$TMP/scripts/autonomy" ]]; then
+  mkdir -p "$DEPLOY_ROOT/scripts/autonomy"
+  rsync -a --delete "$TMP/scripts/autonomy/" "$DEPLOY_ROOT/scripts/autonomy/"
+fi
+if [[ -d "$TMP/scripts/ci" ]]; then
+  mkdir -p "$DEPLOY_ROOT/scripts/ci"
+  rsync -a "$TMP/scripts/ci/" "$DEPLOY_ROOT/scripts/ci/"
+fi
+if [[ -d "$TMP/docker" ]]; then
+  mkdir -p "$DEPLOY_ROOT/docker"
+  rsync -a "$TMP/docker/" "$DEPLOY_ROOT/docker/"
+fi
+log "代码已同步至 $DEPLOY_ROOT"
+
+bootstrap_vendored_langgraph() {
+  local service_python="${FHD_SERVICE_PYTHON:-/usr/bin/python3}"
+  local requirements="$DEPLOY_ROOT/requirements-langgraph-runtime.txt"
+  local package_dirs=(
+    "$DEPLOY_ROOT/packages/xcagi_langgraph_core"
+    "$DEPLOY_ROOT/packages/xcagi_langgraph_checkpoint"
+    "$DEPLOY_ROOT/packages/xcagi_langgraph_checkpoint_backends/checkpoint-sqlite"
+    "$DEPLOY_ROOT/packages/xcagi_langgraph_checkpoint_backends/checkpoint-postgres"
+    "$DEPLOY_ROOT/packages/xcagi_langgraph_prebuilt"
+    "$DEPLOY_ROOT/packages/xcagi_langgraph_sdk"
+  )
+
+  [[ -x "$service_python" ]] || {
+    log "ERROR: service Python 不可执行: $service_python"
+    return 1
+  }
+  [[ -f "$requirements" ]] || {
+    log "ERROR: 缺少 LangGraph 运行时依赖清单: $requirements"
+    return 1
+  }
+  local package_dir
+  for package_dir in "${package_dirs[@]}"; do
+    [[ -f "$package_dir/PROVENANCE.json" ]] || {
+      log "ERROR: 缺少受管 LangGraph provenance: $package_dir/PROVENANCE.json"
+      return 1
+    }
+  done
+
+  deploy_emit pip started "scope=vendored_langgraph python=$service_python"
+  PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_ROOT_USER_ACTION=ignore \
+    "$service_python" -m pip install --quiet --no-cache-dir -r "$requirements"
+
+  local purelib
+  purelib="$($service_python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+  [[ -d "$purelib" ]] || {
+    log "ERROR: Python purelib 目录不存在: $purelib"
+    return 1
+  }
+  local pth_tmp="$TMP/xcagi_vendored_langgraph.pth"
+  "$service_python" - "$pth_tmp" "$DEPLOY_ROOT" "${package_dirs[@]}" <<'PY'
+import os, sys
+
+target, deploy_root, *paths = sys.argv[1:]; relative_paths = [os.path.relpath(path, deploy_root) for path in paths]
+line = "import os,sys; _xcagi_root=next((p for p in sys.path if os.path.isfile(os.path.join(p,'packages','xcagi_langgraph_core','PROVENANCE.json'))),None); _xcagi_relative_paths=" + repr(relative_paths) + "; _xcagi_vendored_paths=[os.path.join(_xcagi_root,p) for p in _xcagi_relative_paths] if _xcagi_root else []; sys.path[:]=[p for p in sys.path if '/packages/xcagi_langgraph_' not in p]; sys.path[:0]=[p for p in _xcagi_vendored_paths if os.path.isdir(p)]\n"
+open(target, "w", encoding="utf-8").write(line)
+PY
+  install -m 0644 "$pth_tmp" "$purelib/xcagi_vendored_langgraph.pth"
+
+  PYTHONPATH="$DEPLOY_ROOT" "$service_python" - <<'PY'
+from app.infrastructure.workflow.langgraph_assert import assert_vendored_sources
+
+assert_vendored_sources()
+PY
+  deploy_emit pip ok "scope=vendored_langgraph"
+}
+
+if [[ "${FHD_SKIP_LANGGRAPH_BOOTSTRAP:-0}" != "1" ]]; then
+  bootstrap_vendored_langgraph
+fi
+
+if [[ "${FHD_SKIP_PIP:-0}" != "1" ]]; then
+  deploy_emit pip started
+  if [[ ! -x "$VENV/bin/pip" ]]; then
+    python3 -m venv "$VENV"
+  fi
+  # shellcheck disable=SC1091
+  . "$VENV/bin/activate"
+  pip install -q -U pip
+  if [[ -f "$DEPLOY_ROOT/requirements-base.txt" ]]; then
+    pip install -q -r "$DEPLOY_ROOT/requirements-base.txt"
+  elif [[ -f "$DEPLOY_ROOT/requirements.txt" ]]; then
+    pip install -q -r "$DEPLOY_ROOT/requirements.txt"
+  fi
+  deploy_emit pip ok
+fi
+
+if [[ "${FHD_RUN_MIGRATIONS:-0}" == "1" && -f "$DEPLOY_ROOT/alembic.ini" ]]; then
+  log "ERROR: autonomous db migration requested; autonomy boundary must block it"
+  if autonomy_evaluate_action "db_migration" "migration:${TARBALL_SHA256:0:16}"; then
+    log "ERROR: prohibited db_migration unexpectedly passed autonomy_guard"
+  fi
+  deploy_emit migrate failed "prohibited_by_autonomy_boundary"
+  exit 77
+fi
+
+# Managed systemd drop-ins: keep env-critical service settings aligned across releases.
+# Source of truth lives in the release tree (scripts/deploy/systemd/*.conf); copying is
+# idempotent and daemon-reload only happens when something actually changed.
+DROPIN_DIR="/etc/systemd/system/${SERVICE}.d"
+DROPIN_SRC_DIR="$DEPLOY_ROOT/scripts/deploy/systemd"
+if [[ -d "$DROPIN_SRC_DIR" ]]; then
+  mkdir -p "$DROPIN_DIR"
+  for unit_dropin in "$DROPIN_SRC_DIR"/*.conf; do
+    [[ -f "$unit_dropin" ]] || continue
+    dropin_name="$(basename "$unit_dropin")"
+    if ! cmp -s "$unit_dropin" "$DROPIN_DIR/$dropin_name"; then
+      cp "$unit_dropin" "$DROPIN_DIR/$dropin_name"
+      systemctl daemon-reload
+      deploy_emit dropin synced "file=$dropin_name"
+    fi
+  done
+fi
+
+deploy_emit restart started "service=$SERVICE"
+fhd_commit_release_identity \
+  "$TARBALL" "$DEPLOY_ROOT" "$BACKUP" "$TARBALL_SHA256" \
+  "$EXPECTED_GIT_SHA" "$EXPECTED_ADMIN_CONSOLE_SHA256"
+systemctl restart "$SERVICE"
+FHD_SERVICE_QUIESCED=1
+sleep "${FHD_HEALTH_INITIAL_SLEEP:-15}"
+
+API_CODE=000
+HEALTH_PATH="${FHD_HEALTH_PATH:-/api/health}"
+HEALTH_RETRIES="${FHD_HEALTH_RETRIES:-90}"
+HEALTH_INTERVAL="${FHD_HEALTH_INTERVAL:-3}"
+for _ in $(seq 1 "$HEALTH_RETRIES"); do
+  if verify_release_health_identity \
+      "http://127.0.0.1:${HEALTH_PORT}${HEALTH_PATH}?lite=true" \
+      "$EXPECTED_GIT_SHA" \
+      "" \
+      "$TARBALL_SHA256" \
+      "$EXPECTED_ADMIN_CONSOLE_SHA256"; then
+    API_CODE=200
+    break
+  fi
+  sleep "$HEALTH_INTERVAL"
+done
+
+if [[ "$API_CODE" == "200" ]] && ! python3 "$DEPLOY_ROOT/scripts/deploy/lib/verify_admin_console.py" \
+    --base-url "http://127.0.0.1:${HEALTH_PORT}/admin/" \
+    --expected-git-sha "$EXPECTED_GIT_SHA" \
+    --expected-sha256 "$EXPECTED_ADMIN_CONSOLE_SHA256"; then
+  API_CODE=admin_identity_mismatch
+fi
+
+if [[ "$API_CODE" != "200" ]]; then
+  log "ERROR: /api/health 未就绪 (code=$API_CODE)，尝试回滚"
+  ROLLBACK_DONE=1
+  if rollback_from_backup; then
+    ROLLBACK_CONFIRMED=1
+  else
+    ROLLBACK_CONFIRMED=0
+    log "ERROR: health rollback did not complete; recovery materials will be retained"
+  fi
+  deploy_emit apply failed "health_check rollback"
+  exit 1
+fi
+
+fhd_complete_release_identity \
+  "$DEPLOY_ROOT" "$BACKUP" "$TARBALL_SHA256" \
+  "$EXPECTED_GIT_SHA" "$EXPECTED_ADMIN_CONSOLE_SHA256"
+
+MUTATION_STARTED=0
+FHD_SERVICE_QUIESCED=0
+log "发布成功 health=200 sha256=${TARBALL_SHA256:0:16}..."
+deploy_emit apply ok "port=$HEALTH_PORT"

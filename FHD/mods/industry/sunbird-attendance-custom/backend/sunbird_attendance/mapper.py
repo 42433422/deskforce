@@ -1,0 +1,85 @@
+"""Public mapper compatibility exports; implementations own their dependencies."""
+
+from __future__ import annotations
+
+from .attendance_models import DayBandEntry as DayBandEntry
+from .attendance_models import EmployeeDayTemplateData as EmployeeDayTemplateData
+from .attendance_models import EmployeeMonthTemplateData as EmployeeMonthTemplateData
+from .attendance_models import TemplateEmployeeProfile as TemplateEmployeeProfile
+from .attendance_models import TemplateWriteResult as TemplateWriteResult
+from .detail_sheet import _detail_numeric_addend as _detail_numeric_addend
+from .detail_sheet import _detail_side_metric_symbol_columns as _detail_side_metric_symbol_columns
+from .detail_sheet import _detail_side_month_link_column_map as _detail_side_month_link_column_map
+from .detail_sheet import _ensure_onsheet_block_total_header as _ensure_onsheet_block_total_header
+from .detail_sheet import (
+    _refresh_detail_side_summary_formulas as _refresh_detail_side_summary_formulas,
+)
+from .detail_sheet import _sum_person_block_numeric_cells as _sum_person_block_numeric_cells
+from .detail_sheet import _write_entries as _write_entries
+from .detail_sheet import write_detail_sheet as write_detail_sheet
+from .monthly_sheet import _excel_quoted_sheet as _excel_quoted_sheet
+from .monthly_sheet import _formula_monthly_detail_metric as _formula_monthly_detail_metric
+from .monthly_sheet import _monthly_sheet_is_roster_layout as _monthly_sheet_is_roster_layout
+from .monthly_sheet import _reset_sheet_rows as _reset_sheet_rows
+from .monthly_sheet import _scan_monthly_roster_header_row as _scan_monthly_roster_header_row
+from .monthly_sheet import write_analysis_sheet as write_analysis_sheet
+from .monthly_sheet import write_monthly_sheet as write_monthly_sheet
+from .template_cells import _apply_style_bundle as _apply_style_bundle
+from .template_cells import (
+    _cell_text_replace_chinese_numerals as _cell_text_replace_chinese_numerals,
+)
+from .template_cells import _chinese_block_label_to_int as _chinese_block_label_to_int
+from .template_cells import _force_arabic_number_format as _force_arabic_number_format
+from .template_cells import _merge_anchor_for_cell as _merge_anchor_for_cell
+from .template_cells import _normalize_block_chinese_numerals as _normalize_block_chinese_numerals
+from .template_cells import (
+    _normalize_chinese_numerals_in_rect as _normalize_chinese_numerals_in_rect,
+)
+from .template_cells import _plain_cell_text as _plain_cell_text
+from .template_cells import _replace_line_all_cn_numerals as _replace_line_all_cn_numerals
+from .template_cells import _round_display as _round_display
+from .template_cells import _snapshot_block_cell_styles as _snapshot_block_cell_styles
+from .template_cells import _strip_dbnum_column_styles as _strip_dbnum_column_styles
+from .template_cells import clear_template_blocks as clear_template_blocks
+from .template_layout import _detail_calendar_anchor_col as _detail_calendar_anchor_col
+from .template_layout import _first_attendance_symbol_col as _first_attendance_symbol_col
+from .template_layout import _unmerge_cell_rectangle as _unmerge_cell_rectangle
+from .template_layout import find_template_base_rows as find_template_base_rows
+from .template_layout import find_template_side_summary_rows as find_template_side_summary_rows
+from .template_layout import iter_detail_sheet_block_base_rows as iter_detail_sheet_block_base_rows
+from .template_layout import set_template_month as set_template_month
+from .template_profiles import (
+    _parse_profile_rules_from_nature_plain as _parse_profile_rules_from_nature_plain,
+)
+from .template_profiles import _safe_hhmm as _safe_hhmm
+from .template_profiles import build_template_profiles as build_template_profiles
+from .template_schema import _ATT_MARK as _ATT_MARK
+from .template_schema import _CN_BLOCK_DIGITS as _CN_BLOCK_DIGITS
+from .template_schema import _DETAIL_MONTH_LINK_RULES as _DETAIL_MONTH_LINK_RULES
+from .template_schema import _MONTHLY_LINKABLE_METRICS as _MONTHLY_LINKABLE_METRICS
+from .template_schema import _NATURE_OT_RE as _NATURE_OT_RE
+from .template_schema import _NATURE_WORK_RE as _NATURE_WORK_RE
+from .template_schema import DETAIL_ARABIC_NUMBER_DISPLAY as DETAIL_ARABIC_NUMBER_DISPLAY
+from .template_schema import DETAIL_BLOCK_TOTAL_NUMBER_DISPLAY as DETAIL_BLOCK_TOTAL_NUMBER_DISPLAY
+from .template_schema import DETAIL_HEADER_ROWS as DETAIL_HEADER_ROWS
+from .template_schema import DETAIL_MAX_COL as DETAIL_MAX_COL
+from .template_schema import DETAIL_ONSHEET_BLOCK_TOTAL_COL as DETAIL_ONSHEET_BLOCK_TOTAL_COL
+from .template_schema import DETAIL_PERSON_BLOCK_ROWS as DETAIL_PERSON_BLOCK_ROWS
+from .template_schema import DETAIL_SIDE_SUMMARY_BP_COL as DETAIL_SIDE_SUMMARY_BP_COL
+from .template_schema import DETAIL_SIDE_SUMMARY_BQ_COL as DETAIL_SIDE_SUMMARY_BQ_COL
+from .template_schema import DETAIL_SIDE_SUMMARY_CD_COL as DETAIL_SIDE_SUMMARY_CD_COL
+from .template_schema import DETAIL_SIDE_SUMMARY_NIGHT_COLS as DETAIL_SIDE_SUMMARY_NIGHT_COLS
+from .template_schema import DETAIL_SIDE_SUMMARY_SUMIF_END_COL as DETAIL_SIDE_SUMMARY_SUMIF_END_COL
+from .template_schema import (
+    DETAIL_SIDE_SUMMARY_SUMIF_START_COL as DETAIL_SIDE_SUMMARY_SUMIF_START_COL,
+)
+from .template_schema import DETAIL_SUM_COL_START as DETAIL_SUM_COL_START
+from .template_schema import DETAIL_TEMPLATE_SUMMARY_BEGIN_COL as DETAIL_TEMPLATE_SUMMARY_BEGIN_COL
+from .template_schema import BlockCellStyle as BlockCellStyle
+from .template_workbook import _ensure_template_workbook as _ensure_template_workbook
+from .template_workbook import _paste_one_person_block as _paste_one_person_block
+from .template_workbook import _snapshot_first_person_block as _snapshot_first_person_block
+from .template_workbook import open_output_workbook as open_output_workbook
+from .template_workbook import (
+    rebuild_detail_sheet_person_blocks as rebuild_detail_sheet_person_blocks,
+)

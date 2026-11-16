@@ -1,0 +1,91 @@
+import { test, expect } from '@playwright/test'
+import { E2E_PASSWORD, E2E_USER, isFullStack, prepareErpSession } from './helpers'
+
+test.describe('Login flow', () => {
+  test('login page loads without app shell chrome', async ({ page }) => {
+    await page.goto('/login', { waitUntil: 'domcontentloaded', timeout: 30_000 })
+    await expect(page.locator('#app')).toBeVisible()
+    await expect(page).toHaveURL((url) => url.pathname === '/login')
+  })
+
+  test('unauthenticated root eventually shows login or ready shell', async ({ page }) => {
+    await page.goto('/', { waitUntil: 'domcontentloaded', timeout: 30_000 })
+    await expect(page.locator('#app')).toBeVisible()
+    const login = page.locator('input[type="password"], input[autocomplete="current-password"]').first()
+    const ready = page.locator('.app-shell.is-ready')
+    // #app also contains the initial loading status before Vue finishes routing.
+    await expect.poll(async () => (await login.isVisible()) || (await ready.isVisible()), {
+      timeout: 25_000,
+    }).toBeTruthy()
+  })
+
+  test('full stack form login reaches authorized ETL and tenant business mods', async ({ page, request }) => {
+    test.skip(!isFullStack(), 'covered by the mandatory release full-stack job')
+    const ownerId = await prepareErpSession(request)
+    await page.goto('/login?redirect=%2Forders', {
+      waitUntil: 'domcontentloaded',
+      timeout: 30_000,
+    })
+    await page.locator('#lv-username').fill(E2E_USER)
+    await page.locator('#lv-password').fill(E2E_PASSWORD)
+    const loginResponsePromise = page.waitForResponse(
+      (response) => response.request().method() === 'POST' && /\/api\/auth\/login(?:\?|$)/.test(response.url()),
+      { timeout: 45_000 },
+    )
+    await page.locator('.login-submit').click()
+
+    const loginResponse = await loginResponsePromise
+    const loginText = await loginResponse.text()
+    expect(loginResponse.status(), loginText).toBe(200)
+    expect(JSON.parse(loginText || '{}')?.success, loginText).toBe(true)
+    await expect(page).toHaveURL((url) => url.pathname === '/mod/xcagi-erp-domain-bridge/orders', { timeout: 45_000 })
+    const prefsResponse = await page.request.get('/api/workspace/prefs')
+    expect(prefsResponse.ok(), await prefsResponse.text()).toBe(true)
+    expect(await prefsResponse.json()).toMatchObject({
+      success: true, owner_id: ownerId, data: { selected_industry_id: '涂料' },
+    })
+    await expect(page.locator('.login-submit')).toHaveCount(0)
+    await expect(page.locator('#app')).toBeVisible()
+    await expect(page.locator('.app-shell.is-ready')).toBeVisible({ timeout: 25_000 })
+
+    await page.evaluate(async () => {
+      const app = (
+        document.querySelector('#app') as HTMLElement & {
+          __vue_app__?: {
+            config?: {
+              globalProperties?: {
+                $router?: { push: (path: string) => Promise<unknown> }
+              }
+            }
+          }
+        }
+      ).__vue_app__
+      const router = app?.config?.globalProperties?.$router
+      if (!router) throw new Error('Vue router is unavailable from the mounted app')
+      await router.push('/business-docking')
+    })
+    await expect(page).toHaveURL((url) => url.pathname === '/business-docking')
+    await expect(page.locator('#view-business-docking')).toBeVisible({ timeout: 25_000 })
+    await page.evaluate(async () => {
+      const app = (
+        document.querySelector('#app') as HTMLElement & {
+          __vue_app__?: {
+            config?: {
+              globalProperties?: {
+                $router?: { push: (path: string) => Promise<unknown> }
+              }
+            }
+          }
+        }
+      ).__vue_app__
+      const router = app?.config?.globalProperties?.$router
+      if (!router) throw new Error('Vue router is unavailable from the mounted app')
+      await router.push('/materials')
+    })
+    await expect(page).toHaveURL(
+      (url) => url.pathname === '/mod/xcagi-erp-domain-bridge/materials',
+      { timeout: 45_000 },
+    )
+    await expect(page.locator('body')).not.toContainText('正在登录')
+  })
+})

@@ -1,0 +1,78 @@
+# gitleaks 自定义配置
+# CI SSOT: hand-written — 编辑此文件即可
+#
+# 用途：
+#   - 在 gitleaks 默认规则基础上，扩展项目特定的密钥模式
+#   - allowlist 排除测试 fixture 中的假密钥
+
+title = "XCMAX gitleaks config"
+
+[extend]
+# 继承 gitleaks 默认规则集
+useDefault = true
+
+# 全局允许列表（不扫描的路径）
+[allowlist]
+description = "Global allowlist"
+paths = [
+    # 测试 fixture 中的假密钥
+    '''FHD/tests/.*fixture.*''',
+    '''FHD/tests/.*mock.*''',
+    '''FHD/tests/.*stub.*''',
+    # CI 自治脚本测试中的 mock token (AKIAIOSFODNN7EXAMPLE / ghp_aBcD... 等文档示例)
+    '''FHD/tests/test_ci/.*''',
+    # 文档中的示例密钥
+    '''docs/.*\.md''',
+    '''\.md$''',
+    # 锁文件
+    '''package-lock\.json''',
+    '''poetry\.lock''',
+    '''Pipfile\.lock''',
+    # Local bytecode is generated, non-source material; runtime-artifact CI
+    # independently forbids committing it.
+    '''__pycache__/''',
+    '''\.pyc$''',
+    # CI 配置中的 ${{ secrets.* }} 占位符
+    '''\.github/workflows/.*\.yml''',
+    # .env.example 模板
+    '''\.env\.example''',
+    '''\.env\.local\.example''',
+    # admin-console 本地构建备份目录（vendor 打包产物误报，目录已移出 git 跟踪）
+    '''admin-console/\.vite-bak/''',
+    # 验收证据中的 feed 签名回执：publicKeySha256 是公钥 SHA256 指纹（公开信息），非凭据；
+    # 文件名绑定回执 schema（仅含公开哈希），误报 generic-api-key
+    '''FHD/docs/evidence/.*feed-signature-receipt\.json''',
+    # 审批验收日志里的 flow_key 是本机流程编号，不是访问密钥。
+    '''feature-acceptance-20260929b/erp-approval/macos/run\.log''',
+    '''capabilities/assets/evidence/erp-approval-run\.log''',
+]
+
+regexes = [
+    # MODstore 客服测试桩函数名 "_visible_ticket_or_404"：api 变量 + 长标识符触发 generic-api-key 误报，非凭据
+    '''_visible_ticket_or_404''',
+]
+
+# 项目特定的密钥模式（XCMAX 自定义）
+[[rules]]
+id = "xcmag-cursor-admin-token"
+description = "XCMAG cursor admin token"
+regex = '''cursor_admin_token['"]?\s*[:=]\s*['"]([a-zA-Z0-9_-]{32,})['"]'''
+secretGroup = 1
+keywords = ["cursor_admin_token"]
+tags = ["xcmag", "token"]
+
+[[rules]]
+id = "xcmag-modstore-api-key"
+description = "MODstore API key"
+regex = '''MODSTORE_API_KEY['"]?\s*[:=]\s*['"]([a-zA-Z0-9_-]{32,})['"]'''
+secretGroup = 1
+keywords = ["modstore_api_key"]
+tags = ["xcmag", "api-key"]
+
+[[rules]]
+id = "xcmag-lan-gateway-secret"
+description = "LAN gateway secret"
+regex = '''LAN_GATEWAY_SECRET['"]?\s*[:=]\s*['"]([a-zA-Z0-9_-]{32,})['"]'''
+secretGroup = 1
+keywords = ["lan_gateway_secret"]
+tags = ["xcmag", "lan"]

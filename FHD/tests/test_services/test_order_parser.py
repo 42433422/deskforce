@@ -1,0 +1,300 @@
+"""Tests for app.services.tools_execution.order_parser — coverage ramp."""
+
+from __future__ import annotations
+
+import os
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from app.services.tools_execution.order_parser import _parse_order_text
+
+
+class TestParseOrderTextEmptyAndInvalid:
+    def test_empty_string(self):
+        result = _parse_order_text("")
+        assert result["success"] is False
+
+    def test_none_input(self):
+        result = _parse_order_text(None)
+        assert result["success"] is False
+
+    def test_whitespace_only(self):
+        result = _parse_order_text("   ")
+        assert result["success"] is False
+
+    def test_unparseable_text(self):
+        result = _parse_order_text("xyz")
+        assert result["success"] is False
+
+
+class TestParseOrderTextWithModelAndSpec:
+    def test_model_with_spec_and_qty(self):
+        result = _parse_order_text("张三 编号：ABC-123 规格20 5桶")
+        assert result["success"] is True
+        assert result["products"][0]["model_number"] == "ABC-123"
+        assert result["products"][0]["tin_spec"] == 20.0
+        assert result["products"][0]["quantity_tins"] == 5
+
+    def test_model_with_spec_no_qty(self):
+        result = _parse_order_text("张三 编号：ABC-123 规格20")
+        # Should ask for quantity
+        assert result["success"] is False
+        assert "桶数" in result.get("message", "") or "缺少" in result.get("message", "")
+
+    def test_model_keyword_xinghao(self):
+        result = _parse_order_text("张三 型号：XYZ-456 规格15 3桶")
+        assert result["success"] is True
+        assert result["products"][0]["model_number"] == "XYZ-456"
+
+    def test_model_spec_before_keyword(self):
+        result = _parse_order_text("张三 ABC-123的规格20 5桶")
+        assert result["success"] is True
+        assert result["products"][0]["model_number"] == "ABC-123"
+
+
+class TestParseOrderTextWithChineseNumbers:
+    def test_chinese_spec_number(self):
+        result = _parse_order_text("张三 编号：ABC-123 规格二十 5桶")
+        assert isinstance(result, dict)
+
+    def test_chinese_quantity(self):
+        result = _parse_order_text("张三 编号：ABC-123 规格20 三桶")
+        assert isinstance(result, dict)
+
+
+class TestParseOrderTextMultiProduct:
+    def test_multi_product_pattern(self):
+        text = "张三 5桶 ABC-123 规格20 3桶 DEF-456 规格15"
+        result = _parse_order_text(text)
+        assert isinstance(result, dict)
+
+
+class TestParseOrderTextWithUnitName:
+    def test_unit_name_from_prefix(self):
+        result = _parse_order_text("张三5桶ABC-123规格20")
+        assert isinstance(result, dict)
+
+    def test_delivery_note_keyword(self):
+        result = _parse_order_text("张三发货单 编号：ABC-123 规格20 5桶")
+        assert isinstance(result, dict)
+
+    def test_print_delivery_note(self):
+        result = _parse_order_text("打印一下张三的发货单 编号：ABC-123 规格20 5桶")
+        assert isinstance(result, dict)
+
+
+class TestParseOrderTextBoxAndKg:
+    def test_box_quantity(self):
+        result = _parse_order_text("张三5箱产品名")
+        assert result["success"] is True
+        assert result["products"][0]["quantity_tins"] == 5
+
+    def test_kg_quantity(self):
+        result = _parse_order_text("张三25公斤产品名")
+        assert result["success"] is True
+        assert "quantity_kg" in result["products"][0]
+        assert result["products"][0]["quantity_kg"] == 25.0
+
+    def test_chinese_kg_quantity(self):
+        result = _parse_order_text("张三二十公斤产品名")
+        assert isinstance(result, dict)
+
+
+class TestParseOrderTextFallbackPatterns:
+    def test_simple_two_word_fallback(self):
+        result = _parse_order_text("张三 产品A")
+        assert result["success"] is True
+        assert result["unit_name"] == "张三"
+        assert result["products"][0]["name"] == "产品A"
+
+    def test_no_container_qty_with_model_spec(self):
+        result = _parse_order_text("张三 ABC-123 规格20")
+        # Should ask for quantity
+        assert result["success"] is False
+        assert "桶数" in result.get("message", "") or "缺少" in result.get("message", "")
+
+
+class TestParseOrderTextCustomerSlot2067:
+    """#2067 回归：客户槽位抽取不得落入会话话术。"""
+
+    def test_quoted_customer_name_extracted(self):
+        result = _parse_order_text(
+            "给「客户闭环验收客户」开一张发货单：客户闭环测试商品A，规格500ml"
+        )
+        msg = result.get("message", "")
+        assert "客户闭环验收客户" in msg
+        assert "开一张" not in msg
+        assert "「" not in msg and "」" not in msg
+
+    def test_keyed_customer_name_not_filler(self):
+        result = _parse_order_text("生成发货单 客户=客户闭环验收客户 商品=测试商品A")
+        assert result.get("unit_name") == "客户闭环验收客户"
+
+    def test_verb_residue_is_not_customer_name(self):
+        """回归：「开发货单」不得残留「开」被当成客户名。"""
+        result = _parse_order_text("开发货单 太阳鸟 5桶")
+        assert result.get("unit_name") == "太阳鸟"
+
+    def test_spoken_keyed_customer_name_extracted(self):
+        """口语键值写法「客户 X」应取 X，而不是把动词残片「开」当客户。"""
+        result = _parse_order_text("开发货单，客户 验收客户，产品 验收产品，数量 1")
+        assert result.get("unit_name") == "验收客户"
+
+    def test_assistant_reply_is_not_an_order(self):
+        for text in (
+            "已识别订单，请确认执行",
+            "好的，正在执行【shipment_generate】，请稍候",
+            "好的",
+            "已识别订单，正在生成发货单…",
+            '已识别订单，请点击"确认执行"生成发货单。',
+        ):
+            result = _parse_order_text(text)
+            assert result["success"] is False, text
+            assert not result.get("unit_name"), text
+
+
+class TestParseOrderTextQuantityPrice2067:
+    """WO-26b0cfd509b8：「数量N 单价P」不得落入兜底被当成 1 桶、单价丢失。"""
+
+    def test_issue_sentence_keeps_quantity_and_unit_price(self):
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": ""}):
+            result = _parse_order_text("客户闭环验收客户 发货单：客户闭环测试商品A 数量24 单价3.5")
+        assert result["success"] is True
+        assert result["unit_name"] == "客户闭环验收客户"
+        product = result["products"][0]
+        assert product["name"] == "客户闭环测试商品A"
+        assert product["quantity"] == 24
+        assert "quantity_kg" not in product
+        assert "tin_spec" not in product
+        assert product["unit"] == ""
+        assert product["unit_price"] == 3.5
+        assert product["amount"] == 84.0
+
+    def test_quantity_unit_word_and_ascii_colon(self):
+        result = _parse_order_text("张三 送货单: 白色乳胶漆 数量3个 单价12.50")
+        assert result["success"] is True
+        assert result["unit_name"] == "张三"
+        assert result["products"][0]["name"] == "白色乳胶漆"
+        assert result["products"][0]["quantity"] == 3
+        assert result["products"][0]["unit"] == "个"
+        assert result["products"][0]["amount"] == 37.5
+
+    def test_filler_customer_is_rejected(self):
+        result = _parse_order_text("好的 发货单：客户闭环测试商品A 数量24 单价3.5")
+        assert result.get("unit_name") != "好的"
+
+    def test_zero_quantity_is_not_retail_order(self):
+        result = _parse_order_text("张三 发货单：商品A 数量0 单价3.5")
+        assert result.get("products", [{}])[0].get("unit_price") is None
+
+    def test_industrial_bucket_order_unchanged(self):
+        result = _parse_order_text("张三 发货单 编号ABC-123 规格20 5桶")
+        assert result["success"] is True
+        product = result["products"][0]
+        assert product["model_number"] == "ABC-123"
+        assert product["quantity_tins"] == 5
+        assert product["tin_spec"] == 20.0
+        assert "unit_price" not in product
+
+
+class TestParseOrderTextAI:
+    def test_ai_fallback_disabled_no_api_key(self):
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": ""}):
+            result = _parse_order_text("一些无法解析的文本xyz")
+        assert result["success"] is False
+
+    def test_ai_fallback_with_api_key_success(self):
+        payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": '{"unit_name": "张三", "model_number": "ABC-123", "tin_spec": "20", "quantity_tins": "5"}'
+                    }
+                }
+            ]
+        }
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "fake-key"}):
+            with patch(
+                "app.infrastructure.llm.invoke.chat_completion_openai_format",
+                new=AsyncMock(return_value=payload),
+            ):
+                result = _parse_order_text("一些无法解析的文本xyz")
+        assert isinstance(result, dict)
+        assert result.get("success") is True
+        assert result["products"][0]["model_number"] == "ABC-123"
+
+    def test_ai_fallback_api_error(self):
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "fake-key"}):
+            with patch(
+                "app.infrastructure.llm.invoke.chat_completion_openai_format",
+                new=AsyncMock(side_effect=OSError("connection failed")),
+            ):
+                result = _parse_order_text("一些无法解析的文本xyz")
+        assert isinstance(result, dict)
+
+    def test_ai_fallback_llm_returns_none(self):
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "fake-key"}):
+            with patch(
+                "app.infrastructure.llm.invoke.chat_completion_openai_format",
+                new=AsyncMock(return_value=None),
+            ):
+                result = _parse_order_text("一些无法解析的文本xyz")
+        assert isinstance(result, dict)
+
+
+class TestParseOrderTextPunctuation:
+    def test_chinese_punctuation_stripped(self):
+        result = _parse_order_text("张三 编号：ABC-123，规格20，5桶")
+        assert isinstance(result, dict)
+
+    def test_mixed_punctuation(self):
+        result = _parse_order_text("张三 编号:ABC-123,规格20,5桶")
+        assert isinstance(result, dict)
+
+
+class TestParseOrderTextDeliveryNoteKeywords:
+    def test_songhuodan_keyword(self):
+        result = _parse_order_text("张三送货单 编号：ABC-123 规格20 5桶")
+        assert isinstance(result, dict)
+
+    def test_chuhuodan_keyword(self):
+        result = _parse_order_text("张三出货单 编号：ABC-123 规格20 5桶")
+        assert isinstance(result, dict)
+
+
+class TestParseOrderTextInvertedSpec:
+    """倒装/容量记法：「20L规格」「规格20」「20L」「28的规格」统一解析为 规格=数字。"""
+
+    def test_inverted_spec_with_unit_suffix(self):
+        result = _parse_order_text("发货单 太阳鸟 5桶 20L规格")
+        assert result["success"] is False
+        msg = result.get("message", "")
+        assert "单位 太阳鸟" in msg
+        assert "规格 20" in msg
+        assert "规格，" not in msg and "规格）" not in msg.replace("规格 20）", "")
+
+    def test_inverted_spec_plain_number(self):
+        result = _parse_order_text("发货单 太阳鸟 5桶 规格20")
+        assert result["success"] is False
+        assert "单位 太阳鸟" in result.get("message", "")
+
+    def test_capacity_notation_standalone(self):
+        result = _parse_order_text("给太阳鸟开单 20L 5桶")
+        assert result["success"] is False
+        msg = result.get("message", "")
+        assert "单位 太阳鸟" in msg
+        assert "开单" not in msg
+
+    def test_colloquial_de_spec_lai_qty(self):
+        result = _parse_order_text("太阳鸟那边要28的规格来30桶")
+        assert result["success"] is False
+        msg = result.get("message", "")
+        assert "规格 28" in msg
+        assert "规格" not in (msg.split("单位 ")[1].split("，")[0] if "单位 " in msg else "")
+
+    def test_inverted_spec_does_not_break_forward_order(self):
+        # 正序「XY-20 规格：20」编号不被倒装改写吞掉
+        result = _parse_order_text("王总 型号：XY-20 规格：20 一共3桶")
+        assert result["success"] is True
+        assert result["products"][0]["model_number"] == "XY-20"

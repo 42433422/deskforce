@@ -1,0 +1,203 @@
+import { api, buildFullApiUrl } from './core'
+import { readCurrentMarketAccessToken } from './marketAccount'
+import { readCsrfTokenFromCookie } from '@/utils/csrfCookie'
+import type { RequestOptions } from './core'
+import type { ApiResponse } from '@/types/api'
+import type { ChatRequest, ChatResponse, ChatSession } from '@/types/chat'
+import type { ChatModelRoute } from '@/utils/chatModelRoute'
+import { readPlannerSseResponse, resolveChatStreamPath, type PlannerSseEvent } from '@/utils/chatSseStream'
+import { createTraceId } from '@/utils/networkStability'
+import { asRecord, asString } from '@/utils/typeGuards'
+import {
+  resolvePlannerChatBatchPath,
+  resolvePlannerChatPath,
+  resolvePlannerIntentTestPath,
+  resolvePlannerUnifiedChatBatchPath,
+  resolvePlannerUnifiedChatPath,
+} from '@/utils/plannerChatPaths'
+
+export type { PlannerSseEvent }
+
+interface ChatContextParams {
+  user_id?: string
+  source?: string
+  mode?: string
+  [key: string]: string | undefined
+}
+
+export type ChatStreamRequestInit = RequestInit & {
+  /** 覆盖默认路径（否则用 ``VITE_CHAT_STREAM_PATH`` 或 ``/api/ai/chat/stream``） */
+  streamPath?: string
+}
+
+function readMarketBearerHeader(): Record<string, string> {
+  const token = readCurrentMarketAccessToken()
+  if (!token) return {}
+  return { Authorization: token.toLowerCase().startsWith('bearer ') ? token : `Bearer ${token}` }
+}
+
+/**
+ * Planner 请求可能同时携带市场授权 Bearer 和本地桌面会话。市场 Bearer 不是本地
+ * FastAPI 可验证的 access/session token，不能据此跳过双提交 CSRF；只要同源 Cookie
+ * 中已有令牌，就显式带上对应请求头。
+ */
+function withChatCsrfHeader(headers: Record<string, string>): Record<string, string> {
+  const hasCsrfHeader = Object.entries(headers).some(([key, value]) => key.toLowerCase() === 'x-csrf-token' && String(value || '').trim())
+  if (hasCsrfHeader) return headers
+  const token = readCsrfTokenFromCookie()
+  return token ? { ...headers, 'X-CSRF-Token': token } : headers
+}
+
+function withMarketAuthorization(options: RequestOptions = {}): RequestOptions {
+  const existing = options.headers as Record<string, string> | undefined
+  if (existing?.Authorization || existing?.authorization) {
+    return { ...options, headers: withChatCsrfHeader({ ...existing }) }
+  }
+  const auth = readMarketBearerHeader()
+  if (!auth.Authorization) return options
+  return {
+    ...options,
+    headers: withChatCsrfHeader({
+      ...existing,
+      ...auth,
+    }),
+  }
+}
+
+/** Planner SSE：非 2xx 时解析 JSON 错误文案 */
+export async function parseChatStreamErrorResponse(res: Response, onRouteMetadata?: (value: unknown) => void): Promise<string> {
+  let msg = `流式请求失败（${res.status}）`
+  try {
+    const ct = res.headers.get('content-type') || ''
+    if (ct.includes('application/json')) {
+      const j = asRecord(await res.json())
+      onRouteMetadata?.(j.route_metadata || asRecord(j.detail).route_metadata)
+      msg = asString(j.message || j.detail) || msg
+    }
+  } catch {
+    /* ignore */
+  }
+  return msg
+}
+
+export const chatApi = {
+  getModelStatus(): Promise<{ ok: boolean; provider: string; model: string } & Partial<ChatModelRoute>> {
+    return api.get('/api/conversation/model-status', {}, { timeoutMs: 20_000, cache: 'no-store' })
+  },
+
+  followPlatformModel(): Promise<{ ok: boolean }> {
+    return api.put('/api/conversation/model-preference', { mode: 'platform' })
+  },
+
+  sendChat(payload: ChatRequest, options: RequestOptions = {}): Promise<ApiResponse<ChatResponse>> {
+    return api.post<ApiResponse<ChatResponse>>(resolvePlannerChatPath(), payload, withMarketAuthorization(options))
+  },
+
+  /**
+   * 真实 Planner SSE：``POST`` + ``text/event-stream``，返回原生 ``Response``（``body`` 为流）。
+   * 与 ``api.post`` 不同，不能用 JSON/blob 封装。
+   */
+  sendChatStream(payload: ChatRequest & Record<string, unknown>, init: ChatStreamRequestInit = {}): Promise<Response> {
+    const { streamPath, headers: hdr, ...rest } = init
+    const url = buildFullApiUrl((streamPath || '').trim() || resolveChatStreamPath())
+    const body = JSON.stringify(payload)
+    const headers = withChatCsrfHeader({
+      'Content-Type': 'application/json',
+      'X-Request-ID': createTraceId(),
+      ...readMarketBearerHeader(),
+      ...(hdr as Record<string, string>),
+    })
+    return fetch(url, {
+      method: 'POST',
+      credentials: 'include',
+      headers,
+      body,
+      ...rest,
+    })
+  },
+
+  /**
+   * 发起流式对话并读完 SSE（直到 ``done`` / ``error``）。``!res.ok`` 时抛错（文案来自 JSON）。
+   */
+  async consumeChatStream(
+    payload: ChatRequest & Record<string, unknown>,
+    onEvent: (ev: PlannerSseEvent) => void,
+    init: ChatStreamRequestInit = {},
+  ): Promise<void> {
+    const res = await chatApi.sendChatStream(payload, init)
+    if (!res.ok) {
+      throw new Error(await parseChatStreamErrorResponse(res))
+    }
+    await readPlannerSseResponse(res, onEvent)
+  },
+
+  getContext(params: ChatContextParams = {}): Promise<ApiResponse<ChatSession>> {
+    return api.get<ApiResponse<ChatSession>>('/api/ai/context', params)
+  },
+
+  clearContext(data: { user_id?: string } = {}): Promise<ApiResponse<void>> {
+    return api.post<ApiResponse<void>>('/api/ai/context/clear', data)
+  },
+
+  getConfig(): Promise<ApiResponse<unknown>> {
+    return api.get<ApiResponse<unknown>>('/api/ai/config')
+  },
+
+  testIntent(data: unknown): Promise<ApiResponse<unknown>> {
+    return api.post<ApiResponse<unknown>>(resolvePlannerIntentTestPath(), data)
+  },
+
+  sendUnifiedChat(payload: ChatRequest, options: RequestOptions = {}): Promise<ApiResponse<ChatResponse>> {
+    return api.post<ApiResponse<ChatResponse>>(resolvePlannerUnifiedChatPath(), payload, withMarketAuthorization(options))
+  },
+
+  /** 专业链路：多条消息一次 HTTP，按顺序 process_chat */
+  sendChatBatch(
+    payload: ChatRequest & { messages: string[] },
+    options: RequestOptions = {},
+  ): Promise<ApiResponse<{ success: boolean; results: ChatResponse[]; count: number; batch?: boolean }>> {
+    return api.post(resolvePlannerChatBatchPath(), payload, withMarketAuthorization(options))
+  },
+
+  /** 普通 unified：多条消息一次 HTTP */
+  sendUnifiedChatBatch(
+    payload: ChatRequest & { messages: string[] },
+    options: RequestOptions = {},
+  ): Promise<ApiResponse<{ success: boolean; results: ChatResponse[]; count: number; batch?: boolean }>> {
+    return api.post(resolvePlannerUnifiedChatBatchPath(), payload, withMarketAuthorization(options))
+  },
+
+  getActiveConversation(): Promise<ApiResponse<{ conversation_id: string }>> {
+    return api.get<ApiResponse<{ conversation_id: string }>>('/api/conversations/active', {}, { timeoutMs: 20_000, cache: 'no-store' })
+  },
+
+  getConversations(params: Record<string, unknown> = {}): Promise<ApiResponse<ChatSession[]>> {
+    return api.get<ApiResponse<ChatSession[]>>('/api/conversations/sessions', params, { timeoutMs: 20_000 })
+  },
+
+  clearConversations(data: Record<string, unknown> = {}): Promise<ApiResponse<{ deleted: number }>> {
+    return api.post<ApiResponse<{ deleted: number }>>('/api/conversations/sessions/clear', data)
+  },
+
+  getConversation(sessionId: string): Promise<ApiResponse<ChatSession>> {
+    return api.get<ApiResponse<ChatSession>>(`/api/conversations/${sessionId}`, {}, { timeoutMs: 20_000 })
+  },
+
+  renameConversation(sessionId: string, title: string): Promise<ApiResponse<{ success: boolean }>> {
+    return api.put<ApiResponse<{ success: boolean }>>(`/api/conversations/${sessionId}/title`, { title })
+  },
+
+  deleteConversation(sessionId: string): Promise<ApiResponse<{ success: boolean }>> {
+    return api.delete<ApiResponse<{ success: boolean }>>(`/api/conversations/${sessionId}`)
+  },
+
+  saveMessage(payload: unknown): Promise<ApiResponse<unknown>> {
+    return api.post<ApiResponse<unknown>>('/api/conversations/message', payload, { timeoutMs: 20_000 })
+  },
+
+  newConversation(data: Record<string, unknown> = {}): Promise<ApiResponse<{ session_id: string }>> {
+    return api.post<ApiResponse<{ session_id: string }>>('/api/ai/conversation/new', data)
+  },
+}
+
+export default chatApi

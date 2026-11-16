@@ -1,0 +1,450 @@
+import { apiFetch } from '@/utils/apiBase'
+import { captureAuthSession } from '@/utils/authSessionCache'
+import { getRuntimeTenantStorageScopeInput } from '@/utils/tenantStorageScopeRuntime'
+
+/** 与 ModelPaymentView 共用：修茈市场访问令牌（勿提交到版本库）。 */
+export const LS_MARKET_ACCESS_TOKEN = 'xcagi_market_access_token'
+export const LS_MARKET_REFRESH_TOKEN = 'xcagi_market_refresh_token'
+export const LS_MARKET_USER_JSON = 'xcagi_market_user_json'
+const LS_MARKET_TOKEN_OWNER = 'xcagi_market_token_owner'
+export const MARKET_ACCOUNT_CACHE_KEYS = ['xcagi_market_overview_cache', 'xcagi_market_llm_catalog_cache'] as const
+
+/** The runtime profile is authoritative; a tenant alone cannot identify a wallet. */
+export function marketAccountOwner(): string | null {
+  const identity = getRuntimeTenantStorageScopeInput()
+  if (!identity) return null
+  const ids = [identity.marketUserId, identity.localUserId].map(id => id == null ? null : String(id).trim() || null)
+  const username = String(identity.marketUsername || '').trim()
+  return ids.some(Boolean) || username
+    ? JSON.stringify([identity.accountKind, identity.tenantId, ...ids, username]) : null
+}
+
+export function readCurrentMarketAccessToken(): string {
+  try {
+    const owner = marketAccountOwner()
+    return owner && window.localStorage.getItem(LS_MARKET_TOKEN_OWNER) === owner
+      ? (window.localStorage.getItem(LS_MARKET_ACCESS_TOKEN) || '').trim() : ''
+  } catch { return '' }
+}
+
+/** Explicit account transitions discard credentials and account-owned wallet snapshots. */
+export function clearMarketCredentials(): void {
+  if (typeof window === 'undefined') return
+  try {
+    for (const key of [LS_MARKET_ACCESS_TOKEN, LS_MARKET_REFRESH_TOKEN, LS_MARKET_USER_JSON, LS_MARKET_TOKEN_OWNER]) window.localStorage.removeItem(key)
+    for (let index = window.localStorage.length - 1; index >= 0; index--) {
+      const key = window.localStorage.key(index)
+      if (key && MARKET_ACCOUNT_CACHE_KEYS.some(base => key === base || key.startsWith(`${base}:`))) window.localStorage.removeItem(key)
+    }
+  } catch { /* Storage may be unavailable; never log credentials. */ }
+}
+
+const handoffOwners = new WeakMap<MarketAuthResult, () => boolean>()
+
+export type MarketUserProfile = {
+  id?: number | string
+  username?: string
+  email?: string
+  phone?: string
+  is_admin?: boolean
+  experience?: number
+  level_profile?: Record<string, unknown>
+  created_at?: string
+}
+
+export type MarketWalletOverview = {
+  balance?: number
+  membership_reference_yuan?: number
+}
+
+export type MarketMembershipOverview = {
+  tier?: string
+  label?: string
+  is_member?: boolean
+  can_byok?: boolean
+}
+
+export type MarketAccountOverviewData = {
+  user: MarketUserProfile
+  market_base_url: string
+  wallet?: MarketWalletOverview
+  plan?: Record<string, unknown> | null
+  membership?: MarketMembershipOverview | null
+  quotas?: Array<Record<string, unknown>>
+  degraded?: boolean
+  market_unreachable?: boolean
+  sync_warning?: string
+  llm?: { providers?: MarketLlmProvider[] }
+}
+
+export type MarketAccountSyncData = {
+  user: MarketUserProfile
+  market_base_url: string
+}
+
+export type MarketAuthResult = {
+  token: string
+  market_base_url: string
+  refresh_token?: string
+  raw?: Record<string, unknown>
+}
+
+export type MarketLlmProvider = {
+  provider: string
+  label?: string
+  models?: string[]
+  models_detailed?: Array<Record<string, unknown>>
+  error?: string | null
+  fetch_source?: string | null
+}
+
+export type MarketLlmCatalogData = {
+  providers: MarketLlmProvider[]
+  preferences?: Record<string, unknown>
+  cache_ttl_seconds?: number
+  market_base_url?: string
+  category_labels?: Record<string, string>
+  billing_settings?: Record<string, unknown>
+}
+
+export type MarketCheckoutData = Record<string, unknown> & {
+  ok?: boolean
+  type?: string
+  redirect_url?: string
+  order_id?: string
+}
+
+/** 将用户粘贴的整行 ``Authorization: Bearer …`` 规范为可提交的 authorization 字段。 */
+export function normalizePastedAuthorization(raw: string): string {
+  let t = (raw || '').trim()
+  if (!t) return ''
+  if (/^authorization:\s*/i.test(t)) {
+    t = t.replace(/^authorization:\s*/i, '').trim()
+  }
+  return t
+}
+
+/** CSRF 中间件：若请求体带 token 但未显式带 Bearer，POST 会被拦截；同时后端可从 Header 读取令牌。 */
+function marketBearerHeaders(rawAuth: string): Record<string, string> {
+  const normalized = normalizePastedAuthorization(rawAuth).trim()
+  if (!normalized) return {}
+  const v = normalized.toLowerCase().startsWith('bearer ') ? normalized : `Bearer ${normalized}`
+  return { Authorization: v }
+}
+
+export async function syncMarketAccount(authorization: string): Promise<MarketAccountSyncData> {
+  const res = await apiFetch('/api/market/account-sync', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...marketBearerHeaders(authorization) },
+    body: JSON.stringify({ authorization }),
+  })
+  const j = (await res.json()) as {
+    success?: boolean
+    detail?: string
+    message?: string
+    data?: MarketAccountSyncData
+  }
+  if (!j.success || !j.data) {
+    throw new Error(j.detail || j.message || '账号同步失败')
+  }
+  return j.data
+}
+
+/** 将底层服务错误收敛为可执行、不会泄露部署细节的用户提示。 */
+export function formatMarketServiceError(status: number, _rawMessage: string, _marketBaseUrl = ''): string {
+  if (status < 400) {
+    return '部分账号信息暂时无法同步，请稍后重试。'
+  }
+  if (status >= 500) {
+    return '服务暂时不可用，请稍后重试；如果问题持续，请联系管理员。'
+  }
+  if (status === 401) {
+    return '登录状态已失效，请重新登录。'
+  }
+  if (status === 429) {
+    return '请求过于频繁，请稍后再试。'
+  }
+  if (status === 400) {
+    return '请求未完成，请检查输入后重试。'
+  }
+  return `请求未完成（错误 ${status}），请稍后重试。`
+}
+
+export function degradedMarketAccountOverview(syncWarning: string, marketBaseUrl = ''): MarketAccountOverviewData {
+  return {
+    user: {},
+    market_base_url: marketBaseUrl,
+    degraded: true,
+    market_unreachable: true,
+    sync_warning: syncWarning,
+    wallet: { balance: undefined },
+    membership: { label: '未同步', tier: 'unknown', can_byok: false },
+    quotas: [],
+    llm: { providers: [] },
+  }
+}
+
+function marketErrorBody(j: Record<string, unknown>): {
+  message: string
+  marketBaseUrl: string
+} {
+  const data = j.data as Record<string, unknown> | undefined
+  const marketBaseUrl =
+    (typeof data?.market_base_url === 'string' && data.market_base_url) ||
+    (typeof j.market_base_url === 'string' && j.market_base_url) ||
+    ''
+  const message = String(j.message || j.detail || '').trim()
+  return { message, marketBaseUrl }
+}
+
+export async function fetchMarketAccountOverview(authorization: string, refresh = false): Promise<MarketAccountOverviewData> {
+  const res = await apiFetch('/api/market/account-overview', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...marketBearerHeaders(authorization) },
+    body: JSON.stringify({ authorization, refresh }),
+  })
+  const j = (await res.json()) as {
+    success?: boolean
+    detail?: string
+    message?: string
+    data?: MarketAccountOverviewData
+  }
+  if (j.data && (j.success || j.data.degraded || j.data.market_unreachable)) {
+    const data = j.data
+    if (data.sync_warning) {
+      data.sync_warning = formatMarketServiceError(res.status, String(data.sync_warning), data.market_base_url || '')
+    }
+    return data
+  }
+  const { message, marketBaseUrl } = marketErrorBody(j as Record<string, unknown>)
+  if (!res.ok && res.status >= 500) {
+    return degradedMarketAccountOverview(formatMarketServiceError(res.status, message || res.statusText, marketBaseUrl), marketBaseUrl)
+  }
+  if (!j.success || !j.data) {
+    if (res.status === 401) {
+      throw new Error(formatMarketServiceError(401, message, marketBaseUrl))
+    }
+    throw new Error(message || '线上额度同步失败')
+  }
+  return j.data
+}
+
+export async function fetchMarketLlmCatalog(authorization = '', refresh = false): Promise<MarketLlmCatalogData> {
+  const p = new URLSearchParams()
+  if (refresh) p.set('refresh', 'true')
+  const res = await apiFetch(`/api/market/llm-catalog${p.toString() ? `?${p}` : ''}`, {
+    headers: { ...marketBearerHeaders(authorization) },
+  })
+  const j = (await res.json()) as {
+    success?: boolean
+    detail?: string
+    message?: string
+    data?: MarketLlmCatalogData
+  }
+  const { message, marketBaseUrl } = marketErrorBody(j as Record<string, unknown>)
+  if (j.data && (j.success || (j.data as MarketLlmCatalogData & { degraded?: boolean }).degraded)) {
+    const data = j.data as MarketLlmCatalogData & { sync_warning?: string; degraded?: boolean }
+    if (data.sync_warning) {
+      data.sync_warning = formatMarketServiceError(res.status, String(data.sync_warning), data.market_base_url || marketBaseUrl)
+    }
+    return data
+  }
+  if (!res.ok && res.status >= 500) {
+    return {
+      providers: [],
+      market_base_url: marketBaseUrl,
+      degraded: true,
+      sync_warning: formatMarketServiceError(res.status, message || res.statusText, marketBaseUrl),
+    } as MarketLlmCatalogData & { degraded?: boolean; sync_warning?: string }
+  }
+  if (!j.success || !j.data) {
+    if (res.status === 401) {
+      throw new Error(formatMarketServiceError(401, message, marketBaseUrl))
+    }
+    throw new Error(message || '模型目录同步失败')
+  }
+  return j.data
+}
+
+/** Read a session-owned credential handoff; callers must explicitly commit it after their own lifecycle check. */
+let marketRepairInflight: Promise<boolean> | null = null
+
+/** One refresh when the access token is blank. Failure does not log the enterprise session out. */
+export function repairBlankMarketAccessToken(): Promise<boolean> {
+  if (typeof window === 'undefined') return Promise.resolve(false)
+  if (readCurrentMarketAccessToken()) return Promise.resolve(true)
+  if (!marketRepairInflight) {
+    marketRepairInflight = fetchSessionMarketHandoff()
+      .then((handoff) => persistMarketTokensFromHandoff(handoff))
+      .catch(() => false)
+      .finally(() => { marketRepairInflight = null })
+  }
+  return marketRepairInflight
+}
+
+export async function fetchSessionMarketHandoff(options: { signal?: AbortSignal } = {}): Promise<MarketAuthResult | null> {
+  const sessionCurrent = captureAuthSession()
+  const current = () => sessionCurrent() && !options.signal?.aborted
+  if (!current()) return null
+  try {
+    const res = await apiFetch('/api/market/session-handoff', { timeoutMs: 8_000, ...options })
+    if (!current()) return null
+    const j = (await res.json()) as {
+      success?: boolean
+      message?: string
+      data?: {
+        market_access_token?: string
+        market_refresh_token?: string
+        market_base_url?: string
+      }
+    }
+    if (!current() || !res.ok || !j.success || !j.data?.market_access_token) return null
+    const refresh = typeof j.data.market_refresh_token === 'string' ? j.data.market_refresh_token.trim() : ''
+    const handoff = {
+      token: j.data.market_access_token.trim(),
+      market_base_url: String(j.data.market_base_url || ''),
+      refresh_token: refresh || undefined,
+    }
+    handoffOwners.set(handoff, current)
+    return handoff
+  } catch (error) {
+    if (!current()) return null
+    throw error
+  }
+}
+
+/** 将服务端会话绑定的修茈令牌写入 localStorage（启动时与登录后调用）。 */
+export function persistMarketTokensFromHandoff(handoff: MarketAuthResult | null): boolean {
+  if (typeof window === 'undefined' || !handoff?.token || handoffOwners.get(handoff)?.() === false) return false
+  try {
+    window.localStorage.setItem(LS_MARKET_ACCESS_TOKEN, handoff.token)
+    const owner = marketAccountOwner()
+    if (owner) window.localStorage.setItem(LS_MARKET_TOKEN_OWNER, owner)
+    else window.localStorage.removeItem(LS_MARKET_TOKEN_OWNER)
+    if (handoff.refresh_token) window.localStorage.setItem(LS_MARKET_REFRESH_TOKEN, handoff.refresh_token)
+    else window.localStorage.removeItem(LS_MARKET_REFRESH_TOKEN)
+    return true
+  } catch {
+    clearMarketCredentials()
+    return false
+  }
+}
+
+function readTokenField(payload: Record<string, unknown> | undefined, key: string): string {
+  if (!payload) return ''
+  const v = payload[key]
+  return typeof v === 'string' ? v.trim() : ''
+}
+
+/**
+ * FHD 登录/注册成功后统一写入市场 token：优先响应字段，否则 session-handoff。
+ * 各 View 勿再各自解析 market_access_token。
+ */
+export async function applyMarketTokensAfterFhdLogin(raw: Record<string, unknown>): Promise<void> {
+  if (typeof window === 'undefined') return
+  const data = raw?.data && typeof raw.data === 'object' && !Array.isArray(raw.data) ? (raw.data as Record<string, unknown>) : undefined
+  const access = readTokenField(raw, 'market_access_token') || readTokenField(data, 'market_access_token')
+  const refresh = readTokenField(raw, 'market_refresh_token') || readTokenField(data, 'market_refresh_token')
+  if (access) {
+    persistMarketTokensFromHandoff({ token: access, refresh_token: refresh || undefined, market_base_url: '' })
+    return
+  }
+  const handoff = await fetchSessionMarketHandoff()
+  persistMarketTokensFromHandoff(handoff)
+}
+
+export async function loginMarketAccount(username: string, password: string): Promise<MarketAuthResult> {
+  const res = await apiFetch('/api/market/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  })
+  const j = (await res.json()) as {
+    success?: boolean
+    detail?: string
+    message?: string
+    data?: MarketAuthResult
+  }
+  if (!j.success || !j.data?.token) {
+    throw new Error(j.detail || j.message || '市场登录失败')
+  }
+  return j.data
+}
+
+export async function registerMarketAccount(
+  username: string,
+  password: string,
+  email: string,
+  verificationCode = '',
+): Promise<MarketAuthResult> {
+  const res = await apiFetch('/api/market/register', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      username,
+      password,
+      email,
+      verification_code: verificationCode,
+    }),
+  })
+  const j = (await res.json()) as {
+    success?: boolean
+    detail?: string
+    message?: string
+    data?: MarketAuthResult
+  }
+  if (!j.success || !j.data?.token) {
+    throw new Error(j.detail || j.message || '市场注册失败')
+  }
+  return j.data
+}
+
+export type DirectMarketCheckoutResult = {
+  ok?: boolean
+  type?: string
+  redirect_url?: string
+  order_id?: string
+  [key: string]: unknown
+}
+
+export async function directMarketCheckout(payload: Record<string, unknown>): Promise<DirectMarketCheckoutResult> {
+  const res = await apiFetch('/api/market/payment/checkout', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload || {}),
+  })
+  const j = (await res.json()) as {
+    success?: boolean
+    detail?: string
+    message?: string
+    data?: DirectMarketCheckoutResult
+  }
+  if (!j.success || !j.data) {
+    throw new Error(j.detail || j.message || '市场支付下单失败')
+  }
+  return j.data
+}
+
+/** A one-use code for browser navigation; no access or refresh token leaves in a URL. */
+export async function createMarketBrowserHandoff(
+  target: string,
+  purpose: 'wallet' | 'plans',
+): Promise<{
+  code: string
+  target: string
+  purpose: 'wallet' | 'plans'
+  expires_in: number
+}> {
+  const response = await apiFetch('/api/market/browser-handoff', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ target, purpose }),
+    timeoutMs: 8_000,
+  })
+  if (!response.ok) throw new Error('暂时无法连接市场账号，请重试或重新登录')
+  const result = await response.json()
+  if (!result.success || !/^[A-Za-z0-9_-]{43}$/.test(result.data?.code || '')) {
+    throw new Error('登录连接无效，请重试')
+  }
+  return result.data
+}

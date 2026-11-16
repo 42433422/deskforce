@@ -1,0 +1,436 @@
+[project]
+name = "xcagi"
+version = "1.0.0.7"
+description = "XCAGI - 企业 AI 员工平台（桌面版 + Web 版并行交付）"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+# 运行时依赖见 optional-dependencies；CI/生产安装：requirements-server-api.txt（与 server-api extra 对齐）
+dependencies = [
+    "langgraph==1.2.10",
+    "langgraph-checkpoint==4.3.0",
+    "langgraph-checkpoint-sqlite==3.1.2",
+    "langgraph-checkpoint-postgres==3.1.3",
+    "langgraph-prebuilt==1.1.0",
+    "langgraph-sdk==0.4.6",
+]
+
+[project.scripts]
+xcagi-brain = "app.cli.brain:main"
+
+[project.optional-dependencies]
+# 意图语义兜底：FastEmbed 走 ONNX，不依赖 torch；未安装时自动降级为纯规则。
+intent-semantic = [
+    "semantic-router>=1.1,<2",
+    "fastembed>=0.7",
+]
+server-api = [
+    "fastapi>=0.136.1",
+    "uvicorn[standard]>=0.27.0",
+    "starlette>=1.3.1",
+    "python-multipart>=0.0.31",
+    "aiofiles>=23.2.1",
+    "Celery==5.6.3",
+    "APScheduler>=3.10,<4",
+    "redis==5.0.1",
+    "openpyxl==3.1.5",
+    "defusedxml==0.7.1",
+    "python-docx>=1.1.0",
+    "python-pptx>=1.0.2",
+    "pdfplumber>=0.11.0",
+    "pypdf>=6.20.1,<7",
+    "reportlab>=5,<6",
+    "Pillow>=12.3.0",
+    "gunicorn>=22.0.0",
+    "gevent>=25.4.2",
+    "python-dotenv>=1.2.2",
+    "httpx==0.28.1",
+    "socksio>=1.0.0",
+    "requests>=2.33.0",
+    "urllib3>=2.8.0",
+    "python-alipay-sdk>=3.3.0",
+    "edge-tts>=6.1.10",
+    "faster-whisper>=1.0.0",
+    "av>=17.1,<18",
+    "imageio-ffmpeg>=0.4.0",
+    "SQLAlchemy>=2.0.0",
+    "alembic>=1.13.0",
+    "psycopg[binary]>=3.1.18",
+    "pgvector>=0.2.5",
+    # 外部工具接入：官方 MCP Python SDK（MIT）
+    "mcp==2.3.0",
+    # 长期记忆（mem0 OSS，Apache-2.0；离线本地向量，不依赖 torch）
+    "mem0ai==2.2.1",
+    # 计划修复：容忍模型 JSON 的尾逗号/截断（MIT，纯 Python）
+    "json-repair==0.64.9",
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "xlrd>=2.0.1",
+    "scikit-learn>=1.3.0",
+    "openai>=1.40.0",
+    "tenacity>=8.2.0",
+    "prometheus_client>=0.19.0",
+    "psutil>=5.9.0",
+    "protobuf>=4.25.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.11.0",
+    "email-validator>=2.0.0",
+    "passlib[bcrypt]>=1.7.4",
+    "PyJWT>=2.15.0",
+    "PyYAML>=6.0.2",
+    # OpenTelemetry (NeuroBus tracer 底层)
+    "opentelemetry-api>=1.45.1",
+    "opentelemetry-sdk>=1.45.1",
+    "opentelemetry-exporter-otlp>=1.45.1",
+]
+ml = [
+    "torch>=2.13.0",
+    "transformers>=5.10.0",
+    # ML 运行时依赖（音频/视频/预测/加速）
+    "accelerate>=0.25.0",
+    "faster-whisper>=1.0.0",
+    "imageio-ffmpeg>=0.4.0",
+    "miniaudio>=1.59",
+    "prophet>=1.3.0",
+    "protobuf>=4.25.0",
+    "PyAudio>=0.2.14",
+    "scikit-learn>=1.3.0",
+    "soundcard>=0.4.3",
+    "statsmodels>=0.14.6",
+]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "pytest-mock>=3.12",
+    "pytest-asyncio>=0.23",
+    "jsonschema>=4.23",
+    "ruff>=0.8,<0.16",
+    "import-linter>=2.15,<3",
+    "mypy>=1.8",
+    "types-redis",
+    "types-requests",
+    "types-pyyaml",
+    "types-psutil",
+    "types-aiofiles",
+    "types-pillow",
+    "types-reportlab",
+    "types-openpyxl",
+    "types-defusedxml",
+    "celery-types",
+    "pip-audit>=2.9",
+    "bandit>=1.7",
+    "httpx2>=2.9,<3",
+]
+
+# LG-W1-T1：LangGraph 运行时根依赖来源 — 全部可编辑(editable)安装到本地 XCAGI vendored 包目录，
+# 替代 PyPI 上游分发，确保 FHD/packages 内解析而非 site-packages。
+[tool.uv.sources]
+langgraph = { path = "packages/xcagi_langgraph_core", editable = true }
+langgraph-checkpoint = { path = "packages/xcagi_langgraph_checkpoint", editable = true }
+langgraph-checkpoint-sqlite = { path = "packages/xcagi_langgraph_checkpoint_backends/checkpoint-sqlite", editable = true }
+langgraph-checkpoint-postgres = { path = "packages/xcagi_langgraph_checkpoint_backends/checkpoint-postgres", editable = true }
+langgraph-prebuilt = { path = "packages/xcagi_langgraph_prebuilt", editable = true }
+langgraph-sdk = { path = "packages/xcagi_langgraph_sdk", editable = true }
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = [
+    ".git",
+    ".venv",
+    "venv",
+    "node_modules",
+    "frontend",
+    "(^|/)build/",
+    "build",
+    "dist",
+    "migrations",
+    "alembic/versions",
+    "third_party",
+    "*.ipynb"
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "C4", "UP", "SIM", "PLC", "BLE001", "RUF100"]
+ignore = [
+    "E501",    # line too long (handled by formatter)
+    "E402",    # module-import-not-at-top (历史遗留；DI registry 延迟导入由测试单独禁止)
+    "E712",    # true-false-comparison
+    "E722",    # bare-except (关键路径由 bare-except gate 单独校验)
+    "E731",    # lambda-assignment
+    "E741",    # ambiguous-variable-name
+    "B008",    # function-call-in-default-argument (FastAPI Depends() 标准用法)
+    "B007",    # unused-loop-control-variable
+    "B904",    # raise-without-from-inside-except
+    "B905",    # zip-without-explicit-strict
+    "B017",    # assert-raises-exception
+    "B023",    # function-uses-loop-variable
+    "B025",    # duplicate-try-block-exception
+    "B027",    # empty-method-without-abstract-decorator
+    "C416",    # unnecessary-comprehension
+    "PLC0415", # import-outside-top-level (历史遗留；DI registry 延迟导入由测试单独禁止)
+    "PLC2401", # non-ascii-name (中文变量名在业务代码中合理)
+    "PLC0414", # useless-import-alias
+    "PLC0206", # dict-index-missing-items
+    "UP042",   # replace-str-enum (历史兼容)
+    "UP035",   # deprecated-import (历史兼容)
+    "UP045",   # non-pep604-annotation-optional (历史 Optional[X] 写法)
+    "UP006",   # non-pep585-annotation (历史 List/Dict/Tuple 类型注解)
+    "SIM102",  # collapsible-if
+    "SIM103",  # needless-bool
+    "SIM105",  # suppressible-exception
+    "SIM108",  # if-else-block-instead-of-if-exp
+    "SIM110",  # reimplemented-builtin
+    "SIM115",  # open-file-with-context-handler
+    "SIM117",  # multiple-with-statements
+    "SIM118",  # in-dict-keys
+    "SIM101",  # duplicate-isinstance-call
+    "SIM210",  # if-expr-with-true-false
+    "SIM222",  # expr-or-true
+]
+
+[tool.ruff.lint.isort]
+# evals 已移入 assets/evals，但脚本与测试仍以 `from evals.…` 引用
+known-first-party = ["app", "scripts", "evals", "tests"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["F841", "F401", "BLE001"]
+"app/fastapi_routes/mobile_api_extensions.py" = ["F811"]
+"app/services/__init__.py" = ["F403", "F405", "F401", "F821"]
+"app/db/__init__.py" = ["F403", "F405", "F401", "F821"]
+"app/db/models/__init__.py" = ["F403", "F405", "F401", "F821"]
+"app/infrastructure/skills/__init__.py" = ["F403", "F405", "F401", "F821"]
+"app/application/neuro_commands/**" = ["F403", "F405", "F401", "F821"]
+"app/utils/__init__.py" = ["F403", "F405", "F401", "F821"]
+"app/legacy/**" = ["BLE001"]
+"app/traditional_mode_fs.py" = ["BLE001"]
+# CI 自治脚本：网络/IO/LLM 调用全 fail-open（设计约束：不阻断主流程）
+"scripts/ci/ai_self_heal.py" = ["BLE001", "UP015"]
+"scripts/ci/ai_self_heal_sla.py" = ["BLE001", "UP015"]
+"scripts/ci/ai_review.py" = ["BLE001", "UP015"]
+# 顶层兜底 catch-all（已记录日志）：裸 except: 已统一改为 except Exception: 后由 BLE001 接管，
+# 这些 I/O / 文档生成 / 意图识别热路径的 catch-all 属合理设计，显式登记免噪。
+"app/utils/printer_automation.py" = ["BLE001"]
+"app/utils/print_utils.py" = ["BLE001"]
+"app/infrastructure/documents/sales_contract_generator.py" = ["BLE001"]
+"app/infrastructure/documents/shipment_document_generator_impl.py" = ["BLE001"]
+"app/services/deepseek_intent_service.py" = ["BLE001"]
+"app/services/tools_execution/order_parser.py" = ["BLE001"]
+"app/services/skills/label_template_generator/label_template_generator.py" = ["BLE001"]
+"resources/tools_legacy/**" = ["BLE001", "E722"]
+"app/infrastructure/gateways/product.py" = ["F822"]
+"**/__init__.py" = ["F401", "F403", "F405", "F811", "I001"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+# mypy 配置唯一真相源（2026-05-04 整合）：
+# - 旧 mypy.ini（strict=True 但拼错过 frontned，且 ignore_missing_imports=False 与本节冲突）已删除。
+# - 当前以 pyproject 的"宽松配置"为准，与 [FHD项目评估报告.md](FHD项目评估报告.md) §四 的认知一致。
+# - 后续严格化路线见 §四 P1 改进项（逐步关闭 ignore_missing_imports、引入 types-* 包）。
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_ignores = true
+warn_unused_configs = true
+ignore_missing_imports = false
+explicit_package_bases = true
+exclude = [
+    "venv",
+    ".venv",
+    "node_modules",
+    "frontend",
+    "XCAGI/data",
+    "XCAGI/mods",
+    "migrations",
+    "alembic/versions",
+    "app/infrastructure/skills/sidebar-menu-manager",
+    "app/infrastructure/skills/skill-maker",
+]
+
+# modstore_server 为可选外部包（MODstore 部署时安装），路由层 try/except 回退到本地 JSON，
+# 故对 mypy 标记为 ignore_missing_imports 而非在代码中散布 # type: ignore。
+[[tool.mypy.overrides]]
+module = "modstore_server.*"
+ignore_missing_imports = true
+
+# Optional heavyweight/platform adapters are imported behind runtime feature
+# probes.  Their availability is validated by the owning capability, while the
+# core type gate remains independent of platform-only or ML-only distributions.
+[[tool.mypy.overrides]]
+module = [
+    "attendance_engine.*",
+    "alipay.*",
+    "barcode.*",
+    "cv2.*",
+    "easyocr.*",
+    "faster_whisper.*",
+    "google.*",
+    "jsonschema.*",
+    "keyring.*",
+    "mcp.*",
+    "mem0.*",
+    "onnxruntime.*",
+    "paddleocr.*",
+    "pandas.*",
+    "pdf2image.*",
+    "prophet.*",
+    "pypdfium2.*",
+    "pypinyin.*",
+    "pytesseract.*",
+    "pythoncom.*",
+    "rasa.*",
+    "sentence_transformers.*",
+    "shipment_document.*",
+    "sklearn.*",
+    "statsmodels.*",
+    "torch.*",
+    "transformers.*",
+    "win32api.*",
+    "win32com.*",
+    "win32con.*",
+    "win32gui.*",
+    "win32print.*",
+    "xlrd.*",
+]
+ignore_missing_imports = true
+
+# pytest 配置唯一真相源（2026-05-04 整合）：
+# - 旧 pytest.ini 已删除；当前 addopts 保留为不含 --cov，与历史 pytest.ini 的有效行为一致，
+#   避免本地交互式运行因 fail_under（当前 84，由棘轮维护）产生噪音。CI 通过显式 --cov 等参数生效（见
+#   .github/workflows/ci-cd.yml + test.yml）。
+[tool.pytest.ini_options]
+# 唯一后端套件：从 FHD/ 执行 pytest tests/（与 CI 一致）。
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short -p no:xdist --import-mode=importlib"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "integration: 集成测试",
+    "e2e: 端到端测试",
+    "asyncio: 异步测试 (pytest-asyncio)",
+    "release_gate: release train hard gate subset",
+    "coverage_ramp: 行覆盖率填充 stub（断言弱、杀变体能力低；非行为契约测试）。由 conftest 按文件名自动打标，可用 -m 'not coverage_ramp' 测真实行为套件",
+]
+# Warnings are release-gate failures: resource leaks, stale dependency APIs and
+# un-awaited coroutines must not disappear behind a global ignore policy.
+# Targeted third-party ignore: anyio 弃用了自家 anyio.abc.BlockingPortal 别名 shim，
+# 经 fastapi TestClient 导入链在收集期触发（filterwarnings=error 下阻断全部收集）。
+# fastapi/starlette 停用该别名后可移除。
+# pytest 9.1.1 自身收集代码（_pytest/pathlib.py find_prefixed）遗留的 scandir 迭代器在
+# gc 时发 ResourceWarning，filterwarnings=error 下变成 unraisable 异常，
+# mutmut 进程内反复跑 pytest 时在 unconfigure 期崩溃（mutation-smoke 自 6 月起 main 周跑必挂）。
+# 泄漏在 pytest 内部而非 app 代码；pytest 修复后移除本条。
+filterwarnings = [
+    "error",
+    'ignore:The anyio\.abc\.BlockingPortal alias is deprecated',
+    'ignore:unclosed scandir iterator:builtins.ResourceWarning',
+]
+
+[tool.coverage.run]
+# 全量 app/ 口径（2026-06-13 技术债清偿）；禁止再用窄 include 凑门禁
+source = ["app"]
+# 分支覆盖独立统计（铁律6，2026-06-14）。开启 branch 后 coverage 的 percent_covered
+# 变为"行+分支合并"指标；行/分支 floor 由 scripts/dev/coverage_ratchet.py 分别把关，
+# 标准测量命令传 --cov-fail-under=0 把门禁交给棘轮（见 ci-cd.yml + COVERAGE_RAMP.md）。
+branch = true
+omit = [
+    "*/tests/*",
+    "*/__pycache__/*",
+    "*/migrations/*",
+    "*/alembic/*",
+    "*/venv/*",
+    "*/virtualenv/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "pass",
+    "@abstractmethod",
+    "if DEBUG:",
+]
+# fail_under 语义 = 纯**行覆盖率** floor（铁律1 全量 source=[app]，铁律6 分支单独由棘轮把关）。
+# 当前动态实测只看 metrics/coverage-dual-summary.json；本文件只保存 coverage.py 行覆盖 floor。
+# 禁止在这里复制 pytest passed/failed 快照，避免 SSOT 分裂。
+# 三档目标（分阶段达成，非一次性切到 90%）：
+#   - 当前 floor：78% 行（本字段）/ 69% 分支（由 coverage_ratchet_baseline.json 守护）
+#     （2026-09-01 D2-5：coverage_ramp stub 82 个清零迁出后，总口径与真实行为口径合一，
+#     floor 自行为口径 78/69 起步，只升不降；决策记录见 docs/adr/0005-coverage-floor-recalibrate-stub-retirement.md）
+#   - Q3 目标（2026-Q3）：85% 行 + 80% 分支
+#   - Q4 终极目标（2026-Q4）：90% 行 + 85% 分支
+# 未修红灯前禁止对外宣称达标或 bump 棘轮。
+# 留 ~2pt 余量防止回退。开启 branch 后 coverage 自带门禁按合并指标拦截，故标准命令传
+# --cov-fail-under=0，由 coverage_ratchet.py --check 按行/分支分别守护（floor 只升不降）。
+fail_under = 78
+
+[tool.coverage.html]
+directory = "htmlcov"
+show_contexts = true
+
+# Phase 4 变异测试（mutmut 3.x）
+# 2026-07-21：为达标 PR gate（kill rate ≥ 80%），首轮门禁作用域收紧为低依赖包
+# app/di + app/contexts；security/middleware 待补测后再扩。
+# 用法：mutmut run && python scripts/dev/mutation_kill_report.py --threshold 80
+[tool.mutmut]
+source_paths = ["app/di", "app/contexts"]
+also_copy = ["app", "resources", "tests", "conftest.py", "packages"]
+pytest_add_cli_args = ["-q", "-p", "no:cacheprovider", "--no-header"]
+pytest_add_cli_args_test_selection = [
+    "tests/test_di",
+    "tests/test_contexts",
+]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+# 桌面/CI 构建时 `pip install -e .` 仅暴露 app 包，避免 FHD 根目录杂项目录触发 setuptools 误判。
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+exclude = [
+    "tests*",
+    "frontend*",
+    "mods*",
+    "desktop*",
+    "admin-console*",
+    "sunbird-console*",
+    "templates*",
+    "alembic*",
+    "scripts*",
+    "docs*",
+    "XCAGI*",
+    "MODstore*",
+]
+namespaces = false
+
+# Incremental contracts: scope only the migrated sync slice, not all legacy modules.
+[tool.importlinter]
+root_package = "app"
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+id = "sync-service-uses-dal"
+name = "Sync service uses the existing DAO instead of the SQLite driver"
+type = "forbidden"
+source_modules = ["app.domain.shared_services.xcmax_sync_service"]
+forbidden_modules = ["sqlite3"]
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+id = "sync-dal-stays-low-level"
+name = "Sync DAO cannot depend on services or application entrypoints"
+type = "forbidden"
+source_modules = ["app.db.xcmax_sync"]
+forbidden_modules = ["app.services", "app.application", "app.fastapi_routes", "app.fastapi_app"]

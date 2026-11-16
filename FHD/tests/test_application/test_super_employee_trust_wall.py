@@ -1,0 +1,288 @@
+"""超级员工信任墙端到端守卫：产品域被结构性收紧，工厂域保持全权。
+
+覆盖图里那四层纵深（工作区 / 凭证 / 工具面 / 派工不泄密），任一退化即 CI 红。
+"""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
+import pytest
+
+from app.application.claude_super_employee_service import ClaudeSuperEmployeeService
+from app.application.workspaces import get_workspace_registry
+from app.domain.app_pure.execution_scope import (
+    FACTORY_TOKEN_ENV,
+    CapabilityGrant,
+    ExecutionScope,
+    factory_context,
+)
+
+
+@pytest.fixture
+def repo_root() -> Path:
+    return get_workspace_registry().get("xcmax").root
+
+
+def _svc() -> ClaudeSuperEmployeeService:
+    return ClaudeSuperEmployeeService()
+
+
+# ── 工作区层：产品域绝不落到服务端工程树 ──
+
+
+def test_product_cwd_never_inside_repo_even_if_client_points_there(repo_root):
+    svc = _svc()
+    svc._grant = CapabilityGrant.product()
+    # 客户试图把 workspace_root 指向服务端 repo（或任意宿主路径）—— 产品域一律忽略，用隔离临时区。
+    cwd = Path(svc._cli_workspace({"workspace_root": str(repo_root)}))
+    assert cwd.resolve() != repo_root.resolve()
+    assert repo_root.resolve() not in cwd.resolve().parents
+    # 产品域 cwd 恒为隔离临时区，与客户传入路径无关（防 path-injection）。
+    assert str(cwd) == svc._product_ephemeral_workspace()
+
+
+def test_factory_cwd_resolves_to_workspace_root(repo_root):
+    svc = _svc()
+    svc._grant = CapabilityGrant(ExecutionScope.FACTORY, "xcmax")
+    cwd = Path(svc._cli_workspace({"request_id": "t1"}))
+    assert cwd.resolve() == repo_root.resolve()
+
+
+def test_relay_workorder_uses_real_repo_when_env_set(repo_root, monkeypatch):
+    """中继工单(操作者自己派工)+ 显式配真仓库 → 在真仓库跑 dev-loop，产出可推送的真东西。"""
+    svc = _svc()
+    svc._grant = CapabilityGrant.product()
+    monkeypatch.setenv("XCMAX_RELAY_WORKSPACE_ROOT", str(repo_root))
+    cwd = Path(svc._cli_workspace({"source": "mobile_relay", "force_cli_direct": True}))
+    assert cwd.resolve() == repo_root.resolve()
+
+
+def test_relay_workorder_rejects_untrusted_context_workspace_root(tmp_path, repo_root):
+    """移动中继显式带任意 git workspace_root → 不采信，避免客户端选择执行目录。"""
+    (tmp_path / ".git").mkdir()
+    svc = _svc()
+    svc._grant = CapabilityGrant.product()
+    cwd = svc._cli_workspace(
+        {
+            "source": "mobile_relay",
+            "force_cli_direct": True,
+            "workspace_root": str(tmp_path),
+        }
+    )
+    assert Path(cwd).resolve() == repo_root.resolve()
+    assert Path(cwd).resolve() != tmp_path.resolve()
+
+
+def test_relay_workorder_uses_inferred_verified_workspace_root(tmp_path, monkeypatch):
+    """旧手机包未传 workspace_root 时，桌面源码运行可回落到已验证的 XCMAX 仓库。"""
+    (tmp_path / ".git").mkdir()
+    svc = _svc()
+    svc._grant = CapabilityGrant.product()
+    monkeypatch.setattr(
+        "app.application.super_employee_service.resolve_verified_relay_workspace_root",
+        lambda _ctx: str(tmp_path),
+    )
+    cwd = Path(svc._cli_workspace({"source": "mobile_relay", "force_cli_direct": True}))
+    assert cwd.resolve() == tmp_path.resolve()
+
+
+def test_real_repo_ignored_for_nonrelay_product_request(repo_root, monkeypatch):
+    """安全：非中继的产品请求即便配了 env 也不给真仓库，仍走隔离临时区。"""
+    svc = _svc()
+    svc._grant = CapabilityGrant.product()
+    monkeypatch.setenv("XCMAX_RELAY_WORKSPACE_ROOT", str(repo_root))
+    cwd = svc._cli_workspace({"workspace_root": str(repo_root)})
+    assert cwd == svc._product_ephemeral_workspace()
+
+
+def test_relay_real_repo_requires_git_dir(tmp_path, monkeypatch):
+    """env 指向非 git 目录 → 不采信，回隔离临时区。"""
+    svc = _svc()
+    svc._grant = CapabilityGrant.product()
+    monkeypatch.setenv("XCMAX_RELAY_WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setattr(
+        "app.application.relay_workspace._inferred_xcmax_repo_root",
+        lambda: "",
+    )
+    cwd = svc._cli_workspace({"source": "mobile_relay", "force_cli_direct": True})
+    assert cwd == svc._product_ephemeral_workspace()
+
+
+# ── 工具面层：产品域禁写/执行类工具，工厂域不限 ──
+
+
+def test_product_cmd_is_restricted():
+    svc = _svc()
+    svc._grant = CapabilityGrant.product()
+    cmd = svc._conversation_cmd("/bin/claude", "hi", None)
+    assert "--disallowedTools" in cmd
+    assert "default" in cmd  # 权限模式降到 default
+    assert "acceptEdits" not in cmd
+    assert "bypassPermissions" not in cmd
+
+
+def test_factory_cmd_is_unrestricted():
+    svc = _svc()
+    svc._grant = CapabilityGrant(ExecutionScope.FACTORY, "xcmax")
+    cmd = svc._conversation_cmd("/bin/claude", "hi", None)
+    assert "--disallowedTools" not in cmd
+    assert "acceptEdits" in cmd
+
+
+# ── 凭证层：产品域剥掉平台令牌与 git 凭证 ──
+
+
+def test_product_subprocess_env_strips_factory_secrets(monkeypatch):
+    monkeypatch.setenv(FACTORY_TOKEN_ENV, "platform-secret")
+    monkeypatch.setenv("XCMAX_FACTORY_ANYTHING", "x")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_xxx")
+    svc = _svc()
+    svc._grant = CapabilityGrant.product()
+    env = svc._cli_subprocess_env()
+    assert env is not None
+    assert FACTORY_TOKEN_ENV not in env
+    assert "XCMAX_FACTORY_ANYTHING" not in env
+    assert "GITHUB_TOKEN" not in env
+
+
+def test_factory_subprocess_env_keeps_environment(monkeypatch):
+    monkeypatch.setenv(FACTORY_TOKEN_ENV, "platform-secret")
+    monkeypatch.delenv("XCMAX_CLI_PROXY", raising=False)
+    svc = _svc()
+    svc._grant = CapabilityGrant(ExecutionScope.FACTORY, "xcmax")
+    # 工厂域且无代理：继承环境（返回 None），与历史行为一致，令牌保留。
+    assert svc._cli_subprocess_env() is None
+
+
+# ── 派工层：产品域不暴露工程路径；令牌绝不入派工/持久化载荷 ──
+
+
+def test_product_dispatch_request_hides_server_path_and_scrubs_token():
+    svc = _svc()
+    svc._grant = CapabilityGrant.product()
+    req = svc._build_dispatch_request(
+        request_id="r1",
+        created_at="now",
+        user_id=1,
+        message="修复一下登录",
+        context={"_factory_token": "should-not-leak", "source": "admin_im"},
+    )
+    assert req["workspace_root"] == ""  # 产品域不向远端暴露服务端 repo 路径
+    assert req["scope"] == "product"
+    assert "_factory_token" not in str(req)  # 令牌被纵深剔除
+
+
+def test_factory_dispatch_request_carries_workspace(repo_root):
+    svc = _svc()
+    svc._grant = CapabilityGrant(ExecutionScope.FACTORY, "xcmax")
+    req = svc._build_dispatch_request(
+        request_id="r2",
+        created_at="now",
+        user_id=1,
+        message="加个接口",
+        context={},
+    )
+    assert req["scope"] == "factory"
+    assert req["workspace_id"] == "xcmax"
+    assert req["workspace_root"] == str(repo_root)
+
+
+def test_default_grant_is_product_deny_by_default():
+    # 任何绕过 invoke 的实例化路径也落在安全档。
+    assert _svc()._grant.scope is ExecutionScope.PRODUCT
+
+
+# ── 审计层：信任决策留痕（#7）──
+
+
+def _stub_dispatch(svc, monkeypatch):
+    """挡掉网络/CLI 重路径，让 invoke 走到落库 + 审计日志即可。"""
+    monkeypatch.setattr(svc, "_should_reply_with_cli", lambda text, ctx: False)
+    monkeypatch.setattr(svc, "_dispatch", lambda req: {"status": "queued", "accepted": False})
+    monkeypatch.setattr(svc, "_cli_reply_body", lambda text, ctx: "")
+
+
+def test_factory_dispatch_is_audited(tmp_path, caplog, monkeypatch):
+    monkeypatch.setenv(FACTORY_TOKEN_ENV, "platform-secret")
+    svc = ClaudeSuperEmployeeService(storage_root=tmp_path)
+    _stub_dispatch(svc, monkeypatch)
+    with caplog.at_level(logging.INFO):
+        svc.invoke(user_id=7, message="加个接口", context=factory_context("xcmax"))
+    assert any(
+        "factory dispatch" in r.getMessage() and "workspace=xcmax" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_rejected_factory_token_warns(tmp_path, caplog, monkeypatch):
+    monkeypatch.setenv(FACTORY_TOKEN_ENV, "platform-secret")
+    svc = ClaudeSuperEmployeeService(storage_root=tmp_path)
+    _stub_dispatch(svc, monkeypatch)
+    with caplog.at_level(logging.WARNING):
+        # 带令牌却不匹配 → 降级产品域 + 警告留痕（可疑越权尝试）。
+        svc.invoke(user_id=7, message="hi", context={"_factory_token": "wrong-guess"})
+    assert any("token rejected" in r.getMessage() for r in caplog.records)
+
+
+def test_persistent_worktree_path_env_gated(repo_root, monkeypatch, tmp_path):
+    """持久 worktree：仅在配了真仓库 + 未显式关闭时启用，路径在稳定桌面态目录下。"""
+    svc = _svc()
+    monkeypatch.delenv("XCMAX_RELAY_WORKSPACE_ROOT", raising=False)
+    monkeypatch.delenv("DEVFLEET_WORKSPACE_ROOT", raising=False)
+    assert svc._relay_persistent_worktree_path() == ""  # 没配真仓库 → 不启用
+    monkeypatch.setenv("XCMAX_RELAY_WORKSPACE_ROOT", str(repo_root))
+    monkeypatch.setenv("XCAGI_DESKTOP_DATA_DIR", str(tmp_path))
+    p = svc._relay_persistent_worktree_path()
+    assert p and "relay_worktrees" in p and p.startswith(str(tmp_path))
+    monkeypatch.setenv("XCMAX_RELAY_PERSISTENT_WORKTREE", "0")
+    assert svc._relay_persistent_worktree_path() == ""  # 显式关闭 → 回每任务新建
+
+
+def test_remove_worktree_keeps_persistent(repo_root, monkeypatch, tmp_path):
+    """_remove_worktree 对持久 worktree 不删（保留复用）。"""
+    svc = _svc()
+    monkeypatch.setenv("XCMAX_RELAY_WORKSPACE_ROOT", str(repo_root))
+    monkeypatch.setenv("XCAGI_DESKTOP_DATA_DIR", str(tmp_path))
+    persistent = svc._relay_persistent_worktree_path()
+    calls = []
+    monkeypatch.setattr(svc, "_git", lambda *a, **k: calls.append(a) or _Dummy())
+    svc._remove_worktree(str(repo_root), persistent)
+    assert calls == []  # 持久 worktree 不应触发 git worktree remove
+
+
+class _Dummy:
+    returncode = 0
+    stdout = ""
+    stderr = ""
+
+
+def test_cursor_agent_command_has_no_extra_agent_subcommand():
+    """cursor-agent 是独立 agent 二进制：命令应是 `cursor-agent --print ...`，不再接 agent 子命令。"""
+    from pathlib import Path
+
+    from app.application.super_employee_service import CURSOR_PROFILE, _cursor_cli_command
+
+    assert CURSOR_PROFILE.cli_binary == "cursor-agent"
+    cmd = _cursor_cli_command("/usr/local/bin/cursor-agent", "hi", Path("/tmp/o"), "/tmp")
+    assert cmd[0].endswith("cursor-agent")
+    assert "agent" not in cmd[1:3]  # 紧跟的不是 agent 子命令
+    assert "--print" in cmd
+    # 旧 cursor 二进制仍保留 agent 子命令（兼容）。
+    legacy = _cursor_cli_command("/usr/local/bin/cursor", "hi", Path("/tmp/o"), "/tmp")
+    assert legacy[1] == "agent"
+
+
+def test_trae_cli_uses_headless_agent_command():
+    """Trae 企业版用 trae-cli 无头 agent：trae-cli --print --output-format stream-json --yolo <prompt>。"""
+    from pathlib import Path
+
+    from app.application.super_employee_service import TRAE_PROFILE, _trae_cli_command
+
+    assert TRAE_PROFILE.cli_binary == "trae-cli"
+    assert TRAE_PROFILE.cli_stream_json is True
+    cmd = _trae_cli_command("/x/trae-cli", "做个任务", Path("/tmp/o"), "/tmp")
+    assert cmd[0].endswith("trae-cli")
+    assert "--print" in cmd and "stream-json" in cmd and "--yolo" in cmd
+    assert cmd[-1] == "做个任务"  # prompt 在末位，不会被前面的变长参数吞掉

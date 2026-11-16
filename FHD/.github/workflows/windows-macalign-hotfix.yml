@@ -1,0 +1,137 @@
+# CI SSOT: edit this file, then run: python scripts/dev/publish_ci_workflows_to_root.py
+name: Windows Mac-Align Hotfix
+
+# Legacy unsigned Windows output is quarantined as an internal CI artifact.
+# Public Windows delivery must use the signed, exact-SHA release orchestrator.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Product version (SSOT four-part)"
+        required: true
+        default: "1.0.0.3"
+      release_sha:
+        description: "Exact 40-character release commit"
+        required: true
+        type: string
+      security_scan_run_id:
+        description: "Current successful full security scan run ID"
+        required: true
+        type: string
+      previous_security_scan_run_id:
+        description: "Previous-day successful full security scan run ID"
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+defaults:
+  run:
+    working-directory: FHD
+
+env:
+  XCAGI_BUILD_SHA: ${{ inputs.release_sha }}
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+      # This lane is deliberately non-publishable until Authenticode exists.
+      XCAGI_REQUIRE_WINDOWS_SIGNING: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha }}
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Verify exact release SHA
+        shell: pwsh
+        run: |
+          $actual = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          $expected = "${{ inputs.release_sha }}".Trim().ToLowerInvariant()
+          if ($expected -notmatch '^[0-9a-f]{40}$') { throw "release_sha must be 40 hex characters" }
+          if ($actual -ne $expected) { throw "checkout drift: $actual != $expected" }
+
+      - name: Download normalized security evidence
+        uses: actions/download-artifact@v8
+        with:
+          name: xcagi-security-release-reports
+          path: ${{ runner.temp }}/security-reports/current
+          run-id: ${{ inputs.security_scan_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download prior-day normalized security evidence
+        uses: actions/download-artifact@v8
+        with:
+          name: xcagi-security-release-reports
+          path: ${{ runner.temp }}/security-reports/previous
+          run-id: ${{ inputs.previous_security_scan_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Enforce exact-SHA two-day security clearance
+        shell: pwsh
+        run: |
+          python scripts/security/verify_security_scan_pair.py `
+            --previous-dir "${{ runner.temp }}/security-reports/previous" `
+            --current-dir "${{ runner.temp }}/security-reports/current" `
+            --release-sha "${{ inputs.release_sha }}"
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: |
+            FHD/frontend/package-lock.json
+            FHD/desktop/package-lock.json
+
+      - name: Build quarantined Windows enterprise installer
+        shell: pwsh
+        run: |
+          $v = "${{ inputs.version }}".TrimStart('v','V')
+          scripts/package/build-installer.ps1 -Version $v -ProductSku enterprise -SkipUiInstaller
+
+      - name: Mark unsigned output as non-publishable
+        shell: pwsh
+        run: |
+          $v = "${{ inputs.version }}".TrimStart('v','V')
+          $dir = "release/xcagi-v$v/enterprise"
+          $src = Join-Path $dir "XCAGI-Enterprise-Setup-$v-x64.exe"
+          if (-not (Test-Path $src)) { throw "Installer missing: $src" }
+          $dst = Join-Path $dir "XCAGI-Enterprise-Setup-$v-x64-macalign.exe"
+          Copy-Item -Force $src $dst
+          "SHA256=$((Get-FileHash $dst -Algorithm SHA256).Hash)" | Out-File -Encoding utf8 (Join-Path $dir "XCAGI-Enterprise-Setup-$v-x64-macalign.exe.sha256")
+          @"
+          WINDOWS QUARANTINE ARTIFACT
+          ProductVersion: $v
+          Build SHA: ${{ inputs.release_sha }}
+          Authenticode: unsigned
+          Public delivery: forbidden; use the signed release orchestrator.
+          "@ | Out-File -Encoding utf8 (Join-Path $dir "WINDOWS-QUARANTINE.txt")
+          python scripts/package/generate-windows-hotfix-pointer.py `
+            --version $v `
+            --git-sha "${{ inputs.release_sha }}" `
+            --artifact $dst `
+            --artifact-url "artifact://github-actions/XCAGI-Enterprise-Setup-$v-x64-macalign.exe" `
+            --release-metadata-source config/download_release.json `
+            --output (Join-Path $dir "WINDOWS-QUARANTINE.json")
+
+      - name: Retain quarantined build for controlled test devices
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcagi-windows-unsigned-quarantine-${{ inputs.release_sha }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            FHD/release/xcagi-v*/enterprise/XCAGI-Enterprise-Setup-*-macalign.exe
+            FHD/release/xcagi-v*/enterprise/XCAGI-Enterprise-Setup-*-macalign.exe.sha256
+            FHD/release/xcagi-v*/enterprise/WINDOWS-QUARANTINE.txt
+            FHD/release/xcagi-v*/enterprise/WINDOWS-QUARANTINE.json

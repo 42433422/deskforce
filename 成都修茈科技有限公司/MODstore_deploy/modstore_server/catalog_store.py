@@ -1,0 +1,490 @@
+"""公网 Catalog 本地 JSON 存储（首期无数据库）。"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import tempfile
+import threading
+import zipfile
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+
+from modstore_server.catalog_archive_integrity import archive_path as _archive_path
+from modstore_server.catalog_archive_integrity import sha256_file
+from modstore_server.catalog_publication_policy import stable_version
+from modstore_server.operational_errors import RECOVERABLE_ERRORS
+
+_lock = threading.Lock()
+
+
+class PackageConflictError(ValueError):
+    """A published version cannot be replaced or moved backwards."""
+
+
+@contextmanager
+def catalog_write_lock():
+    """Serialize catalog mutations across workers, not only one Python process."""
+    import fcntl
+
+    with _lock:
+        root = default_catalog_dir()
+        root.mkdir(parents=True, exist_ok=True)
+        with (root / ".catalog-write.lock").open("a+b") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def norm_pkg_id(v: Any) -> str:
+    """与列表/登记接口对齐的包 id 规范化（去空白、int/float 与字符串统一）。"""
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return str(v).strip()
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        try:
+            if v.is_integer():
+                return str(int(v))
+        except (ValueError, OverflowError):
+            pass
+        return str(v).strip()
+    return str(v).strip()
+
+
+def norm_version(v: Any) -> str:
+    if v is None:
+        return ""
+    return str(v).strip()
+
+
+def default_catalog_dir() -> Path:
+    raw = (os.environ.get("MODSTORE_CATALOG_DIR") or "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return Path(__file__).resolve().parent / "catalog_data"
+
+
+def packages_path() -> Path:
+    d = default_catalog_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    return d / "packages.json"
+
+
+def files_dir() -> Path:
+    d = default_catalog_dir() / "files"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def employee_pack_records_from_store() -> Dict[str, Dict[str, Any]]:
+    """``pkg_id ->`` package dict：供编制内员工加载，**不经过 AI 市场上架**。
+
+    包含：
+    - ``artifact == employee_pack`` 的登记行；或
+    - ``pkg_id`` 在 ``duty_roster.all_planned_employee_ids`` 内，且 ``stored_filename`` 指向
+      ``.xcemp`` / ``.zip`` / ``.xcmod``（内部登记有时未写 artifact）。
+
+    数据来自 ``MODSTORE_CATALOG_DIR``（或默认 ``modstore_server/catalog_data``）下的
+    ``packages.json`` + ``files/``。
+    """
+    from modstore_server.duty_roster import all_planned_employee_ids
+
+    roster = all_planned_employee_ids()
+    out: Dict[str, Dict[str, Any]] = {}
+    for r in load_store().get("packages") or []:
+        if not isinstance(r, dict):
+            continue
+        pid = norm_pkg_id(r.get("id"))
+        if not pid:
+            continue
+        art = str(r.get("artifact") or "").strip().lower()
+        fn = str(r.get("stored_filename") or "").strip()
+        fn_low = fn.lower()
+        ziptail = fn_low.endswith((".xcemp", ".zip", ".xcmod"))
+        if art == "employee_pack":
+            out[pid] = r
+            continue
+        if pid in roster and ziptail:
+            out[pid] = r
+    return out
+
+
+def load_store() -> Dict[str, Any]:
+    p = packages_path()
+    if not p.is_file():
+        return {"packages": []}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("packages"), list):
+            return data
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {"packages": []}
+
+
+def save_store(data: Dict[str, Any]) -> None:
+    p = packages_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=p.parent, delete=False) as f:
+        tmp = Path(f.name)
+        try:
+            f.write(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+            tmp.replace(p)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+
+def catalog_archive_available(filename: Any, expected_sha256: Any) -> bool:
+    return _archive_path(filename, expected_sha256, (files_dir(),)) is not None
+
+
+def public_package_available(row: Dict[str, Any]) -> bool:
+    if str(row.get("download_url") or "").strip():
+        return True
+    stored = str(row.get("stored_filename") or "").strip()
+    return bool(stored) and catalog_archive_available(stored, row.get("sha256"))
+
+
+def market_archive_path(filename: Any, expected_sha256: Any) -> Path | None:
+    return _archive_path(
+        filename,
+        expected_sha256,
+        (
+            files_dir(),
+            default_catalog_dir() / "market_files",
+            Path(__file__).resolve().parent / "market_files",
+        ),
+    )
+
+
+def market_item_available(item: Any) -> bool:
+    if str(item.artifact or "").lower() == "workflow_template" and not item.stored_filename:
+        try:
+            graph = json.loads(item.graph_snapshot or "{}")
+            return (
+                isinstance(graph, dict)
+                and isinstance(graph.get("nodes"), list)
+                and bool(graph["nodes"])
+            )
+        except (TypeError, ValueError):
+            return False
+    return market_archive_path(item.stored_filename, item.sha256) is not None
+
+
+def read_package_manifest_from_zip(path: Path) -> Dict[str, Any] | None:
+    """Return root ``manifest.json`` or the first top-level child manifest.
+
+    ``.xcemp`` / ``.xcmod`` packages are zip files.  The catalog row metadata is
+    only safe if it matches the manifest embedded in the archive; otherwise the
+    UI may show one employee while the downloaded package runs another one.
+    """
+    try:
+        with zipfile.ZipFile(path) as zf:
+            manifest_names = (["manifest.json"] if "manifest.json" in zf.namelist() else []) + [
+                n for n in zf.namelist() if n.count("/") == 1 and n.endswith("/manifest.json")
+            ]
+            if not manifest_names:
+                return None
+            data = json.loads(zf.read(manifest_names[0]).decode("utf-8"))
+            return data if isinstance(data, dict) else None
+    except (OSError, zipfile.BadZipFile, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+
+def package_manifest_alignment_errors(record: Dict[str, Any], archive_path: Path) -> List[str]:
+    """Validate catalog metadata against the manifest embedded in the archive.
+
+    If employee.id or workflow_employees[].id differ from the expected pack id,
+    this function **auto-repairs** the zip in-place and returns no errors.
+    This ensures that regardless of which code path produced the zip, the
+    alignment is always correct after this function runs.
+    """
+    import logging as _logging
+    import shutil as _shutil
+    import zipfile as _zipfile
+
+    _LOG_ALIGN = _logging.getLogger(__name__)
+    _LOG_ALIGN.info("package manifest alignment check started")
+    if not archive_path.is_file():
+        return ["包文件不存在，无法校验 manifest 对齐"]
+    inner = read_package_manifest_from_zip(archive_path)
+    if inner is None:
+        return ["包内未找到顶层 manifest.json 或 manifest 无法解析"]
+
+    errors: List[str] = []
+    expected_id = norm_pkg_id(record.get("id"))
+    inner_id = norm_pkg_id(inner.get("id"))
+    if expected_id and inner_id and expected_id != inner_id:
+        errors.append(f"metadata.id={expected_id} 与包内 manifest.id={inner_id} 不一致")
+
+    expected_ver = norm_version(record.get("version"))
+    inner_ver = norm_version(inner.get("version"))
+    if expected_ver and inner_ver and expected_ver != inner_ver:
+        errors.append(f"metadata.version={expected_ver} 与包内 manifest.version={inner_ver} 不一致")
+
+    if str(record.get("artifact") or "").strip().lower() == "employee_pack":
+        _needs_repair = False
+        if isinstance(inner.get("employee"), dict):
+            emp_id = norm_pkg_id(inner["employee"].get("id"))
+            if expected_id and emp_id and expected_id != emp_id:
+                _LOG_ALIGN.warning("AUTO-REPAIR: employee id mismatch repaired")
+                inner["employee"]["id"] = expected_id
+                _needs_repair = True
+        wf_rows = inner.get("workflow_employees")
+        if isinstance(wf_rows, list):
+            for idx, row in enumerate(wf_rows):
+                if not isinstance(row, dict):
+                    continue
+                wf_id = norm_pkg_id(row.get("id"))
+                if expected_id and wf_id and expected_id != wf_id:
+                    _LOG_ALIGN.warning(
+                        "AUTO-REPAIR: workflow employee id mismatch repaired at index %d",
+                        idx,
+                    )
+                    row["id"] = expected_id
+                    _needs_repair = True
+        if _needs_repair:
+            try:
+                _top_dir = None
+                _other_entries: list = []
+                with _zipfile.ZipFile(archive_path, "r") as _zr:
+                    for _n in _zr.namelist():
+                        if _n.endswith("/manifest.json") and "/" not in _n.removesuffix(
+                            "/manifest.json"
+                        ).replace(_n.split("/")[0] + "/", "", 1):
+                            _top_dir = _n.split("/")[0]
+                        else:
+                            _other_entries.append(_n)
+                if _top_dir:
+                    _mf_key = _top_dir + "/manifest.json"
+                    _tmp_path = archive_path.with_suffix(".xcemp.tmp")
+                    with _zipfile.ZipFile(_tmp_path, "w", compression=_zipfile.ZIP_DEFLATED) as _zw:
+                        _zw.writestr(
+                            _mf_key,
+                            json.dumps(inner, ensure_ascii=False, indent=2) + "\n",
+                        )
+                        with _zipfile.ZipFile(archive_path, "r") as _zr:
+                            for _n in _other_entries:
+                                _zw.writestr(_n, _zr.read(_n))
+                    _shutil.move(str(_tmp_path), str(archive_path))
+                    _LOG_ALIGN.info("AUTO-REPAIR: package archive rewritten successfully")
+            except RECOVERABLE_ERRORS as _repair_exc:
+                _LOG_ALIGN.error("AUTO-REPAIR failed (%s)", type(_repair_exc).__name__)
+
+    return errors
+
+
+def list_packages(
+    *,
+    artifact: str | None = None,
+    q: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> Tuple[List[Dict[str, Any]], int]:
+    with _lock:
+        rows = list(load_store().get("packages") or [])
+    total = len(rows)
+    if artifact:
+        rows = [r for r in rows if str(r.get("artifact") or "mod") == artifact]
+    if q:
+        ql = q.lower()
+        rows = [
+            r
+            for r in rows
+            if ql in str(r.get("name", "")).lower()
+            or ql in str(r.get("id", "")).lower()
+            or ql in str(r.get("description", "")).lower()
+        ]
+    rows = rows[offset : offset + max(1, min(limit, 500))]
+    return rows, total
+
+
+def get_package(id_: str, version: str) -> Dict[str, Any] | None:
+    id_ = (id_ or "").strip()
+    version = (version or "").strip()
+    with _lock:
+        for r in load_store().get("packages") or []:
+            if str(r.get("id")) == id_ and str(r.get("version")) == version:
+                return dict(r)
+    return None
+
+
+def list_versions(id_: str) -> List[Dict[str, Any]]:
+    """返回某个包 id 下的全部版本（按 created_at / version 倒序，缺失字段时按列表顺序）。"""
+    pid = (id_ or "").strip()
+    if not pid:
+        return []
+    with _lock:
+        rows = [dict(r) for r in load_store().get("packages") or [] if str(r.get("id")) == pid]
+    rows.sort(
+        key=lambda r: (str(r.get("created_at") or ""), str(r.get("version") or "")),
+        reverse=True,
+    )
+    return rows
+
+
+def promote_draft_to_stable(id_: str, from_version: str) -> Dict[str, Any]:
+    """把 draft-* 草稿晋升为正式版本：以 from_version 为模板，生成新的稳定版记录。
+
+    规则：
+    - from_version 必须以 ``draft-`` 开头且在该 id 下存在；
+    - 新版本号 = from_version 去掉 ``draft-`` 前缀后保留剩余段，若已存在则追加 ``+N``；
+    - 写入新记录后保留旧 draft，便于回滚。
+    """
+    pid = (id_ or "").strip()
+    src_ver = (from_version or "").strip()
+    if not pid or not src_ver:
+        raise ValueError("id 与 from_version 必填")
+    if not src_ver.startswith("draft-"):
+        raise ValueError("from_version 必须以 draft- 开头")
+    with catalog_write_lock():
+        data = load_store()
+        pkgs = list(data.get("packages") or [])
+        src = next(
+            (
+                r
+                for r in pkgs
+                if norm_pkg_id(r.get("id")) == pid and norm_version(r.get("version")) == src_ver
+            ),
+            None,
+        )
+        if not src:
+            raise ValueError("源版本不存在")
+        base_target = src_ver[len("draft-") :].strip() or "1.0.0"
+        target = base_target
+        bump = 1
+        existing_versions = {
+            norm_version(r.get("version")) for r in pkgs if norm_pkg_id(r.get("id")) == pid
+        }
+        while target in existing_versions:
+            bump += 1
+            target = f"{base_target}+{bump}"
+        rec = dict(src)
+        rec["version"] = target
+        rec["release_channel"] = "stable"
+        rec.pop("created_at", None)
+        pkgs.append(rec)
+        data["packages"] = pkgs
+        save_store(data)
+    return rec
+
+
+def append_package(record: Dict[str, Any], src_file: Path | None) -> Dict[str, Any]:
+    """Commit immutable package bytes before atomically exposing their catalog row."""
+    pid = norm_pkg_id(record.get("id"))
+    ver = norm_version(record.get("version"))
+    if not pid or not ver:
+        raise ValueError("id 与 version 必填")
+    rec = dict(record, id=pid, version=ver)
+    rec.setdefault("artifact", "mod")
+    rec.setdefault("commerce", {"mode": "free", "product_id": None, "sku": None})
+    rec.setdefault("license", {"type": "none", "verify_url": None})
+    staged: Path | None = None
+    dest: Path | None = None
+    created = False
+    try:
+        if src_file is not None:
+            # An isolated copy makes the digest stable even if the caller later
+            # edits its upload file. No live published path is ever overwritten.
+            with tempfile.NamedTemporaryFile(dir=files_dir(), delete=False) as f:
+                staged = Path(f.name)
+                with src_file.open("rb") as source:
+                    shutil.copyfileobj(source, f)
+                f.flush()
+                os.fsync(f.fileno())
+            rec["sha256"] = sha256_file(staged)
+            rec["file_size"] = staged.stat().st_size
+            ext = src_file.suffix.lower()
+            if ext not in {".xcemp", ".xcmod", ".zip"}:
+                ext = ".xcmod"
+            storage_id = hashlib.sha256(f"{pid}\0{ver}\0{rec['sha256']}".encode()).hexdigest()
+            dest = files_dir() / f"package_{storage_id}{ext}"
+            rec["stored_filename"] = dest.name
+        with catalog_write_lock():
+            path = packages_path()
+            data = (
+                json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"packages": []}
+            )
+            if not isinstance(data, dict) or not isinstance(data.get("packages"), list):
+                raise ValueError("Catalog 格式损坏，拒绝覆盖已有发布记录")
+            packages = list(data["packages"])
+            same_id = [r for r in packages if norm_pkg_id(r.get("id")) == pid]
+            existing = next((r for r in same_id if norm_version(r.get("version")) == ver), None)
+            if existing is not None:
+                if not rec.get("sha256") or existing.get("sha256") != rec["sha256"]:
+                    raise PackageConflictError(
+                        "已发布 version 不可覆盖；源码变更须提升 manifest.version"
+                    )
+                return dict(existing)  # Preserve the original source attestation.
+            if rec.get("automation_provenance"):
+                candidate = stable_version(ver)
+                for row in same_id:
+                    if str(row.get("version") or "").startswith("draft-"):
+                        continue
+                    if stable_version(row.get("version")) >= candidate:
+                        raise PackageConflictError("自动发布 version 必须严格高于已有版本")
+            if staged is not None and dest is not None:
+                if dest.exists():
+                    if sha256_file(dest) != rec["sha256"]:
+                        raise PackageConflictError("制品摘要路径冲突，拒绝覆盖")
+                else:
+                    staged.replace(dest)
+                    created = True
+            packages.append(rec)
+            data["packages"] = packages
+            try:
+                save_store(data)
+            except (OSError, TypeError, ValueError):
+                if created and dest is not None:
+                    dest.unlink(missing_ok=True)
+                raise
+        return rec
+    finally:
+        if staged is not None:
+            staged.unlink(missing_ok=True)
+
+
+def remove_package(pkg_id: str, version: str | None = None, *, remove_files: bool = True) -> int:
+    """从 packages.json 移除记录；若 ``version`` 为 ``None`` 则移除该 ``pkg_id`` 下全部版本。
+
+    同时删除 ``stored_filename`` 指向的 ``files/`` 下本地文件（若存在）。
+    返回移除的记录条数。
+    """
+    pid = norm_pkg_id(pkg_id)
+    if not pid:
+        return 0
+    ver_filter = norm_version(version) if version is not None else None
+    removed = 0
+    with catalog_write_lock():
+        data = load_store()
+        pkgs = list(data.get("packages") or [])
+        new_pkgs: List[Dict[str, Any]] = []
+        for r in pkgs:
+            if norm_pkg_id(r.get("id")) != pid:
+                new_pkgs.append(r)
+                continue
+            if ver_filter is not None and norm_version(r.get("version")) != ver_filter:
+                new_pkgs.append(r)
+                continue
+            fn = str(r.get("stored_filename") or "").strip()
+            if fn and remove_files:
+                p = files_dir() / fn
+                if p.is_file():
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
+            removed += 1
+        data["packages"] = new_pkgs
+        save_store(data)
+    return removed

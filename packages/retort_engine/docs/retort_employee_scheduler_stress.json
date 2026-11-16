@@ -1,0 +1,870 @@
+{
+  "evidence": {
+    "employee_results_dir": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results",
+    "history_store": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/retort_history.sqlite",
+    "launch_mode": "concurrent_popen",
+    "process_ids": [
+      26944,
+      26945,
+      26946,
+      26947,
+      26948,
+      26949,
+      26950,
+      26951,
+      26952,
+      26969,
+      26970,
+      26971,
+      26980,
+      26981,
+      26982,
+      27017,
+      27018,
+      27019,
+      27045,
+      27046,
+      27047,
+      27048,
+      27049,
+      27050,
+      27051,
+      27052,
+      27053,
+      27054,
+      27055,
+      27056
+    ],
+    "queue_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_queue.jsonl",
+    "worker": "retort_engine.employee_runtime_worker"
+  },
+  "missing_history_ids": [],
+  "missing_result_ids": [],
+  "project": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine",
+  "rounds": [
+    {
+      "round_completed": true,
+      "round_index": 1,
+      "task_count": 3,
+      "worker_count": 3,
+      "workers": [
+        {
+          "payload_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-01-worker-01.json",
+          "process": {
+            "command": [
+              "/Users/a4243342/Desktop/XCMAX/FHD/.venv/bin/python",
+              "-c",
+              "import sys; sys.path.insert(0, '/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine'); from retort_engine.employee_runtime_worker import main; raise SystemExit(main())",
+              "--payload-file",
+              "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-01-worker-01.json"
+            ],
+            "duration_sec": 0.053,
+            "ended_at": "2026-06-28T08:19:48.729854+00:00",
+            "pid": 26944,
+            "returncode": 0,
+            "started_at": "2026-06-28T08:19:48.676503+00:00",
+            "stderr": "",
+            "stdout": "s/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-01-worker-01.json\",\n      \"parent_pid\": 26924,\n      \"parent_pid_matches_launcher\": true,\n      \"payload_nonce\": \"\",\n      \"payload_nonce_verified\": false,\n      \"payload_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-01-worker-01.json\",\n      \"payload_path_verified\": true,\n      \"pid_differs_from_parent\": true,\n      \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-01-worker-01.json\",\n      \"result_path_verified\": true,\n      \"runtime_boundary\": \"subprocess_payload_file_contract\",\n      \"runtime_boundary_verified\": false,\n      \"worker_pid\": 26944\n    },\n    \"queue_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_queue.jsonl\",\n    \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-01-worker-01.json\",\n    \"task_result_count\": 1,\n    \"worker_payload\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-01-worker-01.json\",\n    \"worker_review\": {\n      \"artifact\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-01-worker-01.worker_review.json\",\n      \"comment_count\": 2,\n      \"file_count\": 1,\n      \"status\": \"reviewed\",\n      \"task_group_count\": 1\n    }\n  },\n  \"source\": \"employee_scheduler_stress\"\n}\n"
+          },
+          "result_exists": true,
+          "result_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-01-worker-01.json",
+          "round_index": 1,
+          "task_count": 1,
+          "worker_index": 1
+        },
+        {
+          "payload_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-01-worker-02.json",
+          "process": {
+            "command": [
+              "/Users/a4243342/Desktop/XCMAX/FHD/.venv/bin/python",
+              "-c",
+              "import sys; sys.path.insert(0, '/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine'); from retort_engine.employee_runtime_worker import main; raise SystemExit(main())",
+              "--payload-file",
+              "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-01-worker-02.json"
+            ],
+            "duration_sec": 0.054,
+            "ended_at": "2026-06-28T08:19:48.732436+00:00",
+            "pid": 26945,
+            "returncode": 0,
+            "started_at": "2026-06-28T08:19:48.678305+00:00",
+            "stderr": "",
+            "stdout": "s/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-01-worker-02.json\",\n      \"parent_pid\": 26924,\n      \"parent_pid_matches_launcher\": true,\n      \"payload_nonce\": \"\",\n      \"payload_nonce_verified\": false,\n      \"payload_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-01-worker-02.json\",\n      \"payload_path_verified\": true,\n      \"pid_differs_from_parent\": true,\n      \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-01-worker-02.json\",\n      \"result_path_verified\": true,\n      \"runtime_boundary\": \"subprocess_payload_file_contract\",\n      \"runtime_boundary_verified\": false,\n      \"worker_pid\": 26945\n    },\n    \"queue_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_queue.jsonl\",\n    \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-01-worker-02.json\",\n    \"task_result_count\": 1,\n    \"worker_payload\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-01-worker-02.json\",\n    \"worker_review\": {\n      \"artifact\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-01-worker-02.worker_review.json\",\n      \"comment_count\": 2,\n      \"file_count\": 1,\n      \"status\": \"reviewed\",\n      \"task_group_count\": 1\n    }\n  },\n  \"source\": \"employee_scheduler_stress\"\n}\n"
+          },
+          "result_exists": true,
+          "result_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-01-worker-02.json",
+          "round_index": 1,
+          "task_count": 1,
+          "worker_index": 2
+        },
+        {
+          "payload_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-01-worker-03.json",
+          "process": {
+            "command": [
+              "/Users/a4243342/Desktop/XCMAX/FHD/.venv/bin/python",
+              "-c",
+              "import sys; sys.path.insert(0, '/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine'); from retort_engine.employee_runtime_worker import main; raise SystemExit(main())",
+              "--payload-file",
+              "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-01-worker-03.json"
+            ],
+            "duration_sec": 0.054,
+            "ended_at": "2026-06-28T08:19:48.733811+00:00",
+            "pid": 26946,
+            "returncode": 0,
+            "started_at": "2026-06-28T08:19:48.679543+00:00",
+            "stderr": "",
+            "stdout": "s/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-01-worker-03.json\",\n      \"parent_pid\": 26924,\n      \"parent_pid_matches_launcher\": true,\n      \"payload_nonce\": \"\",\n      \"payload_nonce_verified\": false,\n      \"payload_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-01-worker-03.json\",\n      \"payload_path_verified\": true,\n      \"pid_differs_from_parent\": true,\n      \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-01-worker-03.json\",\n      \"result_path_verified\": true,\n      \"runtime_boundary\": \"subprocess_payload_file_contract\",\n      \"runtime_boundary_verified\": false,\n      \"worker_pid\": 26946\n    },\n    \"queue_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_queue.jsonl\",\n    \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-01-worker-03.json\",\n    \"task_result_count\": 1,\n    \"worker_payload\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-01-worker-03.json\",\n    \"worker_review\": {\n      \"artifact\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-01-worker-03.worker_review.json\",\n      \"comment_count\": 2,\n      \"file_count\": 1,\n      \"status\": \"reviewed\",\n      \"task_group_count\": 1\n    }\n  },\n  \"source\": \"employee_scheduler_stress\"\n}\n"
+          },
+          "result_exists": true,
+          "result_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-01-worker-03.json",
+          "round_index": 1,
+          "task_count": 1,
+          "worker_index": 3
+        }
+      ]
+    },
+    {
+      "round_completed": true,
+      "round_index": 2,
+      "task_count": 3,
+      "worker_count": 3,
+      "workers": [
+        {
+          "payload_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-02-worker-01.json",
+          "process": {
+            "command": [
+              "/Users/a4243342/Desktop/XCMAX/FHD/.venv/bin/python",
+              "-c",
+              "import sys; sys.path.insert(0, '/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine'); from retort_engine.employee_runtime_worker import main; raise SystemExit(main())",
+              "--payload-file",
+              "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-02-worker-01.json"
+            ],
+            "duration_sec": 0.054,
+            "ended_at": "2026-06-28T08:19:48.791607+00:00",
+            "pid": 26947,
+            "returncode": 0,
+            "started_at": "2026-06-28T08:19:48.737226+00:00",
+            "stderr": "",
+            "stdout": "s/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-02-worker-01.json\",\n      \"parent_pid\": 26924,\n      \"parent_pid_matches_launcher\": true,\n      \"payload_nonce\": \"\",\n      \"payload_nonce_verified\": false,\n      \"payload_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-02-worker-01.json\",\n      \"payload_path_verified\": true,\n      \"pid_differs_from_parent\": true,\n      \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-02-worker-01.json\",\n      \"result_path_verified\": true,\n      \"runtime_boundary\": \"subprocess_payload_file_contract\",\n      \"runtime_boundary_verified\": false,\n      \"worker_pid\": 26947\n    },\n    \"queue_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_queue.jsonl\",\n    \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-02-worker-01.json\",\n    \"task_result_count\": 1,\n    \"worker_payload\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-02-worker-01.json\",\n    \"worker_review\": {\n      \"artifact\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-02-worker-01.worker_review.json\",\n      \"comment_count\": 2,\n      \"file_count\": 1,\n      \"status\": \"reviewed\",\n      \"task_group_count\": 1\n    }\n  },\n  \"source\": \"employee_scheduler_stress\"\n}\n"
+          },
+          "result_exists": true,
+          "result_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-02-worker-01.json",
+          "round_index": 2,
+          "task_count": 1,
+          "worker_index": 1
+        },
+        {
+          "payload_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-02-worker-02.json",
+          "process": {
+            "command": [
+              "/Users/a4243342/Desktop/XCMAX/FHD/.venv/bin/python",
+              "-c",
+              "import sys; sys.path.insert(0, '/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine'); from retort_engine.employee_runtime_worker import main; raise SystemExit(main())",
+              "--payload-file",
+              "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-02-worker-02.json"
+            ],
+            "duration_sec": 0.055,
+            "ended_at": "2026-06-28T08:19:48.793227+00:00",
+            "pid": 26948,
+            "returncode": 0,
+            "started_at": "2026-06-28T08:19:48.738662+00:00",
+            "stderr": "",
+            "stdout": "s/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-02-worker-02.json\",\n      \"parent_pid\": 26924,\n      \"parent_pid_matches_launcher\": true,\n      \"payload_nonce\": \"\",\n      \"payload_nonce_verified\": false,\n      \"payload_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-02-worker-02.json\",\n      \"payload_path_verified\": true,\n      \"pid_differs_from_parent\": true,\n      \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-02-worker-02.json\",\n      \"result_path_verified\": true,\n      \"runtime_boundary\": \"subprocess_payload_file_contract\",\n      \"runtime_boundary_verified\": false,\n      \"worker_pid\": 26948\n    },\n    \"queue_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_queue.jsonl\",\n    \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-02-worker-02.json\",\n    \"task_result_count\": 1,\n    \"worker_payload\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-02-worker-02.json\",\n    \"worker_review\": {\n      \"artifact\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-02-worker-02.worker_review.json\",\n      \"comment_count\": 2,\n      \"file_count\": 1,\n      \"status\": \"reviewed\",\n      \"task_group_count\": 1\n    }\n  },\n  \"source\": \"employee_scheduler_stress\"\n}\n"
+          },
+          "result_exists": true,
+          "result_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-02-worker-02.json",
+          "round_index": 2,
+          "task_count": 1,
+          "worker_index": 2
+        },
+        {
+          "payload_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-02-worker-03.json",
+          "process": {
+            "command": [
+              "/Users/a4243342/Desktop/XCMAX/FHD/.venv/bin/python",
+              "-c",
+              "import sys; sys.path.insert(0, '/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine'); from retort_engine.employee_runtime_worker import main; raise SystemExit(main())",
+              "--payload-file",
+              "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-02-worker-03.json"
+            ],
+            "duration_sec": 0.054,
+            "ended_at": "2026-06-28T08:19:48.794026+00:00",
+            "pid": 26949,
+            "returncode": 0,
+            "started_at": "2026-06-28T08:19:48.740270+00:00",
+            "stderr": "",
+            "stdout": "s/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-02-worker-03.json\",\n      \"parent_pid\": 26924,\n      \"parent_pid_matches_launcher\": true,\n      \"payload_nonce\": \"\",\n      \"payload_nonce_verified\": false,\n      \"payload_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-02-worker-03.json\",\n      \"payload_path_verified\": true,\n      \"pid_differs_from_parent\": true,\n      \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-02-worker-03.json\",\n      \"result_path_verified\": true,\n      \"runtime_boundary\": \"subprocess_payload_file_contract\",\n      \"runtime_boundary_verified\": false,\n      \"worker_pid\": 26949\n    },\n    \"queue_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_queue.jsonl\",\n    \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-02-worker-03.json\",\n    \"task_result_count\": 1,\n    \"worker_payload\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-02-worker-03.json\",\n    \"worker_review\": {\n      \"artifact\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-02-worker-03.worker_review.json\",\n      \"comment_count\": 2,\n      \"file_count\": 1,\n      \"status\": \"reviewed\",\n      \"task_group_count\": 1\n    }\n  },\n  \"source\": \"employee_scheduler_stress\"\n}\n"
+          },
+          "result_exists": true,
+          "result_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-02-worker-03.json",
+          "round_index": 2,
+          "task_count": 1,
+          "worker_index": 3
+        }
+      ]
+    },
+    {
+      "round_completed": true,
+      "round_index": 3,
+      "task_count": 3,
+      "worker_count": 3,
+      "workers": [
+        {
+          "payload_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-03-worker-01.json",
+          "process": {
+            "command": [
+              "/Users/a4243342/Desktop/XCMAX/FHD/.venv/bin/python",
+              "-c",
+              "import sys; sys.path.insert(0, '/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine'); from retort_engine.employee_runtime_worker import main; raise SystemExit(main())",
+              "--payload-file",
+              "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-03-worker-01.json"
+            ],
+            "duration_sec": 0.051,
+            "ended_at": "2026-06-28T08:19:48.847297+00:00",
+            "pid": 26950,
+            "returncode": 0,
+            "started_at": "2026-06-28T08:19:48.796797+00:00",
+            "stderr": "",
+            "stdout": "s/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-03-worker-01.json\",\n      \"parent_pid\": 26924,\n      \"parent_pid_matches_launcher\": true,\n      \"payload_nonce\": \"\",\n      \"payload_nonce_verified\": false,\n      \"payload_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-03-worker-01.json\",\n      \"payload_path_verified\": true,\n      \"pid_differs_from_parent\": true,\n      \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-03-worker-01.json\",\n      \"result_path_verified\": true,\n      \"runtime_boundary\": \"subprocess_payload_file_contract\",\n      \"runtime_boundary_verified\": false,\n      \"worker_pid\": 26950\n    },\n    \"queue_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_queue.jsonl\",\n    \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-03-worker-01.json\",\n    \"task_result_count\": 1,\n    \"worker_payload\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-03-worker-01.json\",\n    \"worker_review\": {\n      \"artifact\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-03-worker-01.worker_review.json\",\n      \"comment_count\": 2,\n      \"file_count\": 1,\n      \"status\": \"reviewed\",\n      \"task_group_count\": 1\n    }\n  },\n  \"source\": \"employee_scheduler_stress\"\n}\n"
+          },
+          "result_exists": true,
+          "result_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-03-worker-01.json",
+          "round_index": 3,
+          "task_count": 1,
+          "worker_index": 1
+        },
+        {
+          "payload_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-03-worker-02.json",
+          "process": {
+            "command": [
+              "/Users/a4243342/Desktop/XCMAX/FHD/.venv/bin/python",
+              "-c",
+              "import sys; sys.path.insert(0, '/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine'); from retort_engine.employee_runtime_worker import main; raise SystemExit(main())",
+              "--payload-file",
+              "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-03-worker-02.json"
+            ],
+            "duration_sec": 0.051,
+            "ended_at": "2026-06-28T08:19:48.848728+00:00",
+            "pid": 26951,
+            "returncode": 0,
+            "started_at": "2026-06-28T08:19:48.798150+00:00",
+            "stderr": "",
+            "stdout": "s/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-03-worker-02.json\",\n      \"parent_pid\": 26924,\n      \"parent_pid_matches_launcher\": true,\n      \"payload_nonce\": \"\",\n      \"payload_nonce_verified\": false,\n      \"payload_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-03-worker-02.json\",\n      \"payload_path_verified\": true,\n      \"pid_differs_from_parent\": true,\n      \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-03-worker-02.json\",\n      \"result_path_verified\": true,\n      \"runtime_boundary\": \"subprocess_payload_file_contract\",\n      \"runtime_boundary_verified\": false,\n      \"worker_pid\": 26951\n    },\n    \"queue_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_queue.jsonl\",\n    \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-03-worker-02.json\",\n    \"task_result_count\": 1,\n    \"worker_payload\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-03-worker-02.json\",\n    \"worker_review\": {\n      \"artifact\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-03-worker-02.worker_review.json\",\n      \"comment_count\": 2,\n      \"file_count\": 1,\n      \"status\": \"reviewed\",\n      \"task_group_count\": 1\n    }\n  },\n  \"source\": \"employee_scheduler_stress\"\n}\n"
+          },
+          "result_exists": true,
+          "result_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-03-worker-02.json",
+          "round_index": 3,
+          "task_count": 1,
+          "worker_index": 2
+        },
+        {
+          "payload_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-03-worker-03.json",
+          "process": {
+            "command": [
+              "/Users/a4243342/Desktop/XCMAX/FHD/.venv/bin/python",
+              "-c",
+              "import sys; sys.path.insert(0, '/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine'); from retort_engine.employee_runtime_worker import main; raise SystemExit(main())",
+              "--payload-file",
+              "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-03-worker-03.json"
+            ],
+            "duration_sec": 0.052,
+            "ended_at": "2026-06-28T08:19:48.850904+00:00",
+            "pid": 26952,
+            "returncode": 0,
+            "started_at": "2026-06-28T08:19:48.799221+00:00",
+            "stderr": "",
+            "stdout": "s/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-03-worker-03.json\",\n      \"parent_pid\": 26924,\n      \"parent_pid_matches_launcher\": true,\n      \"payload_nonce\": \"\",\n      \"payload_nonce_verified\": false,\n      \"payload_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-03-worker-03.json\",\n      \"payload_path_verified\": true,\n      \"pid_differs_from_parent\": true,\n      \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-03-worker-03.json\",\n      \"result_path_verified\": true,\n      \"runtime_boundary\": \"subprocess_payload_file_contract\",\n      \"runtime_boundary_verified\": false,\n      \"worker_pid\": 26952\n    },\n    \"queue_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_queue.jsonl\",\n    \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-03-worker-03.json\",\n    \"task_result_count\": 1,\n    \"worker_payload\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-03-worker-03.json\",\n    \"worker_review\": {\n      \"artifact\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-03-worker-03.worker_review.json\",\n      \"comment_count\": 2,\n      \"file_count\": 1,\n      \"status\": \"reviewed\",\n      \"task_group_count\": 1\n    }\n  },\n  \"source\": \"employee_scheduler_stress\"\n}\n"
+          },
+          "result_exists": true,
+          "result_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-03-worker-03.json",
+          "round_index": 3,
+          "task_count": 1,
+          "worker_index": 3
+        }
+      ]
+    },
+    {
+      "round_completed": true,
+      "round_index": 4,
+      "task_count": 3,
+      "worker_count": 3,
+      "workers": [
+        {
+          "payload_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-04-worker-01.json",
+          "process": {
+            "command": [
+              "/Users/a4243342/Desktop/XCMAX/FHD/.venv/bin/python",
+              "-c",
+              "import sys; sys.path.insert(0, '/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine'); from retort_engine.employee_runtime_worker import main; raise SystemExit(main())",
+              "--payload-file",
+              "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-04-worker-01.json"
+            ],
+            "duration_sec": 0.054,
+            "ended_at": "2026-06-28T08:19:48.908397+00:00",
+            "pid": 26969,
+            "returncode": 0,
+            "started_at": "2026-06-28T08:19:48.853926+00:00",
+            "stderr": "",
+            "stdout": "s/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-04-worker-01.json\",\n      \"parent_pid\": 26924,\n      \"parent_pid_matches_launcher\": true,\n      \"payload_nonce\": \"\",\n      \"payload_nonce_verified\": false,\n      \"payload_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-04-worker-01.json\",\n      \"payload_path_verified\": true,\n      \"pid_differs_from_parent\": true,\n      \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-04-worker-01.json\",\n      \"result_path_verified\": true,\n      \"runtime_boundary\": \"subprocess_payload_file_contract\",\n      \"runtime_boundary_verified\": false,\n      \"worker_pid\": 26969\n    },\n    \"queue_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_queue.jsonl\",\n    \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-04-worker-01.json\",\n    \"task_result_count\": 1,\n    \"worker_payload\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-04-worker-01.json\",\n    \"worker_review\": {\n      \"artifact\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-04-worker-01.worker_review.json\",\n      \"comment_count\": 2,\n      \"file_count\": 1,\n      \"status\": \"reviewed\",\n      \"task_group_count\": 1\n    }\n  },\n  \"source\": \"employee_scheduler_stress\"\n}\n"
+          },
+          "result_exists": true,
+          "result_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-04-worker-01.json",
+          "round_index": 4,
+          "task_count": 1,
+          "worker_index": 1
+        },
+        {
+          "payload_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-04-worker-02.json",
+          "process": {
+            "command": [
+              "/Users/a4243342/Desktop/XCMAX/FHD/.venv/bin/python",
+              "-c",
+              "import sys; sys.path.insert(0, '/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine'); from retort_engine.employee_runtime_worker import main; raise SystemExit(main())",
+              "--payload-file",
+              "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-04-worker-02.json"
+            ],
+            "duration_sec": 0.053,
+            "ended_at": "2026-06-28T08:19:48.909766+00:00",
+            "pid": 26970,
+            "returncode": 0,
+            "started_at": "2026-06-28T08:19:48.856258+00:00",
+            "stderr": "",
+            "stdout": "s/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-04-worker-02.json\",\n      \"parent_pid\": 26924,\n      \"parent_pid_matches_launcher\": true,\n      \"payload_nonce\": \"\",\n      \"payload_nonce_verified\": false,\n      \"payload_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-04-worker-02.json\",\n      \"payload_path_verified\": true,\n      \"pid_differs_from_parent\": true,\n      \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-04-worker-02.json\",\n      \"result_path_verified\": true,\n      \"runtime_boundary\": \"subprocess_payload_file_contract\",\n      \"runtime_boundary_verified\": false,\n      \"worker_pid\": 26970\n    },\n    \"queue_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_queue.jsonl\",\n    \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-04-worker-02.json\",\n    \"task_result_count\": 1,\n    \"worker_payload\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-04-worker-02.json\",\n    \"worker_review\": {\n      \"artifact\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-04-worker-02.worker_review.json\",\n      \"comment_count\": 2,\n      \"file_count\": 1,\n      \"status\": \"reviewed\",\n      \"task_group_count\": 1\n    }\n  },\n  \"source\": \"employee_scheduler_stress\"\n}\n"
+          },
+          "result_exists": true,
+          "result_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-04-worker-02.json",
+          "round_index": 4,
+          "task_count": 1,
+          "worker_index": 2
+        },
+        {
+          "payload_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-04-worker-03.json",
+          "process": {
+            "command": [
+              "/Users/a4243342/Desktop/XCMAX/FHD/.venv/bin/python",
+              "-c",
+              "import sys; sys.path.insert(0, '/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine'); from retort_engine.employee_runtime_worker import main; raise SystemExit(main())",
+              "--payload-file",
+              "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-04-worker-03.json"
+            ],
+            "duration_sec": 0.052,
+            "ended_at": "2026-06-28T08:19:48.909807+00:00",
+            "pid": 26971,
+            "returncode": 0,
+            "started_at": "2026-06-28T08:19:48.857375+00:00",
+            "stderr": "",
+            "stdout": "s/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-04-worker-03.json\",\n      \"parent_pid\": 26924,\n      \"parent_pid_matches_launcher\": true,\n      \"payload_nonce\": \"\",\n      \"payload_nonce_verified\": false,\n      \"payload_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-04-worker-03.json\",\n      \"payload_path_verified\": true,\n      \"pid_differs_from_parent\": true,\n      \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-04-worker-03.json\",\n      \"result_path_verified\": true,\n      \"runtime_boundary\": \"subprocess_payload_file_contract\",\n      \"runtime_boundary_verified\": false,\n      \"worker_pid\": 26971\n    },\n    \"queue_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_queue.jsonl\",\n    \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-04-worker-03.json\",\n    \"task_result_count\": 1,\n    \"worker_payload\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-04-worker-03.json\",\n    \"worker_review\": {\n      \"artifact\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-04-worker-03.worker_review.json\",\n      \"comment_count\": 2,\n      \"file_count\": 1,\n      \"status\": \"reviewed\",\n      \"task_group_count\": 1\n    }\n  },\n  \"source\": \"employee_scheduler_stress\"\n}\n"
+          },
+          "result_exists": true,
+          "result_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-04-worker-03.json",
+          "round_index": 4,
+          "task_count": 1,
+          "worker_index": 3
+        }
+      ]
+    },
+    {
+      "round_completed": true,
+      "round_index": 5,
+      "task_count": 3,
+      "worker_count": 3,
+      "workers": [
+        {
+          "payload_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-05-worker-01.json",
+          "process": {
+            "command": [
+              "/Users/a4243342/Desktop/XCMAX/FHD/.venv/bin/python",
+              "-c",
+              "import sys; sys.path.insert(0, '/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine'); from retort_engine.employee_runtime_worker import main; raise SystemExit(main())",
+              "--payload-file",
+              "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-05-worker-01.json"
+            ],
+            "duration_sec": 0.057,
+            "ended_at": "2026-06-28T08:19:48.969676+00:00",
+            "pid": 26980,
+            "returncode": 0,
+            "started_at": "2026-06-28T08:19:48.912980+00:00",
+            "stderr": "",
+            "stdout": "s/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-05-worker-01.json\",\n      \"parent_pid\": 26924,\n      \"parent_pid_matches_launcher\": true,\n      \"payload_nonce\": \"\",\n      \"payload_nonce_verified\": false,\n      \"payload_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-05-worker-01.json\",\n      \"payload_path_verified\": true,\n      \"pid_differs_from_parent\": true,\n      \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-05-worker-01.json\",\n      \"result_path_verified\": true,\n      \"runtime_boundary\": \"subprocess_payload_file_contract\",\n      \"runtime_boundary_verified\": false,\n      \"worker_pid\": 26980\n    },\n    \"queue_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_queue.jsonl\",\n    \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-05-worker-01.json\",\n    \"task_result_count\": 1,\n    \"worker_payload\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-05-worker-01.json\",\n    \"worker_review\": {\n      \"artifact\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-05-worker-01.worker_review.json\",\n      \"comment_count\": 2,\n      \"file_count\": 1,\n      \"status\": \"reviewed\",\n      \"task_group_count\": 1\n    }\n  },\n  \"source\": \"employee_scheduler_stress\"\n}\n"
+          },
+          "result_exists": true,
+          "result_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-05-worker-01.json",
+          "round_index": 5,
+          "task_count": 1,
+          "worker_index": 1
+        },
+        {
+          "payload_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-05-worker-02.json",
+          "process": {
+            "command": [
+              "/Users/a4243342/Desktop/XCMAX/FHD/.venv/bin/python",
+              "-c",
+              "import sys; sys.path.insert(0, '/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine'); from retort_engine.employee_runtime_worker import main; raise SystemExit(main())",
+              "--payload-file",
+              "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-05-worker-02.json"
+            ],
+            "duration_sec": 0.055,
+            "ended_at": "2026-06-28T08:19:48.969757+00:00",
+            "pid": 26981,
+            "returncode": 0,
+            "started_at": "2026-06-28T08:19:48.914528+00:00",
+            "stderr": "",
+            "stdout": "s/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-05-worker-02.json\",\n      \"parent_pid\": 26924,\n      \"parent_pid_matches_launcher\": true,\n      \"payload_nonce\": \"\",\n      \"payload_nonce_verified\": false,\n      \"payload_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-05-worker-02.json\",\n      \"payload_path_verified\": true,\n      \"pid_differs_from_parent\": true,\n      \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-05-worker-02.json\",\n      \"result_path_verified\": true,\n      \"runtime_boundary\": \"subprocess_payload_file_contract\",\n      \"runtime_boundary_verified\": false,\n      \"worker_pid\": 26981\n    },\n    \"queue_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_queue.jsonl\",\n    \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-05-worker-02.json\",\n    \"task_result_count\": 1,\n    \"worker_payload\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-05-worker-02.json\",\n    \"worker_review\": {\n      \"artifact\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-05-worker-02.worker_review.json\",\n      \"comment_count\": 2,\n      \"file_count\": 1,\n      \"status\": \"reviewed\",\n      \"task_group_count\": 1\n    }\n  },\n  \"source\": \"employee_scheduler_stress\"\n}\n"
+          },
+          "result_exists": true,
+          "result_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-05-worker-02.json",
+          "round_index": 5,
+          "task_count": 1,
+          "worker_index": 2
+        },
+        {
+          "payload_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-05-worker-03.json",
+          "process": {
+            "command": [
+              "/Users/a4243342/Desktop/XCMAX/FHD/.venv/bin/python",
+              "-c",
+              "import sys; sys.path.insert(0, '/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine'); from retort_engine.employee_runtime_worker import main; raise SystemExit(main())",
+              "--payload-file",
+              "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-05-worker-03.json"
+            ],
+            "duration_sec": 0.054,
+            "ended_at": "2026-06-28T08:19:48.969787+00:00",
+            "pid": 26982,
+            "returncode": 0,
+            "started_at": "2026-06-28T08:19:48.915710+00:00",
+            "stderr": "",
+            "stdout": "s/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-05-worker-03.json\",\n      \"parent_pid\": 26924,\n      \"parent_pid_matches_launcher\": true,\n      \"payload_nonce\": \"\",\n      \"payload_nonce_verified\": false,\n      \"payload_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-05-worker-03.json\",\n      \"payload_path_verified\": true,\n      \"pid_differs_from_parent\": true,\n      \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-05-worker-03.json\",\n      \"result_path_verified\": true,\n      \"runtime_boundary\": \"subprocess_payload_file_contract\",\n      \"runtime_boundary_verified\": false,\n      \"worker_pid\": 26982\n    },\n    \"queue_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_queue.jsonl\",\n    \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-05-worker-03.json\",\n    \"task_result_count\": 1,\n    \"worker_payload\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-05-worker-03.json\",\n    \"worker_review\": {\n      \"artifact\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-05-worker-03.worker_review.json\",\n      \"comment_count\": 2,\n      \"file_count\": 1,\n      \"status\": \"reviewed\",\n      \"task_group_count\": 1\n    }\n  },\n  \"source\": \"employee_scheduler_stress\"\n}\n"
+          },
+          "result_exists": true,
+          "result_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-05-worker-03.json",
+          "round_index": 5,
+          "task_count": 1,
+          "worker_index": 3
+        }
+      ]
+    },
+    {
+      "round_completed": true,
+      "round_index": 6,
+      "task_count": 3,
+      "worker_count": 3,
+      "workers": [
+        {
+          "payload_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-06-worker-01.json",
+          "process": {
+            "command": [
+              "/Users/a4243342/Desktop/XCMAX/FHD/.venv/bin/python",
+              "-c",
+              "import sys; sys.path.insert(0, '/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine'); from retort_engine.employee_runtime_worker import main; raise SystemExit(main())",
+              "--payload-file",
+              "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-06-worker-01.json"
+            ],
+            "duration_sec": 0.055,
+            "ended_at": "2026-06-28T08:19:49.027632+00:00",
+            "pid": 27017,
+            "returncode": 0,
+            "started_at": "2026-06-28T08:19:48.973125+00:00",
+            "stderr": "",
+            "stdout": "s/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-06-worker-01.json\",\n      \"parent_pid\": 26924,\n      \"parent_pid_matches_launcher\": true,\n      \"payload_nonce\": \"\",\n      \"payload_nonce_verified\": false,\n      \"payload_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-06-worker-01.json\",\n      \"payload_path_verified\": true,\n      \"pid_differs_from_parent\": true,\n      \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-06-worker-01.json\",\n      \"result_path_verified\": true,\n      \"runtime_boundary\": \"subprocess_payload_file_contract\",\n      \"runtime_boundary_verified\": false,\n      \"worker_pid\": 27017\n    },\n    \"queue_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_queue.jsonl\",\n    \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-06-worker-01.json\",\n    \"task_result_count\": 1,\n    \"worker_payload\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-06-worker-01.json\",\n    \"worker_review\": {\n      \"artifact\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-06-worker-01.worker_review.json\",\n      \"comment_count\": 2,\n      \"file_count\": 1,\n      \"status\": \"reviewed\",\n      \"task_group_count\": 1\n    }\n  },\n  \"source\": \"employee_scheduler_stress\"\n}\n"
+          },
+          "result_exists": true,
+          "result_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-06-worker-01.json",
+          "round_index": 6,
+          "task_count": 1,
+          "worker_index": 1
+        },
+        {
+          "payload_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-06-worker-02.json",
+          "process": {
+            "command": [
+              "/Users/a4243342/Desktop/XCMAX/FHD/.venv/bin/python",
+              "-c",
+              "import sys; sys.path.insert(0, '/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine'); from retort_engine.employee_runtime_worker import main; raise SystemExit(main())",
+              "--payload-file",
+              "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-06-worker-02.json"
+            ],
+            "duration_sec": 0.058,
+            "ended_at": "2026-06-28T08:19:49.033102+00:00",
+            "pid": 27018,
+            "returncode": 0,
+            "started_at": "2026-06-28T08:19:48.974685+00:00",
+            "stderr": "",
+            "stdout": "s/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-06-worker-02.json\",\n      \"parent_pid\": 26924,\n      \"parent_pid_matches_launcher\": true,\n      \"payload_nonce\": \"\",\n      \"payload_nonce_verified\": false,\n      \"payload_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-06-worker-02.json\",\n      \"payload_path_verified\": true,\n      \"pid_differs_from_parent\": true,\n      \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-06-worker-02.json\",\n      \"result_path_verified\": true,\n      \"runtime_boundary\": \"subprocess_payload_file_contract\",\n      \"runtime_boundary_verified\": false,\n      \"worker_pid\": 27018\n    },\n    \"queue_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_queue.jsonl\",\n    \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-06-worker-02.json\",\n    \"task_result_count\": 1,\n    \"worker_payload\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-06-worker-02.json\",\n    \"worker_review\": {\n      \"artifact\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-06-worker-02.worker_review.json\",\n      \"comment_count\": 2,\n      \"file_count\": 1,\n      \"status\": \"reviewed\",\n      \"task_group_count\": 1\n    }\n  },\n  \"source\": \"employee_scheduler_stress\"\n}\n"
+          },
+          "result_exists": true,
+          "result_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-06-worker-02.json",
+          "round_index": 6,
+          "task_count": 1,
+          "worker_index": 2
+        },
+        {
+          "payload_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-06-worker-03.json",
+          "process": {
+            "command": [
+              "/Users/a4243342/Desktop/XCMAX/FHD/.venv/bin/python",
+              "-c",
+              "import sys; sys.path.insert(0, '/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine'); from retort_engine.employee_runtime_worker import main; raise SystemExit(main())",
+              "--payload-file",
+              "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-06-worker-03.json"
+            ],
+            "duration_sec": 0.06,
+            "ended_at": "2026-06-28T08:19:49.036552+00:00",
+            "pid": 27019,
+            "returncode": 0,
+            "started_at": "2026-06-28T08:19:48.976230+00:00",
+            "stderr": "",
+            "stdout": "s/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-06-worker-03.json\",\n      \"parent_pid\": 26924,\n      \"parent_pid_matches_launcher\": true,\n      \"payload_nonce\": \"\",\n      \"payload_nonce_verified\": false,\n      \"payload_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-06-worker-03.json\",\n      \"payload_path_verified\": true,\n      \"pid_differs_from_parent\": true,\n      \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-06-worker-03.json\",\n      \"result_path_verified\": true,\n      \"runtime_boundary\": \"subprocess_payload_file_contract\",\n      \"runtime_boundary_verified\": false,\n      \"worker_pid\": 27019\n    },\n    \"queue_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_queue.jsonl\",\n    \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-06-worker-03.json\",\n    \"task_result_count\": 1,\n    \"worker_payload\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-06-worker-03.json\",\n    \"worker_review\": {\n      \"artifact\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-06-worker-03.worker_review.json\",\n      \"comment_count\": 2,\n      \"file_count\": 1,\n      \"status\": \"reviewed\",\n      \"task_group_count\": 1\n    }\n  },\n  \"source\": \"employee_scheduler_stress\"\n}\n"
+          },
+          "result_exists": true,
+          "result_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-06-worker-03.json",
+          "round_index": 6,
+          "task_count": 1,
+          "worker_index": 3
+        }
+      ]
+    },
+    {
+      "round_completed": true,
+      "round_index": 7,
+      "task_count": 3,
+      "worker_count": 3,
+      "workers": [
+        {
+          "payload_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-07-worker-01.json",
+          "process": {
+            "command": [
+              "/Users/a4243342/Desktop/XCMAX/FHD/.venv/bin/python",
+              "-c",
+              "import sys; sys.path.insert(0, '/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine'); from retort_engine.employee_runtime_worker import main; raise SystemExit(main())",
+              "--payload-file",
+              "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-07-worker-01.json"
+            ],
+            "duration_sec": 0.07,
+            "ended_at": "2026-06-28T08:19:49.109520+00:00",
+            "pid": 27045,
+            "returncode": 0,
+            "started_at": "2026-06-28T08:19:49.039349+00:00",
+            "stderr": "",
+            "stdout": "s/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-07-worker-01.json\",\n      \"parent_pid\": 26924,\n      \"parent_pid_matches_launcher\": true,\n      \"payload_nonce\": \"\",\n      \"payload_nonce_verified\": false,\n      \"payload_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-07-worker-01.json\",\n      \"payload_path_verified\": true,\n      \"pid_differs_from_parent\": true,\n      \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-07-worker-01.json\",\n      \"result_path_verified\": true,\n      \"runtime_boundary\": \"subprocess_payload_file_contract\",\n      \"runtime_boundary_verified\": false,\n      \"worker_pid\": 27045\n    },\n    \"queue_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_queue.jsonl\",\n    \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-07-worker-01.json\",\n    \"task_result_count\": 1,\n    \"worker_payload\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-07-worker-01.json\",\n    \"worker_review\": {\n      \"artifact\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-07-worker-01.worker_review.json\",\n      \"comment_count\": 2,\n      \"file_count\": 1,\n      \"status\": \"reviewed\",\n      \"task_group_count\": 1\n    }\n  },\n  \"source\": \"employee_scheduler_stress\"\n}\n"
+          },
+          "result_exists": true,
+          "result_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-07-worker-01.json",
+          "round_index": 7,
+          "task_count": 1,
+          "worker_index": 1
+        },
+        {
+          "payload_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-07-worker-02.json",
+          "process": {
+            "command": [
+              "/Users/a4243342/Desktop/XCMAX/FHD/.venv/bin/python",
+              "-c",
+              "import sys; sys.path.insert(0, '/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine'); from retort_engine.employee_runtime_worker import main; raise SystemExit(main())",
+              "--payload-file",
+              "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-07-worker-02.json"
+            ],
+            "duration_sec": 0.069,
+            "ended_at": "2026-06-28T08:19:49.109620+00:00",
+            "pid": 27046,
+            "returncode": 0,
+            "started_at": "2026-06-28T08:19:49.040826+00:00",
+            "stderr": "",
+            "stdout": "s/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-07-worker-02.json\",\n      \"parent_pid\": 26924,\n      \"parent_pid_matches_launcher\": true,\n      \"payload_nonce\": \"\",\n      \"payload_nonce_verified\": false,\n      \"payload_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-07-worker-02.json\",\n      \"payload_path_verified\": true,\n      \"pid_differs_from_parent\": true,\n      \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-07-worker-02.json\",\n      \"result_path_verified\": true,\n      \"runtime_boundary\": \"subprocess_payload_file_contract\",\n      \"runtime_boundary_verified\": false,\n      \"worker_pid\": 27046\n    },\n    \"queue_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_queue.jsonl\",\n    \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-07-worker-02.json\",\n    \"task_result_count\": 1,\n    \"worker_payload\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-07-worker-02.json\",\n    \"worker_review\": {\n      \"artifact\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-07-worker-02.worker_review.json\",\n      \"comment_count\": 2,\n      \"file_count\": 1,\n      \"status\": \"reviewed\",\n      \"task_group_count\": 1\n    }\n  },\n  \"source\": \"employee_scheduler_stress\"\n}\n"
+          },
+          "result_exists": true,
+          "result_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-07-worker-02.json",
+          "round_index": 7,
+          "task_count": 1,
+          "worker_index": 2
+        },
+        {
+          "payload_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-07-worker-03.json",
+          "process": {
+            "command": [
+              "/Users/a4243342/Desktop/XCMAX/FHD/.venv/bin/python",
+              "-c",
+              "import sys; sys.path.insert(0, '/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine'); from retort_engine.employee_runtime_worker import main; raise SystemExit(main())",
+              "--payload-file",
+              "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-07-worker-03.json"
+            ],
+            "duration_sec": 0.07,
+            "ended_at": "2026-06-28T08:19:49.112021+00:00",
+            "pid": 27047,
+            "returncode": 0,
+            "started_at": "2026-06-28T08:19:49.041917+00:00",
+            "stderr": "",
+            "stdout": "s/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-07-worker-03.json\",\n      \"parent_pid\": 26924,\n      \"parent_pid_matches_launcher\": true,\n      \"payload_nonce\": \"\",\n      \"payload_nonce_verified\": false,\n      \"payload_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-07-worker-03.json\",\n      \"payload_path_verified\": true,\n      \"pid_differs_from_parent\": true,\n      \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-07-worker-03.json\",\n      \"result_path_verified\": true,\n      \"runtime_boundary\": \"subprocess_payload_file_contract\",\n      \"runtime_boundary_verified\": false,\n      \"worker_pid\": 27047\n    },\n    \"queue_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_queue.jsonl\",\n    \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-07-worker-03.json\",\n    \"task_result_count\": 1,\n    \"worker_payload\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-07-worker-03.json\",\n    \"worker_review\": {\n      \"artifact\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-07-worker-03.worker_review.json\",\n      \"comment_count\": 2,\n      \"file_count\": 1,\n      \"status\": \"reviewed\",\n      \"task_group_count\": 1\n    }\n  },\n  \"source\": \"employee_scheduler_stress\"\n}\n"
+          },
+          "result_exists": true,
+          "result_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-07-worker-03.json",
+          "round_index": 7,
+          "task_count": 1,
+          "worker_index": 3
+        }
+      ]
+    },
+    {
+      "round_completed": true,
+      "round_index": 8,
+      "task_count": 3,
+      "worker_count": 3,
+      "workers": [
+        {
+          "payload_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-08-worker-01.json",
+          "process": {
+            "command": [
+              "/Users/a4243342/Desktop/XCMAX/FHD/.venv/bin/python",
+              "-c",
+              "import sys; sys.path.insert(0, '/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine'); from retort_engine.employee_runtime_worker import main; raise SystemExit(main())",
+              "--payload-file",
+              "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-08-worker-01.json"
+            ],
+            "duration_sec": 0.051,
+            "ended_at": "2026-06-28T08:19:49.165425+00:00",
+            "pid": 27048,
+            "returncode": 0,
+            "started_at": "2026-06-28T08:19:49.114755+00:00",
+            "stderr": "",
+            "stdout": "s/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-08-worker-01.json\",\n      \"parent_pid\": 26924,\n      \"parent_pid_matches_launcher\": true,\n      \"payload_nonce\": \"\",\n      \"payload_nonce_verified\": false,\n      \"payload_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-08-worker-01.json\",\n      \"payload_path_verified\": true,\n      \"pid_differs_from_parent\": true,\n      \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-08-worker-01.json\",\n      \"result_path_verified\": true,\n      \"runtime_boundary\": \"subprocess_payload_file_contract\",\n      \"runtime_boundary_verified\": false,\n      \"worker_pid\": 27048\n    },\n    \"queue_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_queue.jsonl\",\n    \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-08-worker-01.json\",\n    \"task_result_count\": 1,\n    \"worker_payload\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-08-worker-01.json\",\n    \"worker_review\": {\n      \"artifact\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-08-worker-01.worker_review.json\",\n      \"comment_count\": 2,\n      \"file_count\": 1,\n      \"status\": \"reviewed\",\n      \"task_group_count\": 1\n    }\n  },\n  \"source\": \"employee_scheduler_stress\"\n}\n"
+          },
+          "result_exists": true,
+          "result_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-08-worker-01.json",
+          "round_index": 8,
+          "task_count": 1,
+          "worker_index": 1
+        },
+        {
+          "payload_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-08-worker-02.json",
+          "process": {
+            "command": [
+              "/Users/a4243342/Desktop/XCMAX/FHD/.venv/bin/python",
+              "-c",
+              "import sys; sys.path.insert(0, '/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine'); from retort_engine.employee_runtime_worker import main; raise SystemExit(main())",
+              "--payload-file",
+              "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-08-worker-02.json"
+            ],
+            "duration_sec": 0.054,
+            "ended_at": "2026-06-28T08:19:49.169921+00:00",
+            "pid": 27049,
+            "returncode": 0,
+            "started_at": "2026-06-28T08:19:49.116111+00:00",
+            "stderr": "",
+            "stdout": "s/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-08-worker-02.json\",\n      \"parent_pid\": 26924,\n      \"parent_pid_matches_launcher\": true,\n      \"payload_nonce\": \"\",\n      \"payload_nonce_verified\": false,\n      \"payload_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-08-worker-02.json\",\n      \"payload_path_verified\": true,\n      \"pid_differs_from_parent\": true,\n      \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-08-worker-02.json\",\n      \"result_path_verified\": true,\n      \"runtime_boundary\": \"subprocess_payload_file_contract\",\n      \"runtime_boundary_verified\": false,\n      \"worker_pid\": 27049\n    },\n    \"queue_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_queue.jsonl\",\n    \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-08-worker-02.json\",\n    \"task_result_count\": 1,\n    \"worker_payload\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-08-worker-02.json\",\n    \"worker_review\": {\n      \"artifact\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-08-worker-02.worker_review.json\",\n      \"comment_count\": 2,\n      \"file_count\": 1,\n      \"status\": \"reviewed\",\n      \"task_group_count\": 1\n    }\n  },\n  \"source\": \"employee_scheduler_stress\"\n}\n"
+          },
+          "result_exists": true,
+          "result_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-08-worker-02.json",
+          "round_index": 8,
+          "task_count": 1,
+          "worker_index": 2
+        },
+        {
+          "payload_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-08-worker-03.json",
+          "process": {
+            "command": [
+              "/Users/a4243342/Desktop/XCMAX/FHD/.venv/bin/python",
+              "-c",
+              "import sys; sys.path.insert(0, '/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine'); from retort_engine.employee_runtime_worker import main; raise SystemExit(main())",
+              "--payload-file",
+              "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-08-worker-03.json"
+            ],
+            "duration_sec": 0.053,
+            "ended_at": "2026-06-28T08:19:49.169967+00:00",
+            "pid": 27050,
+            "returncode": 0,
+            "started_at": "2026-06-28T08:19:49.117244+00:00",
+            "stderr": "",
+            "stdout": "s/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-08-worker-03.json\",\n      \"parent_pid\": 26924,\n      \"parent_pid_matches_launcher\": true,\n      \"payload_nonce\": \"\",\n      \"payload_nonce_verified\": false,\n      \"payload_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-08-worker-03.json\",\n      \"payload_path_verified\": true,\n      \"pid_differs_from_parent\": true,\n      \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-08-worker-03.json\",\n      \"result_path_verified\": true,\n      \"runtime_boundary\": \"subprocess_payload_file_contract\",\n      \"runtime_boundary_verified\": false,\n      \"worker_pid\": 27050\n    },\n    \"queue_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_queue.jsonl\",\n    \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-08-worker-03.json\",\n    \"task_result_count\": 1,\n    \"worker_payload\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-08-worker-03.json\",\n    \"worker_review\": {\n      \"artifact\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-08-worker-03.worker_review.json\",\n      \"comment_count\": 2,\n      \"file_count\": 1,\n      \"status\": \"reviewed\",\n      \"task_group_count\": 1\n    }\n  },\n  \"source\": \"employee_scheduler_stress\"\n}\n"
+          },
+          "result_exists": true,
+          "result_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-08-worker-03.json",
+          "round_index": 8,
+          "task_count": 1,
+          "worker_index": 3
+        }
+      ]
+    },
+    {
+      "round_completed": true,
+      "round_index": 9,
+      "task_count": 3,
+      "worker_count": 3,
+      "workers": [
+        {
+          "payload_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-09-worker-01.json",
+          "process": {
+            "command": [
+              "/Users/a4243342/Desktop/XCMAX/FHD/.venv/bin/python",
+              "-c",
+              "import sys; sys.path.insert(0, '/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine'); from retort_engine.employee_runtime_worker import main; raise SystemExit(main())",
+              "--payload-file",
+              "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-09-worker-01.json"
+            ],
+            "duration_sec": 0.056,
+            "ended_at": "2026-06-28T08:19:49.229500+00:00",
+            "pid": 27051,
+            "returncode": 0,
+            "started_at": "2026-06-28T08:19:49.173982+00:00",
+            "stderr": "",
+            "stdout": "s/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-09-worker-01.json\",\n      \"parent_pid\": 26924,\n      \"parent_pid_matches_launcher\": true,\n      \"payload_nonce\": \"\",\n      \"payload_nonce_verified\": false,\n      \"payload_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-09-worker-01.json\",\n      \"payload_path_verified\": true,\n      \"pid_differs_from_parent\": true,\n      \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-09-worker-01.json\",\n      \"result_path_verified\": true,\n      \"runtime_boundary\": \"subprocess_payload_file_contract\",\n      \"runtime_boundary_verified\": false,\n      \"worker_pid\": 27051\n    },\n    \"queue_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_queue.jsonl\",\n    \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-09-worker-01.json\",\n    \"task_result_count\": 1,\n    \"worker_payload\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-09-worker-01.json\",\n    \"worker_review\": {\n      \"artifact\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-09-worker-01.worker_review.json\",\n      \"comment_count\": 2,\n      \"file_count\": 1,\n      \"status\": \"reviewed\",\n      \"task_group_count\": 1\n    }\n  },\n  \"source\": \"employee_scheduler_stress\"\n}\n"
+          },
+          "result_exists": true,
+          "result_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-09-worker-01.json",
+          "round_index": 9,
+          "task_count": 1,
+          "worker_index": 1
+        },
+        {
+          "payload_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-09-worker-02.json",
+          "process": {
+            "command": [
+              "/Users/a4243342/Desktop/XCMAX/FHD/.venv/bin/python",
+              "-c",
+              "import sys; sys.path.insert(0, '/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine'); from retort_engine.employee_runtime_worker import main; raise SystemExit(main())",
+              "--payload-file",
+              "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-09-worker-02.json"
+            ],
+            "duration_sec": 0.054,
+            "ended_at": "2026-06-28T08:19:49.229583+00:00",
+            "pid": 27052,
+            "returncode": 0,
+            "started_at": "2026-06-28T08:19:49.175380+00:00",
+            "stderr": "",
+            "stdout": "s/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-09-worker-02.json\",\n      \"parent_pid\": 26924,\n      \"parent_pid_matches_launcher\": true,\n      \"payload_nonce\": \"\",\n      \"payload_nonce_verified\": false,\n      \"payload_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-09-worker-02.json\",\n      \"payload_path_verified\": true,\n      \"pid_differs_from_parent\": true,\n      \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-09-worker-02.json\",\n      \"result_path_verified\": true,\n      \"runtime_boundary\": \"subprocess_payload_file_contract\",\n      \"runtime_boundary_verified\": false,\n      \"worker_pid\": 27052\n    },\n    \"queue_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_queue.jsonl\",\n    \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-09-worker-02.json\",\n    \"task_result_count\": 1,\n    \"worker_payload\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-09-worker-02.json\",\n    \"worker_review\": {\n      \"artifact\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-09-worker-02.worker_review.json\",\n      \"comment_count\": 2,\n      \"file_count\": 1,\n      \"status\": \"reviewed\",\n      \"task_group_count\": 1\n    }\n  },\n  \"source\": \"employee_scheduler_stress\"\n}\n"
+          },
+          "result_exists": true,
+          "result_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-09-worker-02.json",
+          "round_index": 9,
+          "task_count": 1,
+          "worker_index": 2
+        },
+        {
+          "payload_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-09-worker-03.json",
+          "process": {
+            "command": [
+              "/Users/a4243342/Desktop/XCMAX/FHD/.venv/bin/python",
+              "-c",
+              "import sys; sys.path.insert(0, '/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine'); from retort_engine.employee_runtime_worker import main; raise SystemExit(main())",
+              "--payload-file",
+              "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-09-worker-03.json"
+            ],
+            "duration_sec": 0.053,
+            "ended_at": "2026-06-28T08:19:49.229610+00:00",
+            "pid": 27053,
+            "returncode": 0,
+            "started_at": "2026-06-28T08:19:49.176394+00:00",
+            "stderr": "",
+            "stdout": "s/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-09-worker-03.json\",\n      \"parent_pid\": 26924,\n      \"parent_pid_matches_launcher\": true,\n      \"payload_nonce\": \"\",\n      \"payload_nonce_verified\": false,\n      \"payload_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-09-worker-03.json\",\n      \"payload_path_verified\": true,\n      \"pid_differs_from_parent\": true,\n      \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-09-worker-03.json\",\n      \"result_path_verified\": true,\n      \"runtime_boundary\": \"subprocess_payload_file_contract\",\n      \"runtime_boundary_verified\": false,\n      \"worker_pid\": 27053\n    },\n    \"queue_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_queue.jsonl\",\n    \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-09-worker-03.json\",\n    \"task_result_count\": 1,\n    \"worker_payload\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-09-worker-03.json\",\n    \"worker_review\": {\n      \"artifact\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-09-worker-03.worker_review.json\",\n      \"comment_count\": 2,\n      \"file_count\": 1,\n      \"status\": \"reviewed\",\n      \"task_group_count\": 1\n    }\n  },\n  \"source\": \"employee_scheduler_stress\"\n}\n"
+          },
+          "result_exists": true,
+          "result_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-09-worker-03.json",
+          "round_index": 9,
+          "task_count": 1,
+          "worker_index": 3
+        }
+      ]
+    },
+    {
+      "round_completed": true,
+      "round_index": 10,
+      "task_count": 3,
+      "worker_count": 3,
+      "workers": [
+        {
+          "payload_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-10-worker-01.json",
+          "process": {
+            "command": [
+              "/Users/a4243342/Desktop/XCMAX/FHD/.venv/bin/python",
+              "-c",
+              "import sys; sys.path.insert(0, '/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine'); from retort_engine.employee_runtime_worker import main; raise SystemExit(main())",
+              "--payload-file",
+              "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-10-worker-01.json"
+            ],
+            "duration_sec": 0.055,
+            "ended_at": "2026-06-28T08:19:49.287961+00:00",
+            "pid": 27054,
+            "returncode": 0,
+            "started_at": "2026-06-28T08:19:49.232895+00:00",
+            "stderr": "",
+            "stdout": "s/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-10-worker-01.json\",\n      \"parent_pid\": 26924,\n      \"parent_pid_matches_launcher\": true,\n      \"payload_nonce\": \"\",\n      \"payload_nonce_verified\": false,\n      \"payload_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-10-worker-01.json\",\n      \"payload_path_verified\": true,\n      \"pid_differs_from_parent\": true,\n      \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-10-worker-01.json\",\n      \"result_path_verified\": true,\n      \"runtime_boundary\": \"subprocess_payload_file_contract\",\n      \"runtime_boundary_verified\": false,\n      \"worker_pid\": 27054\n    },\n    \"queue_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_queue.jsonl\",\n    \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-10-worker-01.json\",\n    \"task_result_count\": 1,\n    \"worker_payload\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-10-worker-01.json\",\n    \"worker_review\": {\n      \"artifact\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-10-worker-01.worker_review.json\",\n      \"comment_count\": 2,\n      \"file_count\": 1,\n      \"status\": \"reviewed\",\n      \"task_group_count\": 1\n    }\n  },\n  \"source\": \"employee_scheduler_stress\"\n}\n"
+          },
+          "result_exists": true,
+          "result_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-10-worker-01.json",
+          "round_index": 10,
+          "task_count": 1,
+          "worker_index": 1
+        },
+        {
+          "payload_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-10-worker-02.json",
+          "process": {
+            "command": [
+              "/Users/a4243342/Desktop/XCMAX/FHD/.venv/bin/python",
+              "-c",
+              "import sys; sys.path.insert(0, '/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine'); from retort_engine.employee_runtime_worker import main; raise SystemExit(main())",
+              "--payload-file",
+              "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-10-worker-02.json"
+            ],
+            "duration_sec": 0.059,
+            "ended_at": "2026-06-28T08:19:49.293235+00:00",
+            "pid": 27055,
+            "returncode": 0,
+            "started_at": "2026-06-28T08:19:49.234345+00:00",
+            "stderr": "",
+            "stdout": "s/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-10-worker-02.json\",\n      \"parent_pid\": 26924,\n      \"parent_pid_matches_launcher\": true,\n      \"payload_nonce\": \"\",\n      \"payload_nonce_verified\": false,\n      \"payload_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-10-worker-02.json\",\n      \"payload_path_verified\": true,\n      \"pid_differs_from_parent\": true,\n      \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-10-worker-02.json\",\n      \"result_path_verified\": true,\n      \"runtime_boundary\": \"subprocess_payload_file_contract\",\n      \"runtime_boundary_verified\": false,\n      \"worker_pid\": 27055\n    },\n    \"queue_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_queue.jsonl\",\n    \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-10-worker-02.json\",\n    \"task_result_count\": 1,\n    \"worker_payload\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-10-worker-02.json\",\n    \"worker_review\": {\n      \"artifact\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-10-worker-02.worker_review.json\",\n      \"comment_count\": 2,\n      \"file_count\": 1,\n      \"status\": \"reviewed\",\n      \"task_group_count\": 1\n    }\n  },\n  \"source\": \"employee_scheduler_stress\"\n}\n"
+          },
+          "result_exists": true,
+          "result_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-10-worker-02.json",
+          "round_index": 10,
+          "task_count": 1,
+          "worker_index": 2
+        },
+        {
+          "payload_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-10-worker-03.json",
+          "process": {
+            "command": [
+              "/Users/a4243342/Desktop/XCMAX/FHD/.venv/bin/python",
+              "-c",
+              "import sys; sys.path.insert(0, '/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine'); from retort_engine.employee_runtime_worker import main; raise SystemExit(main())",
+              "--payload-file",
+              "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-10-worker-03.json"
+            ],
+            "duration_sec": 0.058,
+            "ended_at": "2026-06-28T08:19:49.293288+00:00",
+            "pid": 27056,
+            "returncode": 0,
+            "started_at": "2026-06-28T08:19:49.235517+00:00",
+            "stderr": "",
+            "stdout": "s/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-10-worker-03.json\",\n      \"parent_pid\": 26924,\n      \"parent_pid_matches_launcher\": true,\n      \"payload_nonce\": \"\",\n      \"payload_nonce_verified\": false,\n      \"payload_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-10-worker-03.json\",\n      \"payload_path_verified\": true,\n      \"pid_differs_from_parent\": true,\n      \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-10-worker-03.json\",\n      \"result_path_verified\": true,\n      \"runtime_boundary\": \"subprocess_payload_file_contract\",\n      \"runtime_boundary_verified\": false,\n      \"worker_pid\": 27056\n    },\n    \"queue_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_queue.jsonl\",\n    \"result_path\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-10-worker-03.json\",\n    \"task_result_count\": 1,\n    \"worker_payload\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_runtime_requests/scheduler-stress-20260628T081948Z-81863cde-round-10-worker-03.json\",\n    \"worker_review\": {\n      \"artifact\": \"/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-10-worker-03.worker_review.json\",\n      \"comment_count\": 2,\n      \"file_count\": 1,\n      \"status\": \"reviewed\",\n      \"task_group_count\": 1\n    }\n  },\n  \"source\": \"employee_scheduler_stress\"\n}\n"
+          },
+          "result_exists": true,
+          "result_path": "/Users/a4243342/Desktop/XCMAX/.claude/worktrees/pedantic-leakey-5611d9/packages/retort_engine/.retort/employee_results/scheduler-stress-20260628T081948Z-81863cde-round-10-worker-03.json",
+          "round_index": 10,
+          "task_count": 1,
+          "worker_index": 3
+        }
+      ]
+    }
+  ],
+  "status": "ready",
+  "summary": {
+    "all_rounds_completed": true,
+    "completed_result_count": 30,
+    "concurrent_workers_verified": true,
+    "failed_process_count": 0,
+    "history_task_result_count": 30,
+    "independent_process_verified": true,
+    "missing_history_count": 0,
+    "missing_result_count": 0,
+    "pid_isolation_verified": true,
+    "process_id_count": 30,
+    "process_invocation_count": 30,
+    "queue_result_history_consistent": true,
+    "queued_task_count": 30,
+    "round_count": 10,
+    "run_id": "scheduler-stress-20260628T081948Z-81863cde",
+    "successful_process_id_count": 30,
+    "tasks_per_round": 3,
+    "unique_process_id_count": 30,
+    "unique_successful_process_id_count": 30,
+    "unique_task_id_count": 30,
+    "workers_per_round": 3
+  }
+}

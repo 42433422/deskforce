@@ -1,0 +1,634 @@
+"""通用表格与 OCR 输入解析。"""
+
+from __future__ import annotations
+
+import csv
+import itertools
+import re
+from pathlib import Path
+from typing import Any
+
+from app.application.elt.errors import EltError
+from app.application.elt.parser_ocr_provenance import enrich_ocr_provenance
+from app.application.elt.parser_structure import (
+    business_note_text,
+    detect_table_layout,
+    header_match_score,
+    is_auxiliary_sheet_name,
+    is_footer_or_note_row,
+    is_repeated_header,
+)
+from app.application.elt.parser_table_structure import (
+    load_sheet_segmentations,
+    plan_rows,
+    structured_layout,
+    table_values,
+)
+from app.application.elt.parser_target_match import (
+    covers_required_target_fields,
+    target_header_hints,
+)
+from app.application.elt.parser_types import ParsedDataset, ParsedRow, ParsedRows
+from app.application.elt.table_segmentation import SegmentedTable
+from app.utils.operational_errors import RECOVERABLE_ERRORS
+
+MAX_ROWS = 100_000
+STRUCTURED_SUFFIXES = {".xlsx", ".xlsm", ".csv"}
+OCR_SUFFIXES = {".pdf", ".jpg", ".jpeg", ".png"}
+KNOWLEDGE_ONLY_SUFFIXES = {".doc", ".docx", ".ppt", ".pptx"}
+SUPPORTED_SUFFIXES = STRUCTURED_SUFFIXES | OCR_SUFFIXES | KNOWLEDGE_ONLY_SUFFIXES
+_ROW_DIFFERENCE_LIMIT = 50
+
+
+def _row_reconciliation(
+    recognized: int,
+    row_groups: list[tuple[str, list[dict[str, Any]], str]],
+    sheet_groups: list[tuple[str, list[dict[str, Any]], str]] | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Explain original, recognized and preview counts without dropping a row silently."""
+    differences: list[dict[str, Any]] = []
+    dropped = 0
+    for code, rows, message in row_groups:
+        if not rows:
+            continue
+        dropped += len(rows)
+        item: dict[str, Any] = {
+            "code": code,
+            "count": len(rows),
+            "message": message,
+            "rows": rows[:_ROW_DIFFERENCE_LIMIT],
+        }
+        if len(rows) > _ROW_DIFFERENCE_LIMIT:
+            item["rows_omitted"] = len(rows) - _ROW_DIFFERENCE_LIMIT
+        differences.append(item)
+    for code, sheets, message in sheet_groups or []:
+        if not sheets:
+            continue
+        differences.append(
+            {
+                "code": code,
+                "count": 0,
+                "sheet_count": len(sheets),
+                "message": message,
+                "sheets": sheets,
+            }
+        )
+    if recognized == 0 and dropped == 0:
+        differences.append(
+            {
+                "code": "ELT_NO_DATA_ROWS",
+                "count": 0,
+                "message": "表头下没有可识别的业务数据行。",
+            }
+        )
+    reconciliation = {
+        "original_rows": recognized + dropped,
+        "recognized_rows": recognized,
+        "preview_rows": recognized,
+        "differences": differences,
+    }
+    return reconciliation, [dict(item) for item in differences]
+
+
+def _aligned_headers_by_sheet(
+    candidates: list[tuple[Any, Any]],
+    target_type: str,
+) -> dict[str, list[str]]:
+    """Align equivalent aliases across sheets to one source key per target field."""
+    from app.application.elt.targets import get_adapter
+
+    adapter = get_adapter(target_type)
+    if adapter.allow_dynamic_fields:
+        return {
+            worksheet.title: list(layout.headers)
+            for worksheet, layout in candidates
+            if layout is not None
+        }
+    canonical_by_field: dict[int, str] = {}
+    result: dict[str, list[str]] = {}
+    for worksheet, layout in candidates:
+        if layout is None:
+            continue
+        headers = list(layout.headers)
+        pairs = sorted(
+            (
+                (
+                    header_match_score(
+                        header,
+                        (field.key, field.label, *field.aliases),
+                    ),
+                    field_index,
+                    header_index,
+                )
+                for field_index, field in enumerate(adapter.fields)
+                for header_index, header in enumerate(headers)
+            ),
+            reverse=True,
+        )
+        used_fields: set[int] = set()
+        used_headers: set[int] = set()
+        for score, field_index, header_index in pairs:
+            # Only exact or contextual matches are safe to align automatically.
+            if score < 0.9:
+                break
+            if field_index in used_fields or header_index in used_headers:
+                continue
+            canonical = canonical_by_field.setdefault(field_index, headers[header_index])
+            headers[header_index] = canonical
+            used_fields.add(field_index)
+            used_headers.add(header_index)
+        result[worksheet.title] = headers
+    return result
+
+
+_ZERO_PAD_FORMAT = re.compile(r"0{2,}")
+
+
+def _cell_value(cell: Any) -> Any:
+    """Cell value as displayed for zero-padded codes (number format ``00000``)."""
+    value = cell.value
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return value
+    number_format = str(getattr(cell, "number_format", "") or "")
+    if _ZERO_PAD_FORMAT.fullmatch(number_format) and value >= 0 and value == int(value):
+        return str(int(value)).zfill(len(number_format))
+    return value
+
+
+def _row_data(headers: list[str], values: Any) -> dict[str, Any]:
+    """Keep "" distinct from None; drop only absent cells and all-blank rows."""
+    row = values[: len(headers)]
+    if all(value in (None, "") for value in row):
+        return {}
+    return {headers[index]: value for index, value in enumerate(row) if value is not None}
+
+
+def _parse_workbook(path: Path, max_rows: int, target_type: str) -> ParsedDataset:
+    from openpyxl import load_workbook
+
+    workbook = load_workbook(
+        path,
+        read_only=True,
+        data_only=True,
+        keep_links=False,
+    )
+    result = ParsedRows()
+    all_headers: list[str] = []
+    sheets: list[dict[str, Any]] = []
+    skipped_sheets: list[dict[str, Any]] = []
+    blank_rows: list[dict[str, Any]] = []
+    repeated_rows: list[dict[str, Any]] = []
+    footer_rows: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    business_notes: list[str] = []
+    header_hints = target_header_hints(target_type)
+    complete = False
+    try:
+        candidates: list[tuple[Any, Any]] = []
+        for worksheet in workbook.worksheets:
+            probe = list(worksheet.iter_rows(min_row=1, max_row=60, values_only=True))
+            layout = detect_table_layout(probe, header_hints=header_hints)
+            candidates.append((worksheet, layout))
+        segmentations = (
+            load_sheet_segmentations(path)
+            if any(layout is not None for _, layout in candidates)
+            else {}
+        )
+        candidates = [
+            (worksheet, structured_layout(segmentations.get(worksheet.title), layout, header_hints))
+            for worksheet, layout in candidates
+        ]
+        any_target_match = any(
+            layout is not None and layout.matched_hint_count > 0 for _, layout in candidates
+        )
+        aligned_headers = _aligned_headers_by_sheet(candidates, target_type)
+        excluded_rows: list[dict[str, Any]] = []
+
+        for worksheet, layout in candidates:
+            if layout is None:
+                skipped_sheets.append({"name": worksheet.title, "reason": "no_tabular_header"})
+                continue
+            if (
+                any_target_match
+                and layout.matched_hint_count == 0
+                and is_auxiliary_sheet_name(worksheet.title)
+            ):
+                skipped_sheets.append(
+                    {
+                        "name": worksheet.title,
+                        "reason": "auxiliary_sheet_without_target_fields",
+                    }
+                )
+                continue
+            headers = aligned_headers.get(worksheet.title, layout.headers)
+            header_aliases = {
+                original: aligned
+                for original, aligned in zip(layout.headers, headers, strict=False)
+                if original != aligned
+            }
+            all_headers.extend(header for header in headers if header not in all_headers)
+            sheet_count = 0
+            plan = plan_rows(segmentations.get(worksheet.title), layout.header_end + 1)
+            for row_number, cells in enumerate(
+                worksheet.iter_rows(min_row=layout.header_end + 2),
+                start=layout.header_end + 2,
+            ):
+                row_values = tuple(_cell_value(cell) for cell in cells)
+                located = {"sheet": worksheet.title, "row": row_number}
+                if all(value in (None, "") for value in row_values):
+                    blank_rows.append(located)
+                    continue
+                slices: list[tuple[SegmentedTable | None, tuple[Any, ...]]]
+                if plan is not None:
+                    tables = plan.tables_by_row.get(row_number)
+                    if not tables:
+                        if any(value not in (None, "") for value in row_values):
+                            role, reason = plan.exclude(row_number)
+                            if role == "repeated_header":
+                                repeated_rows.append(located)
+                            else:
+                                footer_rows.append(located)
+                            note = business_note_text(row_values)
+                            if note and note not in business_notes:
+                                business_notes.append(note)
+                            excluded_rows.append(
+                                {
+                                    "sheet": worksheet.title,
+                                    "row": row_number,
+                                    "role": role,
+                                    "reason": reason,
+                                }
+                            )
+                        continue
+                    slices = [
+                        (table, table_values(row_values, table, plan, len(headers)))
+                        for table in tables
+                    ]
+                elif is_repeated_header(row_values, layout.headers):
+                    repeated_rows.append(located)
+                    continue
+                elif is_footer_or_note_row(row_values):
+                    footer_rows.append(located)
+                    note = business_note_text(row_values)
+                    if note and note not in business_notes:
+                        business_notes.append(note)
+                    continue
+                else:
+                    slices = [(None, row_values)]
+                for table, values in slices:
+                    data = _row_data(headers, values)
+                    if not data:
+                        continue
+                    if len(result) >= max_rows:
+                        raise EltError(
+                            "ELT_ROW_LIMIT_EXCEEDED",
+                            f"文件超过 {max_rows} 行限制",
+                            status_code=413,
+                        )
+                    offset = (
+                        table.min_col - min(t.min_col for t in plan.tables)
+                        if table is not None and plan is not None
+                        else 0
+                    )
+                    provenance = {
+                        "sheet": worksheet.title,
+                        "row": row_number,
+                        "original_fragment": {
+                            layout.headers[index]: value
+                            for index, value in enumerate(values[: len(headers)])
+                        },
+                        "header_aliases": header_aliases,
+                        "columns": {
+                            headers[index]: offset + index + 1 for index in range(len(headers))
+                        },
+                        "header_rows": {
+                            "start": layout.header_start + 1,
+                            "end": layout.header_end + 1,
+                        },
+                    }
+                    if table is not None:
+                        provenance["table_id"] = table.table_id
+                        provenance["table_range"] = table.range_ref()
+                        provenance["table_title"] = table.title
+                    result.append(
+                        ParsedRow(
+                            sheet=worksheet.title,
+                            row_number=row_number,
+                            values=data,
+                            provenance=provenance,
+                        )
+                    )
+                    sheet_count += 1
+            sheets.append(
+                {
+                    "name": worksheet.title,
+                    "header_row": layout.header_end + 1,
+                    "header_start_row": layout.header_start + 1,
+                    "header_depth": layout.header_end - layout.header_start + 1,
+                    "header_confidence": layout.confidence,
+                    "header_reasons": list(layout.reasons),
+                    "matched_target_headers": layout.matched_hint_count,
+                    "source_headers": list(layout.headers),
+                    "aligned_headers": list(headers),
+                    "header_aliases": header_aliases,
+                    "row_count": sheet_count,
+                    **({"table_structure": plan.public()} if plan is not None else {}),
+                }
+            )
+        complete = True
+    finally:
+        if not complete:
+            result.close()
+        workbook.close()
+    reconciliation, warnings = _row_reconciliation(
+        len(result),
+        [
+            ("ELT_BLANK_ROWS_SKIPPED", blank_rows, f"已跳过 {len(blank_rows)} 行空白行。"),
+            (
+                "ELT_REPEATED_HEADERS_SKIPPED",
+                repeated_rows,
+                f"已跳过 {len(repeated_rows)} 行重复表头。",
+            ),
+            (
+                "ELT_FOOTER_ROWS_SKIPPED",
+                footer_rows,
+                f"已跳过 {len(footer_rows)} 行合计、备注或签字尾行。",
+            ),
+        ],
+        [
+            (
+                "ELT_AUXILIARY_SHEETS_SKIPPED",
+                skipped_sheets,
+                f"已跳过 {len(skipped_sheets)} 个非业务或无法识别的工作表，这些工作表不计入行数。",
+            )
+        ],
+    )
+    return ParsedDataset(
+        headers=all_headers,
+        rows=result,
+        source_features={
+            "kind": "workbook",
+            "sheets": sheets,
+            "skipped_sheets": skipped_sheets,
+            "headers": all_headers,
+            "structure_detection": "deterministic_v2",
+            "excluded_rows": excluded_rows,
+            "row_reconciliation": reconciliation,
+            "business_notes": business_notes,
+        },
+        warnings=warnings,
+    )
+
+
+def _csv_reader(path: Path):
+    for encoding in ("utf-8-sig", "gb18030"):
+        handle = None
+        try:
+            handle = path.open("r", encoding=encoding, newline="")
+            sample = handle.read(8192)
+            handle.seek(0)
+            try:
+                dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+            except csv.Error:
+                dialect = csv.excel
+            return handle, csv.reader(handle, dialect, skipinitialspace=True)
+        except UnicodeDecodeError:
+            if handle is not None:
+                handle.close()
+            continue
+    raise EltError("ELT_CSV_ENCODING_UNSUPPORTED", "CSV 编码无法识别")
+
+
+def _parse_csv(path: Path, max_rows: int, target_type: str) -> ParsedDataset:
+    handle, reader = _csv_reader(path)
+    rows = ParsedRows()
+    dataset = None
+    try:
+        probe = list(itertools.islice(reader, 60))
+        layout = detect_table_layout(
+            probe,
+            header_hints=target_header_hints(target_type),
+        )
+        if layout is None:
+            dataset = ParsedDataset(headers=[], rows=rows, source_features={"kind": "csv"})
+            return dataset
+        headers = layout.headers
+        blank_rows: list[dict[str, Any]] = []
+        repeated_rows: list[dict[str, Any]] = []
+        footer_rows: list[dict[str, Any]] = []
+        business_notes: list[str] = []
+        remaining_probe = probe[layout.header_end + 1 :]
+        for row_number, values in enumerate(
+            itertools.chain(remaining_probe, reader),
+            start=layout.header_end + 2,
+        ):
+            located = {"sheet": "CSV", "row": row_number}
+            if is_repeated_header(values, headers):
+                repeated_rows.append(located)
+                continue
+            if is_footer_or_note_row(values):
+                footer_rows.append(located)
+                note = business_note_text(values)
+                if note and note not in business_notes:
+                    business_notes.append(note)
+                continue
+            data = _row_data(headers, values)
+            if not data:
+                blank_rows.append(located)
+                continue
+            if len(rows) >= max_rows:
+                raise EltError(
+                    "ELT_ROW_LIMIT_EXCEEDED", f"文件超过 {max_rows} 行限制", status_code=413
+                )
+            rows.append(
+                ParsedRow(
+                    sheet="CSV",
+                    row_number=row_number,
+                    values=data,
+                    provenance={
+                        "sheet": "CSV",
+                        "row": row_number,
+                        "original_fragment": dict(zip(headers, values)),
+                        "columns": {headers[index]: index + 1 for index in range(len(headers))},
+                        "header_rows": {
+                            "start": layout.header_start + 1,
+                            "end": layout.header_end + 1,
+                        },
+                    },
+                )
+            )
+        reconciliation, warnings = _row_reconciliation(
+            len(rows),
+            [
+                ("ELT_BLANK_ROWS_SKIPPED", blank_rows, f"已跳过 {len(blank_rows)} 行空白行。"),
+                (
+                    "ELT_REPEATED_HEADERS_SKIPPED",
+                    repeated_rows,
+                    f"已跳过 {len(repeated_rows)} 行重复表头。",
+                ),
+                (
+                    "ELT_FOOTER_ROWS_SKIPPED",
+                    footer_rows,
+                    f"已跳过 {len(footer_rows)} 行合计、备注或签字尾行。",
+                ),
+            ],
+        )
+        dataset = ParsedDataset(
+            headers=headers,
+            rows=rows,
+            source_features={
+                "kind": "csv",
+                "headers": headers,
+                "row_count": len(rows),
+                "header_row": layout.header_end + 1,
+                "header_start_row": layout.header_start + 1,
+                "header_depth": layout.header_end - layout.header_start + 1,
+                "header_confidence": layout.confidence,
+                "header_reasons": list(layout.reasons),
+                "structure_detection": "deterministic_v2",
+                "row_reconciliation": reconciliation,
+                "business_notes": business_notes,
+            },
+            warnings=warnings,
+        )
+        return dataset
+    finally:
+        if dataset is None:
+            rows.close()
+        handle.close()
+
+
+def parse_file(
+    path: str | Path,
+    *,
+    target_type: str,
+    max_rows: int = MAX_ROWS,
+    compatibility_preset_id: str | None = None,
+) -> ParsedDataset:
+    source = Path(path).expanduser().resolve()
+    suffix = source.suffix.lower()
+    if not source.is_file():
+        raise EltError("ELT_UPLOAD_MISSING", "上传文件不存在", status_code=404)
+    if suffix not in SUPPORTED_SUFFIXES:
+        raise EltError("ELT_FILE_TYPE_UNSUPPORTED", f"不支持的文件类型: {suffix}")
+    if suffix in KNOWLEDGE_ONLY_SUFFIXES:
+        if target_type != "knowledge":
+            raise EltError(
+                "ELT_KNOWLEDGE_ONLY_FILE",
+                "Word/PPT 仅可导入知识库，不支持结构化业务写入",
+            )
+        return ParsedDataset(
+            headers=["document_path"],
+            rows=[
+                ParsedRow(
+                    sheet="文档",
+                    row_number=1,
+                    values={"document_path": str(source)},
+                    provenance={"original_file": source.name},
+                )
+            ],
+            source_features={"kind": "document", "knowledge_only": True},
+        )
+    if suffix == ".csv":
+        if compatibility_preset_id:
+            raise EltError(
+                "ELT_COMPATIBILITY_PRESET_FILE_UNSUPPORTED",
+                "兼容预设仅适用于 XLSX/XLSM 文件；CSV 请使用自动识别",
+            )
+        return _parse_csv(source, max_rows, target_type)
+    if suffix in STRUCTURED_SUFFIXES and target_type == "attendance":
+        from app.application.elt.attendance_pipeline import parse_attendance_dataset
+
+        return parse_attendance_dataset(source, max_rows=max_rows)
+    if suffix in STRUCTURED_SUFFIXES:
+        if compatibility_preset_id and target_type not in {
+            "customer_products",
+            "customers",
+            "products",
+            "shipment_records",
+        }:
+            raise EltError(
+                "ELT_COMPATIBILITY_PRESET_TARGET_MISMATCH",
+                "兼容预设不适用于当前目标",
+            )
+        if target_type in {"customer_products", "shipment_records"} and not compatibility_preset_id:
+            try:
+                from app.application.elt.parser_regions import (
+                    parse_customer_product_regions,
+                )
+
+                regional = parse_customer_product_regions(
+                    source,
+                    max_rows=max_rows,
+                    target_type=target_type,
+                )
+            except EltError:
+                raise
+            except RECOVERABLE_ERRORS:
+                regional = None
+            if regional is not None:
+                if covers_required_target_fields(regional, target_type):
+                    return regional
+                regional.close()
+        from app.application.elt.shipment_compat_parser import (
+            parse_delivery_note_with_compat_profile,
+        )
+
+        compatibility = parse_delivery_note_with_compat_profile(
+            source,
+            target_type=target_type,
+            max_rows=max_rows,
+            compatibility_preset_id=compatibility_preset_id,
+        )
+        if compatibility_preset_id:
+            if compatibility is None:
+                raise EltError(
+                    "ELT_COMPATIBILITY_PRESET_NO_MATCH",
+                    "所选兼容预设未识别到可靠业务数据，请改用自动识别或其他预设",
+                )
+            return compatibility
+        if compatibility is not None:
+            if target_type == "shipment_records":
+                return compatibility
+            try:
+                generic = _parse_workbook(source, max_rows, target_type)
+            except EltError:
+                raise
+            except RECOVERABLE_ERRORS:
+                return compatibility
+            if generic.rows and covers_required_target_fields(generic, target_type):
+                generic.warnings.insert(
+                    0,
+                    {
+                        "code": "ELT_GENERIC_STRUCTURE_PREFERRED",
+                        "message": "文件已包含完整业务字段，已优先使用通用表格结构解析。",
+                    },
+                )
+                compatibility.close()
+                return generic
+            generic.close()
+            return compatibility
+        return _parse_workbook(source, max_rows, target_type)
+
+    if compatibility_preset_id:
+        raise EltError(
+            "ELT_COMPATIBILITY_PRESET_FILE_UNSUPPORTED",
+            "兼容预设仅适用于 XLSX/XLSM 文件；OCR 文件请使用自动识别",
+        )
+
+    from app.application.shipment_excel_etl_ocr import ocr_source_to_workbook
+
+    result = ocr_source_to_workbook(source)
+    if not result.get("success"):
+        raise EltError(
+            str(result.get("error_code") or "ELT_OCR_FAILED").upper(),
+            "OCR 无法可靠还原表格，请更换清晰文件后重试",
+        )
+    dataset = _parse_workbook(Path(str(result["file_path"])), max_rows, target_type)
+    enriched = None
+    try:
+        enriched = enrich_ocr_provenance(dataset, result, source_suffix=suffix)
+        return enriched
+    finally:
+        if enriched is None:
+            dataset.close()

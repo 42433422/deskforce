@@ -1,0 +1,566 @@
+"""Planner chat API with request-scoped, explicitly bound components."""
+
+from __future__ import annotations
+
+import json as json
+import logging
+import uuid
+from collections.abc import AsyncGenerator
+from contextlib import aclosing
+from typing import Any
+
+from fastapi import HTTPException as HTTPException
+from fastapi import Request
+
+from app.application.agent_orchestrator.chat_trace import (
+    attach_chat_trace_run,
+)
+from app.application.planner_compat.admission import ChatAdmission
+from app.application.planner_compat.application import CompatChatApplication, FastPaths
+from app.application.planner_compat.persona import (
+    BINARY_CONTEXT_KEYS,
+    ConversationService,
+    IndustryResolver,
+    PersonaEnricher,
+    request_session_candidates,
+    summarize_context_for_log,
+)
+from app.application.planner_compat.persona import (
+    recent_history as _recent_history,
+)
+from app.application.planner_compat.persona import (
+    resolve_chat_user_id as _resolve_chat_user_id,
+)
+from app.application.planner_compat.protocols import (
+    ChatBackends,
+    ChatBody,
+    ChatResponses,
+    ChatTrace,
+    Context,
+    Payload,
+)
+from app.application.planner_compat.runtime import await_with_timeout as _await_with_timeout
+from app.application.planner_compat.runtime import execute_mainline
+from app.application.planner_compat.runtime import (
+    merge_kitten_attachments as _merge_kitten_attachments,
+)
+from app.application.planner_compat.streaming import CompatStream
+from app.application.planner_compat_execute import ChatTurnExecutor
+from app.domain.ai.tier import (
+    assert_p2_elevated_claim_or_raise,
+    resolve_ai_tier,
+    runtime_context_with_tier,
+)
+from app.domain.context.session_context import (
+    planner_workflow_interrupt_reply,
+    runtime_context_after_workflow_interrupt,
+)
+from app.domain.shared_services.conversation.modstore_adapter import (
+    create_modstore_openai_client_from_request,
+    request_route_metadata,
+)
+from app.fastapi_routes.xcagi_compat_chat_helpers import (
+    XcagiCompatChatBatchBody,
+    XcagiCompatChatBody,
+    _ensure_chat_db_read_authorized,
+    _ensure_vector_index_if_needed,
+    _merge_runtime_context_with_message_paths,
+    _message_requires_db_read_token,
+    _runtime_context_with_authenticated_actor,
+    _xcagi_chat_http_exc,
+    _xcagi_chat_timeout_error_payload,
+    _xcagi_chat_timeout_seconds,
+    _xcagi_compat_reply_payload,
+    _xcagi_planner_stream_bytes_async,
+)
+from app.infrastructure.llm.client import llm_client_factory_scope, request_llm_mode
+from app.infrastructure.llm.client import set_mode as set_llm_mode
+from app.utils.operational_errors import BOUNDARY_ERRORS as BOUNDARY_ERRORS
+from app.utils.operational_errors import RECOVERABLE_ERRORS
+
+logger = logging.getLogger(__name__)
+
+
+def _compatibility_session(request: Request) -> str | None:
+    from app.fastapi_routes.domains.misc.helpers import _session_id_from_request
+
+    return _session_id_from_request(request)
+
+
+def _request_session_candidates(request: Request) -> list[str]:
+    return request_session_candidates(request, _compatibility_session, logger)
+
+
+def _account_meta(session: str) -> Context:
+    from app.application.session_account_meta import load_session_account_meta
+
+    return load_session_account_meta(session) or {}
+
+
+def _workspace_prefs(owner: str) -> Context:
+    from app.application.tenant_workspace_prefs import get_workspace_prefs
+
+    return get_workspace_prefs(owner)
+
+
+def _user_industry(user: Any) -> str | None:
+    from app.db.models.user import User
+    from app.db.session import get_db
+
+    with get_db() as db:
+        row = db.query(User.industry_id).filter(User.id == user).first()
+    return str(row[0]).strip() if row and row[0] else None
+
+
+def _derive_industry_from_session(request: Request) -> str:
+    return IndustryResolver(
+        _request_session_candidates, _account_meta, _workspace_prefs, _user_industry, logger
+    ).resolve(request)
+
+
+def _summarize_context_for_log(value: Any) -> Any:
+    return summarize_context_for_log(value, binary_keys=BINARY_CONTEXT_KEYS)
+
+
+def _conversation_service() -> ConversationService:
+    from app.domain.shared_services.conversation.manager import get_ai_conversation_service
+
+    return get_ai_conversation_service()
+
+
+def _attach_compat_chat_trace(
+    payload: Payload,
+    body: ChatBody,
+    *,
+    message: str,
+    runtime_context: Context | None,
+    channel: str,
+) -> Payload:
+    return attach_chat_trace_run(
+        payload,
+        message=message,
+        runtime_context=runtime_context,
+        user_id=body.user_id,
+        source=body.source,
+        channel=channel,
+    )
+
+
+async def _execute_ai_chat_mainline(
+    body: ChatBody,
+    runtime_context: Context,
+    *,
+    message: str | None = None,
+    kitten_extra: Payload | None = None,
+) -> Payload:
+    from app.application import get_ai_chat_app_service
+
+    return await execute_mainline(
+        get_ai_chat_app_service(),
+        body,
+        runtime_context,
+        message=message,
+        kitten_extra=kitten_extra,
+        reply=_xcagi_compat_reply_payload,
+        merge_attachments=_merge_kitten_attachments,
+    )
+
+
+def _business_action(
+    message: str, *, runtime_context: Context, user_id: str | None, request: Request
+) -> Payload | None:
+    from app.domain.app_pure.chat_business_safety import try_handle_business_chat_action
+
+    return try_handle_business_chat_action(
+        message, runtime_context=runtime_context, user_id=user_id, request=request
+    )
+
+
+async def _kitten_context(context: Context, message: str) -> tuple[Context, Payload]:
+    try:
+        from app.application.kitten_planner_context import (
+            enrich_kitten_analyzer_runtime,
+            kitten_reply_attachments,
+        )
+
+        context = await enrich_kitten_analyzer_runtime(context, message)
+        return context, kitten_reply_attachments(context)
+    except RECOVERABLE_ERRORS:
+        logger.debug("kitten planner context enrich skipped", exc_info=True)
+        return context, {}
+
+
+def _sse_event(payload: Payload) -> bytes:
+    from app.fastapi_routes.xcagi_compat_chat_helpers import _sse_event_line
+
+    return _sse_event_line(payload)
+
+
+def _admission() -> ChatAdmission:
+    return ChatAdmission(
+        merge_paths=_merge_runtime_context_with_message_paths,
+        authenticate=_runtime_context_with_authenticated_actor,
+        with_tier=runtime_context_with_tier,
+        authorize_read=_ensure_chat_db_read_authorized,
+        requires_read=_message_requires_db_read_token,
+        interrupt=planner_workflow_interrupt_reply,
+        after_interrupt=runtime_context_after_workflow_interrupt,
+        vector_guard=_ensure_vector_index_if_needed,
+        reply=_xcagi_compat_reply_payload,
+    )
+
+
+def _fast_paths() -> FastPaths:
+    return FastPaths(_business_action, _kitten_context)
+
+
+def _token_required_payload(parsed: Payload) -> Payload:
+    data = {
+        "requires_token": True,
+        "token_name": parsed.get("token_name"),
+        "token_description": parsed.get("token_description"),
+    }
+    records = parsed.get("legacy_tool_records")
+    if isinstance(records, list) and records:
+        data["legacy_tool_records"] = records
+    return {
+        "success": True,
+        "requires_token": True,
+        "token_name": parsed.get("token_name"),
+        "token_description": parsed.get("token_description"),
+        "message": parsed.get("message"),
+        "response": parsed.get("message"),
+        "data": data,
+    }
+
+
+def _application() -> CompatChatApplication:
+    # Resolve these seams from the calling module, including separately loaded
+    # facade instances. No ambient globals or shared request state is needed.
+    executor = ChatTurnExecutor(
+        backends=ChatBackends(
+            _execute_ai_chat_mainline,
+        ),
+        responses=ChatResponses(
+            _xcagi_chat_timeout_error_payload,
+            _xcagi_chat_http_exc,
+        ),
+        trace=ChatTrace(_attach_compat_chat_trace),
+        await_timeout=_await_with_timeout,
+    )
+    return CompatChatApplication(
+        _admission(),
+        executor,
+        _fast_paths(),
+        set_llm_mode,
+        assert_p2_elevated_claim_or_raise,
+        resolve_ai_tier,
+        _xcagi_chat_timeout_seconds,
+        single_turn=execute_compat_chat,
+    )
+
+
+async def _execute_compat_chat_impl(request: Request, body: XcagiCompatChatBody) -> Payload:
+    return await _application().single(request, body)
+
+
+async def _execute_compat_chat_batch_impl(
+    request: Request, body: XcagiCompatChatBatchBody
+) -> Payload:
+    return await _application().batch(request, body)
+
+
+def _prepare_compat_chat_body(request: Request, body: XcagiCompatChatBody) -> XcagiCompatChatBody:
+    context = _runtime_context_with_authenticated_actor(request, body.context or {})
+    if not str(context.get("turn_id") or "").strip():
+        context["turn_id"] = uuid.uuid4().hex
+    return body.model_copy(update={"context": context})
+
+
+def _settle_dialogue_turn(body: XcagiCompatChatBody, payload: dict[str, Any], status: str) -> None:
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        data = {}
+    if data.get("replay"):
+        return
+    from app.application.agent_orchestrator.trace_payloads import _payload_status
+    from app.application.ai_chat.dialogue_memory import settle_chat_turn
+    from app.domain.task_lifecycle.results import (
+        execution_result_requires_reconciliation,
+        execution_result_wait_reason,
+    )
+
+    execution_status = _payload_status(payload)
+    if execution_status == "waiting_user":
+        status = (
+            "waiting_approval"
+            if execution_result_wait_reason(payload) in {"authorization", "approval"}
+            else "waiting_user"
+        )
+    elif execution_status == "blocked":
+        status = "unknown" if execution_result_requires_reconciliation(payload) else "blocked"
+    elif execution_status != "completed" or status not in {"unknown", "interrupted"}:
+        status = execution_status
+
+    message = str(getattr(body, "message", "") or "")
+    context = getattr(body, "context", None)
+    if not message or not isinstance(context, dict):
+        return
+    payload["turn_id"] = context.get("turn_id")
+    try:
+        settle_chat_turn(message, context, payload, status)
+    except RECOVERABLE_ERRORS:
+        logger.warning("dialogue turn settle failed", exc_info=True)
+
+
+def _persist_compat_chat_turn(body: XcagiCompatChatBody, payload: dict[str, Any]) -> None:
+    from app.application import get_ai_chat_app_service
+    from app.application.task_conversation_store import durable_user_id
+
+    context = body.context or {}
+    owner = durable_user_id(context.get("local_user_id"))
+    if (
+        owner is None
+        or context.get("tenant_id") is None
+        or not (context.get("session_id") or context.get("conversation_id"))
+    ):
+        return
+    try:
+        get_ai_chat_app_service()._persist_chat_turn(str(owner), body.message, context, payload)
+    except RECOVERABLE_ERRORS:
+        logger.warning("compat chat history persistence failed", exc_info=True)
+    if payload.get("success") and context.get("memory_capture_enabled") is not False:
+        try:
+            from app.application.persy_memory_app_service import get_persy_memory_app_service
+            from app.infrastructure.auth.agent_mod_scope import agent_dataset_access_context
+
+            get_persy_memory_app_service().capture_conversation_turn(
+                access_context=agent_dataset_access_context(context),
+                user_message=body.message,
+                assistant_message=str(payload.get("response") or payload.get("message") or ""),
+                session_id=str(context.get("session_id") or context.get("conversation_id") or ""),
+                source=str(body.source or "chat"),
+            )
+        except RECOVERABLE_ERRORS:
+            logger.warning("compat chat memory capture failed", exc_info=True)
+
+
+async def execute_compat_chat(request: Request, body: XcagiCompatChatBody) -> Payload:
+    body = _prepare_compat_chat_body(request, body)
+    try:
+        with (
+            request_llm_mode(body.mode),
+            llm_client_factory_scope(lambda: create_modstore_openai_client_from_request(request)),
+        ):
+            payload = await _execute_compat_chat_impl(request, body)
+    except HTTPException as exc:
+        metadata = request_route_metadata(request)
+        message = (
+            exc.detail
+            if isinstance(exc.detail, str)
+            else (
+                str(exc.detail.get("message") or "对话执行失败")
+                if isinstance(exc.detail, dict)
+                else "对话执行失败"
+            )
+        )
+        failure = {"success": False, "response": message}
+        if metadata:
+            failure["route_metadata"] = metadata
+        _settle_dialogue_turn(body, failure, "failed")
+        if metadata:
+            _persist_compat_chat_turn(body, failure)
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"message": message, "route_metadata": metadata},
+                headers=exc.headers,
+            ) from None
+        raise
+    metadata = request_route_metadata(request)
+    if metadata:
+        payload["route_metadata"] = metadata
+    _persist_compat_chat_turn(body, payload)
+    _settle_dialogue_turn(body, payload, "completed" if payload.get("success") else "failed")
+    return payload
+
+
+async def execute_compat_chat_batch(request: Request, body: XcagiCompatChatBatchBody) -> Payload:
+    with (
+        request_llm_mode(body.mode),
+        llm_client_factory_scope(lambda: create_modstore_openai_client_from_request(request)),
+    ):
+        return await _execute_compat_chat_batch_impl(request, body)
+
+
+async def compat_chat_stream_async(
+    request: Request, body: XcagiCompatChatBody, *, ai_tier: str | None = None
+) -> AsyncGenerator[bytes, None]:
+    body = _prepare_compat_chat_body(request, body)
+    assert_p2_elevated_claim_or_raise(request)
+    stream = CompatStream(
+        _admission(),
+        _fast_paths(),
+        PersonaEnricher(
+            _conversation_service,
+            _resolve_chat_user_id,
+            _derive_industry_from_session,
+            _recent_history,
+            _summarize_context_for_log,
+            logger,
+        ),
+        attach_chat_trace_run,
+        _sse_event,
+        resolve_ai_tier,
+        _xcagi_planner_stream_bytes_async,
+        logger,
+    )
+    pending = b""
+    turn_id = str((body.context or {}).get("turn_id") or "")
+    last_metadata: dict[str, Any] = {}
+    last_run_id = ""
+    settled = False
+    try:
+        with (
+            request_llm_mode(body.mode),
+            llm_client_factory_scope(lambda: create_modstore_openai_client_from_request(request)),
+        ):
+            async with aclosing(stream.run(request, body, ai_tier=ai_tier)) as chunks:
+                async for chunk in chunks:
+                    if not pending and not chunk.startswith((b"data", b"event:")):
+                        yield chunk
+                        continue
+                    pending += chunk
+                    while b"\n\n" in pending:
+                        event, pending = pending.split(b"\n\n", 1)
+                        encoded = event + b"\n\n"
+                        for line in event.splitlines():
+                            if not line.startswith(b"data: "):
+                                continue
+                            try:
+                                item = json.loads(line[6:])
+                            except (ValueError, UnicodeError):
+                                continue
+                            if not isinstance(item, dict):
+                                continue
+                            item["turn_id"] = turn_id
+                            nested = item.get("result")
+                            observed_run_id = str(
+                                item.get("run_id")
+                                or item.get("agent_run_id")
+                                or (
+                                    nested.get("run_id") or nested.get("agent_run_id")
+                                    if isinstance(nested, dict)
+                                    else ""
+                                )
+                                or ""
+                            )
+                            if observed_run_id and not last_run_id:
+                                last_run_id = observed_run_id
+                                if item.get("type") not in {
+                                    "done",
+                                    "error",
+                                    "requires_token",
+                                }:
+                                    _settle_dialogue_turn(
+                                        body,
+                                        {
+                                            "success": False,
+                                            "run_id": last_run_id,
+                                            "execution_state": "running",
+                                            "response": "任务正在处理，请查询原执行结果。",
+                                        },
+                                        "running",
+                                    )
+                            metadata = request_route_metadata(request)
+                            if metadata and metadata != last_metadata:
+                                yield _sse_event(
+                                    {
+                                        "type": "route_metadata",
+                                        "route_metadata": metadata,
+                                    }
+                                )
+                                last_metadata = metadata
+                            if item.get("type") == "done" and isinstance(item.get("result"), dict):
+                                result = item["result"]
+                                if (body.context or {}).get("kitten_analyzer"):
+                                    from app.application.kitten_planner_context import (
+                                        kitten_reply_attachments,
+                                    )
+
+                                    result = _merge_kitten_attachments(
+                                        result, kitten_reply_attachments(body.context)
+                                    )
+                                    item["result"] = result
+                                if last_run_id:
+                                    result.setdefault("run_id", last_run_id)
+                                if metadata:
+                                    result["route_metadata"] = metadata
+                                explicit = result.get("success") if "success" in result else None
+                                reply = str(
+                                    result.get("response") or result.get("message") or ""
+                                ).strip()
+                                if explicit is True or (explicit is None and reply):
+                                    status = "completed"
+                                elif explicit is False:
+                                    status = "failed"
+                                else:
+                                    result.update(
+                                        execution_outcome="unknown",
+                                        requires_reconciliation=True,
+                                    )
+                                    status = "unknown"
+                                _persist_compat_chat_turn(body, result)
+                                _settle_dialogue_turn(body, result, status)
+                                settled = True
+                            elif item.get("type") == "requires_token":
+                                if last_run_id:
+                                    item.setdefault("run_id", last_run_id)
+                                item["execution_state"] = "waiting_approval"
+                                result = {
+                                    **item,
+                                    "success": True,
+                                    "requires_token": True,
+                                    "response": str(
+                                        item.get("message") or "等待授权，原任务尚未完成。"
+                                    ),
+                                }
+                                result.pop("type", None)
+                                _persist_compat_chat_turn(body, result)
+                                _settle_dialogue_turn(body, result, "waiting_approval")
+                                settled = True
+                            elif item.get("type") == "error":
+                                if last_run_id:
+                                    item.setdefault("run_id", last_run_id)
+                                if metadata:
+                                    item["route_metadata"] = metadata
+                                error_data = item.get("data")
+                                failure = {
+                                    **item,
+                                    "success": False,
+                                    "response": str(item.get("message") or "对话执行失败"),
+                                    "data": {
+                                        **(error_data if isinstance(error_data, dict) else {}),
+                                        "status": item.get("status") or "failed",
+                                    },
+                                }
+                                failure.pop("type", None)
+                                _persist_compat_chat_turn(body, failure)
+                                _settle_dialogue_turn(body, failure, "failed")
+                                settled = True
+                            encoded = _sse_event(item)
+                        yield encoded
+        if pending:
+            yield pending
+    finally:
+        if not settled:
+            _settle_dialogue_turn(
+                body,
+                {
+                    "success": False,
+                    "run_id": last_run_id,
+                    "execution_outcome": "unknown",
+                    "requires_reconciliation": True,
+                    "response": "对话观察已中断，执行结果尚未确认，请查询原任务。",
+                },
+                "unknown",
+            )

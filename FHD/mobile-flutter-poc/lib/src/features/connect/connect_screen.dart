@@ -1,0 +1,247 @@
+import 'package:flutter/material.dart';
+
+import '../../theme/app_assets.dart';
+import '../../theme/app_theme.dart';
+import '../../widgets/we_ui.dart';
+import '../auth/auth_screen.dart';
+import '../scan/scan_qr_screen.dart';
+
+class ConnectScreen extends StatelessWidget {
+  const ConnectScreen({
+    super.key,
+    this.fromProfile = false,
+    this.onNext,
+    this.onScan,
+    this.onSkipCloud,
+    this.onBack,
+  });
+
+  final bool fromProfile;
+  final VoidCallback? onNext;
+  final VoidCallback? onScan;
+  final VoidCallback? onSkipCloud;
+  final VoidCallback? onBack;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = AppTheme.colors(context);
+    return Scaffold(
+      backgroundColor: colors.page,
+      body: Container(
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.center,
+            colors: [
+              colors.brand.withValues(alpha: 0.10),
+              colors.page,
+            ],
+          ),
+        ),
+        child: SafeArea(
+          bottom: false,
+          child: Column(
+            children: [
+              WeTopBar(title: 'Agent 远程控制', onBack: () => _back(context)),
+              Expanded(
+                child: SingleChildScrollView(
+                  padding: const EdgeInsets.fromLTRB(24, 32, 24, 32),
+                  child: Container(
+                    padding: const EdgeInsets.fromLTRB(24, 32, 24, 28),
+                    decoration: BoxDecoration(
+                      color: colors.surface,
+                      borderRadius: BorderRadius.circular(24),
+                      border: Border.all(
+                        color: colors.divider.withValues(alpha: 0.7),
+                      ),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withValues(alpha: 0.06),
+                          blurRadius: 24,
+                          offset: const Offset(0, 8),
+                        ),
+                      ],
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Center(
+                          child: Container(
+                            width: 88,
+                            height: 88,
+                            padding: const EdgeInsets.all(16),
+                            decoration: BoxDecoration(
+                              color: colors.surface,
+                              borderRadius: BorderRadius.circular(24),
+                              border: Border.all(color: colors.divider),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: colors.brand.withValues(alpha: 0.18),
+                                  blurRadius: 18,
+                                  offset: const Offset(0, 6),
+                                ),
+                              ],
+                            ),
+                            child: Image.asset(
+                              appLauncherForegroundAsset,
+                              fit: BoxFit.contain,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 20),
+                        Text(
+                          key: const ValueKey('connect_title'),
+                          'XCAGI 修茈企业版',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: colors.textPrimary,
+                            fontSize: 23,
+                            height: 1.3,
+                            fontWeight: FontWeight.w700,
+                            letterSpacing: 0,
+                          ),
+                        ),
+                        const SizedBox(height: 22),
+                        Wrap(
+                          alignment: WrapAlignment.center,
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: const [
+                            _CapabilityChip(label: '扫码绑定'),
+                            _CapabilityChip(label: '远程派单'),
+                            _CapabilityChip(label: '审批与收产物'),
+                          ],
+                        ),
+                        const SizedBox(height: 26),
+                        _LoginButton(
+                          text: '扫描绑定',
+                          kind: _LoginButtonKind.primary,
+                          onTap: () => _scan(context),
+                        ),
+                        const SizedBox(height: 12),
+                        _LoginButton(
+                          text: '返回',
+                          kind: _LoginButtonKind.secondary,
+                          onTap: () => _back(context),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _scan(BuildContext context) {
+    final callback = onScan;
+    if (callback != null) {
+      callback();
+      return;
+    }
+    Navigator.of(
+      context,
+    ).push(MaterialPageRoute(builder: (_) => const ScanQrScreen()));
+  }
+
+  void _back(BuildContext context) {
+    final callback = onBack ?? onSkipCloud ?? onNext;
+    if (callback != null) {
+      callback();
+      return;
+    }
+    final navigator = Navigator.of(context);
+    if (navigator.canPop()) {
+      navigator.maybePop();
+      return;
+    }
+    navigator.pushReplacement(
+      MaterialPageRoute(builder: (_) => const AuthScreen()),
+    );
+  }
+}
+
+enum _LoginButtonKind { primary, secondary }
+
+class _LoginButton extends StatelessWidget {
+  const _LoginButton({
+    required this.text,
+    required this.kind,
+    required this.onTap,
+  });
+
+  final String text;
+  final _LoginButtonKind kind;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final primary = kind == _LoginButtonKind.primary;
+    final colors = AppTheme.colors(context);
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 24),
+      child: Material(
+        color: primary ? colors.brand : colors.surface,
+        borderRadius: BorderRadius.circular(8),
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(8),
+          child: Container(
+            key: ValueKey(
+              primary ? 'connect_primary_button' : 'connect_secondary_button',
+            ),
+            height: 48,
+            width: double.infinity,
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(8),
+              border: primary
+                  ? null
+                  : Border.all(color: colors.divider, width: 0.5),
+            ),
+            alignment: Alignment.center,
+            child: Text(
+              text,
+              style: TextStyle(
+                color:
+                    primary ? colors.chatUserBubbleText : colors.textSecondary,
+                fontSize: primary ? 16 : 15,
+                height: primary ? 1.38 : 1.4,
+                fontWeight: primary ? FontWeight.w500 : FontWeight.w400,
+                letterSpacing: 0,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _CapabilityChip extends StatelessWidget {
+  const _CapabilityChip({required this.label});
+
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = AppTheme.colors(context);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      decoration: BoxDecoration(
+        color: colors.brand.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+          color: colors.brand,
+          fontSize: 12,
+          fontWeight: FontWeight.w500,
+        ),
+      ),
+    );
+  }
+}

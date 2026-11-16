@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "retort-engine"
+version = "0.4.0"
+description = "Retort blackhole external evolution engine"
+requires-python = ">=3.10"
+dependencies = ["cryptography>=50,<51"]
+
+[project.optional-dependencies]
+web = ["fastapi>=0.115,<1", "uvicorn>=0.34,<1"]
+
+[project.scripts]
+retort = "retort_engine.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["retort_engine*"]
+
+[tool.setuptools.package-data]
+retort_engine = ["frontend/*"]
+
+[tool.pytest.ini_options]
+markers = [
+  "keep_self_depth_gate: do not mock external_improvement_gate (assert real blocked/allowed paths)",
+]

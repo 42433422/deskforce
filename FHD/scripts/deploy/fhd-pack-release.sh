@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+# 打包 FHD 生产 API 发布物（tar.gz + manifest.json）。
+# 用法（在 FHD 根目录）:
+#   bash scripts/deploy/fhd-pack-release.sh
+# 输出: dist/deploy/fhd-full-<version>-<sha>.tar.gz 与同目录 manifest.json
+# macOS 打包时禁用 xattr，避免 Linux 解压 LIBARCHIVE.xattr 警告。
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+FHD_ROOT="$(cd -- "$SCRIPT_DIR/../.." &>/dev/null && pwd)"
+REPO_ROOT="$(cd -- "$FHD_ROOT/.." &>/dev/null && pwd)"
+DR_RELEASE_SYNC="$REPO_ROOT/ops/dr/xcmax_release_sync.sh"
+DR_RELEASE_SYNC_PRUNE="$REPO_ROOT/ops/dr/xcmax_release_sync_prune.py"
+# shellcheck source=lib/deploy_emit.sh
+. "$SCRIPT_DIR/lib/deploy_emit.sh"
+export DEPLOY_SCRIPT_ID="fhd_pack_release"
+
+OUT_DIR="${FHD_RELEASE_OUT_DIR:-$FHD_ROOT/dist/deploy}"
+CHANNEL="${FHD_RELEASE_CHANNEL:-stable}"
+mkdir -p "$OUT_DIR"
+
+deploy_emit bootstrap started "fhd_root=$FHD_ROOT"
+
+VERIFY="$FHD_ROOT/scripts/dev/verify_version_anchors.py"
+if [[ ! -f "$VERIFY" ]]; then
+  echo "[err] missing $VERIFY" >&2
+  deploy_emit verify failed "missing_script"
+  exit 1
+fi
+deploy_emit verify started
+if ! python3 "$VERIFY"; then
+  deploy_emit verify failed "anchor_mismatch"
+  exit 1
+fi
+deploy_emit verify ok
+
+VERSION="$(. "$SCRIPT_DIR/lib/version.sh" && product_version)"
+
+GIT_SHA="${FHD_RELEASE_GIT_SHA:-local}"
+if [[ "$GIT_SHA" == "local" ]] && command -v git >/dev/null 2>&1 && git -C "$FHD_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  GIT_SHA="$(git -C "$FHD_ROOT" rev-parse HEAD 2>/dev/null || echo local)"
+fi
+[[ "$GIT_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+  echo "[err] FHD release requires an exact 40-character Git SHA" >&2
+  exit 1
+}
+
+ADMIN_DIST="$FHD_ROOT/templates/admin-vue-dist"
+ADMIN_VERIFY="$SCRIPT_DIR/lib/verify_admin_console.py"
+ARCHIVE_VERIFY="$SCRIPT_DIR/lib/verify_release_archive.py"
+if [[ "${FHD_SKIP_ADMIN_BUILD:-0}" != "1" ]]; then
+  command -v npm >/dev/null 2>&1 || {
+    echo "[err] npm is required to build the admin console" >&2
+    exit 1
+  }
+  [[ -d "$FHD_ROOT/frontend/node_modules" ]] || {
+    echo "[err] frontend dependencies are missing; run npm ci in FHD/frontend" >&2
+    exit 1
+  }
+  deploy_emit admin_build started "git_sha=$GIT_SHA"
+  (
+    cd "$FHD_ROOT/admin-console"
+    VITE_XCAGI_GIT_SHA="$GIT_SHA" npm run build
+  )
+  deploy_emit admin_build ok
+fi
+[[ -f "$ADMIN_VERIFY" ]] || {
+  echo "[err] admin release verifier is missing: $ADMIN_VERIFY" >&2
+  exit 1
+}
+[[ -f "$ARCHIVE_VERIFY" ]] || {
+  echo "[err] release archive verifier is missing: $ARCHIVE_VERIFY" >&2
+  exit 1
+}
+ARCHIVE_VERIFY_SHA256="$(python3 - "$REPO_ROOT" "$GIT_SHA" "$ARCHIVE_VERIFY" <<'PY'
+import hashlib, subprocess, sys
+root, sha, local_path = sys.argv[1:]
+source = subprocess.check_output(["git", "-C", root, "show", f"{sha}:FHD/scripts/deploy/lib/verify_release_archive.py"])
+expected = hashlib.sha256(source).hexdigest()
+with open(local_path, "rb") as stream:
+    actual = hashlib.sha256(stream.read()).hexdigest()
+if actual != expected:
+    raise SystemExit("release archive verifier differs from exact release Git source")
+print(expected)
+PY
+)"
+[[ "$ARCHIVE_VERIFY_SHA256" =~ ^[0-9a-f]{64}$ ]] || exit 1
+[[ -x "$DR_RELEASE_SYNC" ]] || {
+  echo "[err] DR release sync helper is missing or not executable: $DR_RELEASE_SYNC" >&2
+  exit 1
+}
+[[ -r "$DR_RELEASE_SYNC_PRUNE" ]] || {
+  echo "[err] DR release sync prune helper is missing: $DR_RELEASE_SYNC_PRUNE" >&2
+  exit 1
+}
+ADMIN_CONSOLE_SHA256="$(python3 "$ADMIN_VERIFY" --root "$ADMIN_DIST" --stamp-git-sha "$GIT_SHA" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha256"])')"
+[[ "$ADMIN_CONSOLE_SHA256" =~ ^[0-9a-f]{64}$ ]] || {
+  echo "[err] admin release SHA256 is invalid" >&2
+  exit 1
+}
+
+GIT_SHORT="${GIT_SHA:0:12}"
+ARTIFACT="fhd-full-${VERSION}-${GIT_SHORT}.tar.gz"
+TARBALL="$OUT_DIR/$ARTIFACT"
+STAGING="$(mktemp -d "${TMPDIR:-/tmp}/fhd-pack.XXXXXX")"
+trap 'rm -rf "$STAGING"' EXIT
+
+export COPYFILE_DISABLE=1
+
+deploy_emit pack started "artifact=$ARTIFACT"
+
+# 仅打包运行时代码；不含 .env / data / uploads / 前端构建缓存。
+RSYNC_EXCLUDES=(
+  --exclude '_archive_pre_baseline_2026_06_22/'
+  --exclude '.backups'
+  --exclude '.test_db_state.json'
+  --exclude '商标导出'
+  --exclude '监控/window_*.png'
+  --exclude '监控/window_*.jpg'
+  --exclude '监控/window_*.jpeg'
+  --exclude '.git'
+  --exclude '.venv'
+  --exclude '__pycache__'
+  --exclude '*/__pycache__'
+  --exclude '**/__pycache__'
+  --exclude '**/*.pyc'
+  --exclude 'node_modules'
+  --exclude 'frontend'
+  --exclude 'desktop'
+  --exclude 'mobile-flutter-poc'
+  --exclude 'tests'
+  --exclude 'data'
+  --exclude 'uploads'
+  --exclude 'dist'
+  --exclude '.coverage'
+  --exclude '.pytest_cache'
+  --exclude '.ruff_cache'
+  --exclude '.secrets'
+  --exclude '.env'
+  --exclude '.env.*'
+  --exclude '.install-receipts'
+  --exclude '.install-receipts/***'
+  --exclude '.fhd-release-managed.json'
+  --exclude 'routing_policies/routing_decisions.jsonl'
+  --exclude 'routing_policies/.online_update_state.json'
+)
+
+for item in app XCAGI alembic alembic.ini config mods xcagi_common resources requirements-base.txt requirements.txt pyproject.toml; do
+  src="$FHD_ROOT/$item"
+  if [[ -e "$src" ]]; then
+    rsync -a "${RSYNC_EXCLUDES[@]}" "$src" "$STAGING/"
+  fi
+done
+
+# The server runs the same audited LangGraph sources as CI and the frozen
+# desktop backend.  Do not rely on a PyPI install or an operator's site-packages
+# state: the release must carry all six maintained source trees plus their
+# external dependency lock surface.
+LANGGRAPH_PACKAGE_DIRS=(
+  xcagi_langgraph_core
+  xcagi_langgraph_checkpoint
+  xcagi_langgraph_checkpoint_backends/checkpoint-sqlite
+  xcagi_langgraph_checkpoint_backends/checkpoint-postgres
+  xcagi_langgraph_prebuilt
+  xcagi_langgraph_sdk
+)
+mkdir -p "$STAGING/packages"
+for package_dir in "${LANGGRAPH_PACKAGE_DIRS[@]}"; do
+  src="$FHD_ROOT/packages/$package_dir"
+  [[ -d "$src" ]] || {
+    echo "[err] missing vendored LangGraph package: $src" >&2
+    exit 1
+  }
+  mkdir -p "$STAGING/packages/$(dirname "$package_dir")"
+  rsync -a "${RSYNC_EXCLUDES[@]}" "$src" "$STAGING/packages/$(dirname "$package_dir")/"
+done
+cp "$FHD_ROOT/ops/deploy/requirements-langgraph-runtime.txt" \
+  "$STAGING/requirements-langgraph-runtime.txt"
+
+mkdir -p "$STAGING/templates/admin-vue-dist"
+rsync -a --delete "$ADMIN_DIST/" "$STAGING/templates/admin-vue-dist/"
+
+# 服务器端拉取式部署脚本（随制品一并下发，避免生产机 git pull）
+mkdir -p "$STAGING/scripts/deploy/lib" "$STAGING/docker"
+cp "$SCRIPT_DIR/fhd-auto-update.sh" \
+  "$SCRIPT_DIR/fhd-apply-release.sh" \
+  "$SCRIPT_DIR/fhd-apply-release-compose.sh" \
+  "$SCRIPT_DIR/fhd-load-release-image.sh" \
+  "$SCRIPT_DIR/fhd-install-online-update-cron.sh" \
+  "$SCRIPT_DIR/fhd-install-temp-cleanup-cron.sh" \
+  "$SCRIPT_DIR/fhd-clean-temp-files.sh" \
+  "$SCRIPT_DIR/online_update_daemon.py" \
+  "$SCRIPT_DIR/prune_release_cache.py" \
+  "$STAGING/scripts/deploy/"
+cp "$DR_RELEASE_SYNC" "$STAGING/scripts/deploy/xcmax-release-sync.sh"
+cp "$DR_RELEASE_SYNC_PRUNE" "$STAGING/scripts/deploy/xcmax_release_sync_prune.py"
+cp "$SCRIPT_DIR/lib/deploy_emit.sh" \
+  "$SCRIPT_DIR/lib/dora_event.sh" \
+  "$SCRIPT_DIR/lib/version.sh" \
+  "$SCRIPT_DIR/lib/autonomy_gate.sh" \
+  "$SCRIPT_DIR/lib/service_quiescence.sh" \
+  "$SCRIPT_DIR/lib/apply_recovery.sh" \
+  "$FHD_ROOT/scripts/deploy/lib/mod_tree_guard.py" \
+  "$SCRIPT_DIR/lib/verify_admin_console.py" \
+  "$SCRIPT_DIR/lib/verify_release_archive.py" \
+  "$SCRIPT_DIR/lib/verify_release_identity.sh" \
+  "$STAGING/scripts/deploy/lib/"
+cp "$FHD_ROOT/ops/docker/docker-compose.fhd-prod.yml" "$STAGING/docker/"
+
+# The scheduled CVM watcher must execute the exact autonomy code shipped by
+# this release.  Falling back to an unrelated server-side Git worktree makes a
+# successful production deploy continue running stale probes.  Bundle the
+# autonomy package and the two optional notification/approval clients it uses.
+mkdir -p "$STAGING/scripts/autonomy" "$STAGING/scripts/ci"
+rsync -a "${RSYNC_EXCLUDES[@]}" \
+  "$FHD_ROOT/scripts/autonomy/" "$STAGING/scripts/autonomy/"
+cp "$FHD_ROOT/scripts/ci/_approval_ledger_client.py" \
+  "$FHD_ROOT/scripts/ci/_im_notify_client.py" \
+  "$STAGING/scripts/ci/"
+
+BUILT_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+COMMIT_AT="$(git -C "$FHD_ROOT" show -s --format=%cI "$GIT_SHA")"
+python3 - <<'PY' "$STAGING/.build-identity.json" "$VERSION" "$GIT_SHA" "$BUILT_AT" "$COMMIT_AT" "$CHANNEL" "$ADMIN_CONSOLE_SHA256"
+import json, sys
+path, version, git_sha, built_at, commit_at, channel, admin_console_sha256 = sys.argv[1:8]
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(
+        {
+            "admin_console_sha256": admin_console_sha256,
+            "artifact_sha256": "",
+            "built_at": built_at,
+            "channel": channel,
+            "commit_at": commit_at,
+            "git_sha": git_sha,
+            "image_digest": "",
+            "product_version": version,
+            "release_id": f"xcagi-{version}-{git_sha}",
+            "version": version,
+        },
+        fh,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
+    fh.write("\n")
+PY
+
+TAR_XATTR_ARGS=()
+if tar --no-xattrs -cf /dev/null --files-from /dev/null >/dev/null 2>&1; then
+  TAR_XATTR_ARGS+=(--no-xattrs)
+fi
+COPYFILE_DISABLE=1 tar "${TAR_XATTR_ARGS[@]}" -C "$STAGING" -czf "$TARBALL" .
+python3 "$ARCHIVE_VERIFY" --archive "$TARBALL"
+SHA256="$(python3 - <<'PY' "$TARBALL"
+import hashlib, sys
+h = hashlib.sha256()
+with open(sys.argv[1], "rb") as f:
+    for chunk in iter(lambda: f.read(1024 * 1024), b""):
+        h.update(chunk)
+print(h.hexdigest())
+PY
+)"
+
+MANIFEST="$OUT_DIR/fhd-manifest.json"
+
+python3 - <<'PY' "$MANIFEST" "$VERSION" "$GIT_SHA" "$ARTIFACT" "$SHA256" "$BUILT_AT" "$COMMIT_AT" "$CHANNEL" "$ADMIN_CONSOLE_SHA256" "$ARCHIVE_VERIFY_SHA256"
+import json, sys
+path, version, git_sha, artifact, sha256, built_at, commit_at, channel, admin_console_sha256, archive_verify_sha256 = sys.argv[1:11]
+doc = {
+    "admin_console_sha256": admin_console_sha256,
+    "archive_verifier_sha256": archive_verify_sha256,
+    "product": "fhd-full",
+    "channel": channel,
+    "version": version,
+    "git_sha": git_sha,
+    "release_id": f"xcagi-{version}-{git_sha}",
+    "deploy_mode": "tarball",
+    "artifact": artifact,
+    "sha256": sha256,
+    "built_at": built_at,
+    "commit_at": commit_at,
+}
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(doc, fh, ensure_ascii=False, indent=2)
+    fh.write("\n")
+print(json.dumps(doc, ensure_ascii=False))
+PY
+
+deploy_emit pack ok "sha256=${SHA256:0:16}..."
+echo "[ok] tarball: $TARBALL"
+echo "[ok] manifest: $MANIFEST"

@@ -1,0 +1,103 @@
+import { describe, expect, it, vi, beforeEach } from 'vitest'
+
+const apiMock = vi.hoisted(() => ({
+  get: vi.fn(),
+  post: vi.fn(),
+  download: vi.fn(),
+}))
+
+vi.mock('./core', () => ({
+  api: apiMock,
+}))
+
+import agentRunsApi from './agentRuns'
+
+describe('agentRunsApi', () => {
+  it('downloads artifacts through the authenticated client with encoded identities', async () => {
+    await agentRunsApi.downloadArtifact('run/1', 'file/2')
+    expect(apiMock.download).toHaveBeenCalledWith('/api/agent/runs/run%2F1/artifacts/file%2F2')
+  })
+  beforeEach(() => {
+    apiMock.get.mockReset().mockResolvedValue({ success: true })
+    apiMock.post.mockReset().mockResolvedValue({ success: true })
+  })
+
+  it('creates an agent run', async () => {
+    await agentRunsApi.createRun({
+      message: '查产品',
+      runtime_context: { source: 'test' },
+    })
+
+    expect(apiMock.post).toHaveBeenCalledWith('/api/agent/runs', {
+      message: '查产品',
+      runtime_context: { source: 'test' },
+    })
+  })
+
+  it('records an observed low-risk tool run', async () => {
+    const payload = {
+      message: '查产品',
+      tool_id: 'products',
+      action: 'query',
+      params: { keyword: '5003' },
+      output: { success: true, data: [] },
+    }
+    await agentRunsApi.observeTool(payload)
+    expect(apiMock.post).toHaveBeenCalledWith('/api/agent/runs/observed-tool', payload)
+  })
+
+  it('continues an agent run', async () => {
+    await agentRunsApi.continueRun('run/1', {
+      approval_grant: 'signed-grant',
+      runtime_context: { source: 'test' },
+    })
+
+    expect(apiMock.post).toHaveBeenCalledWith('/api/agent/runs/run%2F1/continue', {
+      approval_grant: 'signed-grant',
+      runtime_context: { source: 'test' },
+    })
+  })
+
+  it('reads run detail, list, and events', async () => {
+    await agentRunsApi.getRun('run/1')
+    await agentRunsApi.listRuns({ limit: 10 })
+    await agentRunsApi.listEvents('run/1', { after_event_id: 'evt_1' })
+
+    expect(apiMock.get).toHaveBeenCalledWith('/api/agent/runs/run%2F1', {}, { timeoutMs: 30_000, quiet: true })
+    expect(apiMock.get).toHaveBeenCalledWith('/api/agent/runs', { limit: 10 }, { timeoutMs: 30_000, quiet: true })
+    expect(apiMock.get).toHaveBeenCalledWith('/api/agent/runs/run%2F1/events', {
+      after_event_id: 'evt_1',
+    }, { timeoutMs: 30_000, quiet: true })
+    expect(agentRunsApi.eventStreamPath('run/1', 'evt/1')).toBe('/api/agent/runs/run%2F1/events/stream?after_event_id=evt%2F1')
+  })
+
+  it('reads and archives durable tasks', async () => {
+    await agentRunsApi.listTasks({ limit: 25, include_archived: false })
+    await agentRunsApi.getTask('task-1')
+    await agentRunsApi.getTaskRuntime()
+    await agentRunsApi.archiveTask('task-1')
+
+    expect(apiMock.get).toHaveBeenCalledWith('/api/agent/tasks', {
+      limit: 25,
+      include_archived: false,
+    }, { timeoutMs: 30000, quiet: true })
+    expect(apiMock.get).toHaveBeenCalledWith('/api/agent/tasks/task-1')
+    expect(apiMock.get).toHaveBeenCalledWith('/api/agent/task-runtime')
+    expect(apiMock.post).toHaveBeenCalledWith('/api/agent/tasks/task-1/archive', {})
+    expect(agentRunsApi.taskEventStreamPath()).toBe('/api/agent/tasks/events/stream')
+  })
+
+  it('controls agent run lifecycle', async () => {
+    await agentRunsApi.pauseRun('run/1')
+    await agentRunsApi.resumeRun('run/1', { source: 'resume-test' })
+    await agentRunsApi.retryRun('run/1')
+    await agentRunsApi.cancelRun('run/1')
+
+    expect(apiMock.post).toHaveBeenCalledWith('/api/agent/runs/run%2F1/pause', {}, { timeoutMs: 15000 })
+    expect(apiMock.post).toHaveBeenCalledWith('/api/agent/runs/run%2F1/resume', {
+      runtime_context: { source: 'resume-test' },
+    }, { timeoutMs: 15000 })
+    expect(apiMock.post).toHaveBeenCalledWith('/api/agent/runs/run%2F1/retry', {}, { timeoutMs: 15000 })
+    expect(apiMock.post).toHaveBeenCalledWith('/api/agent/runs/run%2F1/cancel', {}, { timeoutMs: 15000 })
+  })
+})

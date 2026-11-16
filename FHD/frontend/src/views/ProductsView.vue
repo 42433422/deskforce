@@ -1,0 +1,406 @@
+<template>
+  <div class="page-view" id="view-products">
+    <div class="page-content">
+      <div class="page-header">
+        <h2>{{ pageNavTitle }}</h2>
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+          <button class="btn btn-secondary" @click="triggerImportExcel" :title="`上传 Excel 批量导入${entityName}`">
+            <i class="fa fa-upload" aria-hidden="true"></i> 导入Excel
+          </button>
+          <input
+            ref="importExcelInput"
+            type="file"
+            accept=".xlsx,.xls"
+            style="display:none"
+            @change="handleImport"
+          >
+          <button class="btn btn-primary" @click="exportPriceList" style="margin-right:6px;" title="导出当前单位价目表（Word .docx，使用下方所选 Word 模板）">
+            <i class="fa fa-file-text-o" aria-hidden="true"></i> 导出价格表
+          </button>
+          <button class="btn btn-secondary" @click="exportPriceListExcel" title="导出为 Excel（与旧版一致）">导出Excel</button>
+          <button v-if="selectedIds.length > 0" class="btn btn-danger" @click="batchDelete" style="margin-right:10px;">批量删除 ({{ selectedIds.length }})</button>
+          <button class="btn btn-primary" data-tutorial-id="product-create" @click="showAddModal">+ 添加{{ entityName }}</button>
+        </div>
+      </div>
+      <div class="search-box" style="display:flex;flex-wrap:wrap;align-items:center;gap:10px;">
+        <label style="white-space:nowrap;">{{ entityName }}单位：</label>
+        <select v-model="selectedUnit" style="min-width:180px;" @change="loadProducts">
+          <option value="">请选择{{ entityName }}单位</option>
+          <option v-for="u in units" :key="u" :value="u">{{ u }}</option>
+        </select>
+        <select v-model="selectedWordTemplateSlug" style="min-width:240px;" title="Word 价目表模板（在「模板预览」管理 .docx）">
+          <option value="">默认 Word 模板（price_list_default）</option>
+          <option v-for="tpl in wordTemplateOptions" :key="tpl.id" :value="tpl.id">{{ tpl.name }}</option>
+        </select>
+        <input v-model="searchQuery" type="text" :placeholder="`搜索${entityName}型号或名称...`" @input="loadProducts">
+      </div>
+      <div v-if="productReadError || (!fresh && products.length) || productListNotice" role="status" class="product-read-status">
+        <span>{{ productReadError ? '产品读取失败：' + productReadError : (!fresh ? '产品数据需要更新，请刷新后再编辑。' : productListNotice) }}</span>
+        <button type="button" class="btn btn-secondary" :disabled="loading" @click="refreshProducts">重新读取</button>
+      </div>
+      <div class="card">
+        <DataTable
+          :columns="columns"
+          :data="products"
+          :loading="loading"
+          :selectable="true"
+          :selected-ids="selectedIds"
+          :has-more="hasMore"
+          :height="'500px'"
+          row-key="id"
+          :highlight-id="focusId"
+          :empty-text="`暂无${entityName}数据`"
+          @update:selected-ids="selectedIds = $event"
+          @load-more="loadMoreProducts"
+        >
+          <template #cell-model_number="{ value }">
+            {{ value || '-' }}
+          </template>
+          <template #cell-name="{ value }">
+            {{ value || '-' }}
+          </template>
+          <template #cell-specification="{ value }">
+            {{ value || '-' }}
+          </template>
+          <template #cell-price="{ value }">
+            {{ value ? '¥' + value.toFixed(2) : '-' }}
+          </template>
+          <template #actions="{ row }">
+            <button type="button" class="btn btn-sm btn-secondary" :disabled="!canEditProducts" @click.stop="editProduct(row)">编辑</button>
+            <button type="button" class="btn btn-sm btn-danger" :disabled="!canEditProducts" @click.stop="handleDelete(row)">删除</button>
+          </template>
+        </DataTable>
+      </div>
+    </div>
+
+    <ConfirmDialog
+      v-model="showDeleteConfirm"
+      title="确认删除"
+      :message="`确定要删除该${entityName}吗？`"
+      confirm-text="删除"
+      confirm-class="btn-danger"
+      @confirm="confirmDelete"
+    />
+
+    <ConfirmDialog
+      v-model="showBatchDeleteConfirm"
+      title="批量删除"
+      :message="`确定要删除选中的 ${selectedIds.length} 个${entityName}吗？`"
+      confirm-text="批量删除"
+      confirm-class="btn-danger"
+      @confirm="confirmBatchDelete"
+    />
+
+    <div v-if="showModal" class="modal active">
+      <div class="modal-content">
+        <div class="modal-header">{{ isEdit ? '编辑' + entityName : '添加' + entityName }}</div>
+        <div class="modal-body">
+          <div v-if="!isEdit" class="form-group">
+            <label>所属客户 *</label>
+            <select v-model="formData.unit">
+              <option value="">请选择客户</option>
+              <option v-for="u in units" :key="u" :value="u">{{ u }}</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>{{ fieldLabel('model_number', '产品型号') }} *</label>
+            <input v-model="formData.model_number" data-tutorial-id="product-model" type="text" placeholder="如：A001">
+          </div>
+          <div class="form-group">
+            <label>{{ fieldLabel('name', '产品名称') }} *</label>
+            <input v-model="formData.name" data-tutorial-id="product-name" type="text" :placeholder="`${entityName}名称`">
+          </div>
+          <div class="form-group">
+            <label>{{ fieldLabel('specification', '规格') }}</label>
+            <select v-if="specOptions.length" v-model="formData.specification">
+              <option value="">请选择{{ fieldLabel('specification', '规格') }}</option>
+              <option v-for="opt in specOptions" :key="opt" :value="opt">{{ opt }}</option>
+            </select>
+            <input v-else v-model="formData.specification" type="text" placeholder="规格描述">
+          </div>
+          <div class="form-group">
+            <label>{{ fieldLabel('price', '价格') }}</label>
+            <input v-model.number="formData.price" data-tutorial-id="product-price" type="number" step="0.01" placeholder="0.00">
+          </div>
+          <div v-if="!isEdit" class="form-group"><label>初始库存</label><input v-model.number="formData.quantity" data-tutorial-id="product-inventory" type="number" min="0" step="1" placeholder="0"></div>
+          <div class="form-group" v-for="f in extraFields" :key="f.key">
+            <label>{{ f.label }}</label>
+            <input
+              v-model="formData[f.key]"
+              :type="f.type === 'date' ? 'date' : (f.type === 'number' ? 'number' : 'text')"
+              :placeholder="f.label"
+            >
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" @click="showModal = false">取消</button>
+          <button class="btn btn-primary" data-tutorial-id="product-save" :disabled="loading || (isEdit && !canEditProducts)" @click="saveProduct">保存</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
+
+<script setup>
+import { ref, computed, onMounted, watch } from 'vue';
+import { useRecordFocusQuery } from '@/composables/useRecordFocusQuery';
+import { useProductsStore } from '@/stores/products';
+import { useProductsReadLifecycle, createProductListLoader, createProductUnitsLoader } from '@/composables/useProductsReadLifecycle';
+import { storeToRefs } from 'pinia';
+import { api } from '@/api/index';
+import DataTable from '@/components/DataTable.vue';
+import ConfirmDialog from '@/components/ConfirmDialog.vue';
+import { appAlert } from '@/utils/appDialog';
+import { useCoreNavLabel } from '@/composables/useCoreNavLabel';
+import { useIndustryFieldSchema } from '@/composables/useIndustryFieldSchema';
+import { useProductsPriceListExport } from '@/composables/useProductsPriceListExport';
+const pageNavTitle = useCoreNavLabel('products');
+// 行业感知：products 子系统的实体名与字段表头随行业变（产品/人员、型号/工号、规格/班次、单价/时薪）
+const productsSchema = useIndustryFieldSchema('products');
+const entityName = computed(() => productsSchema.entity.value || '产品');
+function fieldLabel(key, fallback) {
+  return productsSchema.labelOf(key, fallback);
+}
+// 行业新增字段（批号/保质期等）动态渲染：schema 里超出核心 4 字段(型号/名称/规格/单价)的字段，
+// 在表单尾部按类型自动生成输入；核心字段仍为固定输入，保证稳定。
+const CORE_PRODUCT_KEYS = ['model_number', 'name', 'specification', 'price', 'quantity', 'unit'];
+const extraFields = computed(() =>
+  productsSchema.fields.value.filter((f) => !CORE_PRODUCT_KEYS.includes(f.key)),
+);
+// 「规格」字段若声明了 oneOf（如考勤「班次」=早/中/晚），表单渲染为下拉而非自由文本。
+const specOptions = computed(() => {
+  const sf = productsSchema.fields.value.find((f) => f.key === 'specification');
+  const rule = (sf?.validators || []).find((v) => String(v.type) === 'oneOf');
+  return Array.isArray(rule?.params) ? rule.params.map((x) => String(x)) : [];
+});
+
+const store = useProductsStore();
+const { products, loading, error: productReadError, fresh, canEditProducts } = storeToRefs(store);
+const productListNotice = ref('');
+const units = ref([]);
+const showModal = ref(false);
+const isEdit = ref(false);
+const selectedIds = ref([]);
+const selectAll = ref(false);
+const searchQuery = ref('');
+const { keyword: routeKeyword, focusId } = useRecordFocusQuery();
+searchQuery.value = routeKeyword.value;
+const selectedUnit = ref('');
+const currentPage = ref(1);
+const perPage = ref(1000);
+const hasMore = ref(false);
+// 价目表导出与 Word 模板选择逻辑抽至 composable，此处解构保留同名顶层绑定（测试兼容面）
+const {
+  selectedWordTemplateSlug,
+  wordTemplateOptions,
+  docxSlugFromListTemplate,
+  loadWordTemplateOptions,
+  exportPriceList,
+  exportPriceListExcel,
+} = useProductsPriceListExport({ selectedUnit, searchQuery });
+const formData = ref({
+  id: null,
+  model_number: '',
+  name: '',
+  specification: '',
+  price: 0,
+  quantity: 0
+});
+const showDeleteConfirm = ref(false);
+const showBatchDeleteConfirm = ref(false);
+const itemToDelete = ref(null);
+const importExcelInput = ref(null);
+const columns = computed(() => [
+  { key: 'model_number', label: fieldLabel('model_number', '型号') },
+  { key: 'name', label: fieldLabel('name', '名称') },
+  { key: 'specification', label: fieldLabel('specification', '规格') },
+  { key: 'price', label: fieldLabel('price', '价格') },
+  { key: 'quantity', label: '库存' }
+]);
+
+const currentRequestId = ref(0);
+
+const loadProducts = createProductListLoader({
+  store, page: currentPage, hasMore, requestId: currentRequestId,
+  query: () => ({ per_page: perPage.value, ...(searchQuery.value ? { keyword: searchQuery.value } : {}), ...(selectedUnit.value ? { unit: selectedUnit.value } : {}) }),
+});
+
+let isLoadingMore = false;
+
+const loadMoreProducts = async () => {
+  if (loading.value || !hasMore.value || isLoadingMore) return;
+  isLoadingMore = true;
+  try {
+    await loadProducts(false);
+  } finally {
+    isLoadingMore = false;
+  }
+};
+
+const loadUnits = createProductUnitsLoader(store, units);
+
+const showAddModal = () => {
+  void loadUnits();
+  isEdit.value = false;
+  formData.value = {
+    id: null,
+    model_number: '',
+    name: '',
+    unit: selectedUnit.value,
+    specification: '',
+    price: 0,
+    quantity: 0
+  };
+  showModal.value = true;
+};
+
+const editProduct = (product) => {
+  if (!canEditProducts.value) return;
+  productListNotice.value = '';
+  isEdit.value = true;
+  formData.value = { ...product };
+  showModal.value = true;
+};
+
+const saveProduct = async () => {
+  if (isEdit.value && !canEditProducts.value) return;
+  if (!isEdit.value && !formData.value.unit) { await appAlert('请先选择所属客户'); return; }
+  formData.value.price = formData.value.price || 0;
+  const fieldErrors = productsSchema.validate(formData.value);
+  if (fieldErrors.length > 0) {
+    await appAlert(fieldErrors[0].message);
+    return;
+  }
+
+  const result = isEdit.value && formData.value.id
+    ? await store.updateProduct(formData.value.id, formData.value)
+    : await store.createProduct({ ...formData.value });
+
+  if (result.success) {
+    showModal.value = false;
+    loadProducts();
+  } else {
+    await appAlert('保存失败: ' + (result.message || '未知错误'));
+  }
+};
+
+const handleDelete = (product) => {
+  if (!canEditProducts.value) return;
+  itemToDelete.value = product;
+  showDeleteConfirm.value = true;
+};
+
+const confirmDelete = async () => {
+  if (!itemToDelete.value || !canEditProducts.value) return;
+  const result = await store.deleteProduct(itemToDelete.value.id);
+  if (!result.success) {
+    await appAlert('删除失败: ' + (result.message || '未知错误'));
+  }
+  itemToDelete.value = null;
+};
+
+const batchDelete = () => {
+  if (!canEditProducts.value) return;
+  showBatchDeleteConfirm.value = true;
+};
+
+const confirmBatchDelete = async () => {
+  if (!canEditProducts.value) return;
+  const result = await store.batchDelete(selectedIds.value);
+  if (result.success) {
+    selectedIds.value = [];
+    selectAll.value = false;
+    loadProducts();
+  } else {
+    await appAlert('批量删除失败: ' + (result.message || '未知错误'));
+  }
+};
+
+const triggerImportExcel = () => {
+  importExcelInput.value?.click();
+};
+
+const handleImport = async (e) => {
+  const file = e.target.files?.[0];
+  if (!file) return;
+
+  try {
+    // 1. 上传并提取Excel数据 (使用 extract/upload 端点)
+    const formData = new FormData();
+    formData.append('excel_file', file);
+    const extractRes = await api.post('/api/excel/data/extract/upload', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' }
+    });
+
+    if (!extractRes.success) {
+      await appAlert('文件解析失败: ' + (extractRes.message || '未知错误'));
+      return;
+    }
+    const rows = extractRes.rows || [];
+    if (!rows.length) {
+      await appAlert('未解析到任何数据行，请检查产品表头及内容。');
+      return;
+    }
+
+    // 2. 调用产品导入API
+    const importRes = await api.post('/api/excel/data/import/products', {
+      file_name: file.name,
+      data: rows,
+      field_mapping: extractRes.headers?.reduce((map, h) => {
+        map[h.value] = h.value;
+        return map;
+      }, {}),
+      options: {
+        skip_duplicates: true,
+        validate_before_import: true,
+        clean_data: true,
+      }
+    });
+
+    if (importRes.success) {
+      const imported = importRes.imported || 0;
+      const skipped = importRes.skipped || 0;
+      let msg = `导入成功！共导入 ${imported} 条产品`;
+      if (skipped > 0) {
+        msg += `，跳过 ${skipped} 条重复产品`;
+      }
+      await appAlert(msg);
+      await loadProducts();
+    } else {
+      await appAlert('导入失败: ' + (importRes.message || '未知错误'));
+    }
+  } catch (err) {
+    console.error('导入失败:', err);
+    await appAlert('导入失败: ' + (err.message || '未知错误'));
+  } finally {
+    e.target.value = '';
+  }
+};
+
+watch(routeKeyword, (value) => {
+  if (searchQuery.value === value) return;
+  searchQuery.value = value;
+  loadProducts();
+});
+
+const { refreshProducts } = useProductsReadLifecycle({
+  store, loadProducts, loadUnits,
+  resetScope: () => {
+    currentRequestId.value++;
+    selectedIds.value = []; selectedUnit.value = ''; searchQuery.value = routeKeyword.value; units.value = [];
+    showModal.value = false; showDeleteConfirm.value = false; showBatchDeleteConfirm.value = false;
+    itemToDelete.value = null; productListNotice.value = '';
+    formData.value = { id: null, model_number: '', name: '', specification: '', price: 0 };
+  },
+  invalidateEditing: () => {
+    selectedIds.value = []; showDeleteConfirm.value = false; showBatchDeleteConfirm.value = false;
+    if (showModal.value && isEdit.value && !store.mutating) {
+      showModal.value = false;
+      productListNotice.value = '产品数据需要重新确认，请重新选择产品后编辑。';
+    }
+  },
+});
+onMounted(loadWordTemplateOptions);
+</script>
+
+<style scoped src="./ProductsView.css"></style>

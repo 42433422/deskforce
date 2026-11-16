@@ -1,0 +1,20 @@
+# CI SSOT: edit this file, then run: python scripts/dev/publish_ci_workflows_to_root.py
+name: Publish macOS update feed from local upload (disabled)
+
+# This legacy lane trusted operator-supplied hashes for a ZIP that CI never
+# inspected. It is retained only as an explicit fail-closed tombstone so old
+# runbooks cannot silently bypass the exact-SHA release orchestrator.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  blocked:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reject unverifiable local artifact publication
+        run: |
+          echo "::error::Local-upload macOS feed publication is disabled. Use Release Orchestrator with an exact release_sha and two consecutive zero-finding security scan runs."
+          exit 1

@@ -1,0 +1,174 @@
+# macOS OTA: Build-only native candidates; frozen pairs are promoted by Fix macOS update feed.
+name: Release Desktop macOS OTA
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version"
+        required: true
+        default: "1.0.0.7"
+        type: choice
+        options: ["1.0.0.7", "1.0.0.6", "1.0.0.5", "1.0.0.4", "1.0.0.3", "1.0.0.2", "1.0.0.1", "1.0.0.0"]
+      candidate_only:
+        description: "Build and notarize an acceptance artifact without publishing"
+        required: false
+        default: true
+        type: boolean
+      release_sha:
+        description: "Immutable 40-character source SHA"
+        required: true
+        type: string
+      architecture: {description: "Native candidate architecture", required: false, default: arm64, type: choice, options: [arm64, x64]}
+
+permissions:
+  contents: write
+  actions: read
+
+defaults:
+  run:
+    working-directory: FHD
+
+env:
+  XCAGI_BUILD_SHA: ${{ inputs.release_sha }}
+
+jobs:
+  macos-ota:
+    runs-on: ${{ inputs.architecture == 'x64' && 'macos-15-intel' || 'macos-latest' }}
+    env:
+      APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+      APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+      APP_STORE_CONNECT_API_PRIVATE_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_PRIVATE_KEY_BASE64 }}
+      IOS_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID || secrets.IOS_TEAM_ID }}
+      XCAGI_UPDATE_ED25519_PRIVATE_KEY: ${{ secrets.XCAGI_UPDATE_ED25519_PRIVATE_KEY }}
+      CSC_LINK: ${{ secrets.CSC_LINK }}
+      CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha }}
+
+      - name: Lock checkout and acceptance candidate to main
+        run: |
+          test "$(git rev-parse HEAD)" = "${XCAGI_BUILD_SHA}"
+          test "$(uname -m | sed 's/^x86_64$/x64/')" = "${{ inputs.architecture || 'arm64' }}"
+          test "${{ inputs.candidate_only }}" = true || { echo '::error::Build-only lane. Promote the frozen arm64/x64 pair with Fix macOS update feed.'; exit 1; }
+          test "${GITHUB_REF}" = refs/heads/main
+          test "${GITHUB_SHA}" = "${XCAGI_BUILD_SHA}"
+          . scripts/deploy/lib/version.sh; test "$(product_version)" = "${{ inputs.version }}"
+
+      - name: Preflight macOS OTA secrets
+        working-directory: .
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in \
+            APP_STORE_CONNECT_API_KEY_ID APP_STORE_CONNECT_API_ISSUER_ID \
+            APP_STORE_CONNECT_API_PRIVATE_KEY_BASE64 \
+            CSC_LINK CSC_KEY_PASSWORD XCAGI_UPDATE_ED25519_PRIVATE_KEY
+          do
+            if [ -z "${!name:-}" ]; then missing+=("$name"); fi
+          done
+          if [ -z "${APPLE_TEAM_ID:-}" ] && [ -z "${IOS_TEAM_ID:-}" ]; then
+            missing+=("APPLE_TEAM_ID|IOS_TEAM_ID")
+          fi
+          if [ "${#missing[@]}" -gt 0 ]; then
+            printf '::error::macOS OTA preflight missing: %s\n' "${missing[*]}"
+            exit 1
+          fi
+          echo "macOS OTA preflight passed."
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: |
+            FHD/frontend/package-lock.json
+            FHD/desktop/package-lock.json
+
+      - name: Import Developer ID certificate (CSC_LINK p12)
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x scripts/package/import_mac_developer_id_p12.sh
+          scripts/package/import_mac_developer_id_p12.sh
+
+      - name: Build macOS enterprise installer
+        shell: bash
+        env:
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CSC_NAME:-}" ]; then
+            CSC_NAME="$(security find-identity -v -p codesigning | grep 'Developer ID Application' | head -1 | sed -n 's/.*"\(.*\)"/\1/p' || true)"
+          fi
+          CSC_NAME="${CSC_NAME#Developer ID Application: }"
+          CSC_NAME="${CSC_NAME#Developer ID Application:}"
+          if [ -z "${CSC_NAME}" ]; then
+            echo "::error::Developer ID Application certificate missing after CSC_LINK import"
+            security find-identity -v -p codesigning || true
+            exit 1
+          fi
+          export CSC_NAME
+          v="${{ github.event.inputs.version }}"
+          PYTHON=python3 scripts/package/build-installer.sh "$v" enterprise
+
+      - name: Notarize and staple macOS enterprise DMG
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="${{ github.event.inputs.version }}"
+          arch="${{ inputs.architecture || 'arm64' }}"
+          toolchain_version="$(printf '%s' "${v}" | cut -d. -f1-3)"
+          dmg="$(find "release/xcagi-v${v}/enterprise" -name "XCAGI-Enterprise-${v}-mac-${arch}.dmg" -print -quit)"
+          test -n "${dmg}"
+          chmod +x scripts/package/finalize-macos-dmg.sh
+          scripts/package/finalize-macos-dmg.sh "${dmg}" "${v}" "${toolchain_version}"
+
+      - name: Verify packaged identity and ZIP feed
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="${{ github.event.inputs.version }}"
+          arch="${{ inputs.architecture || 'arm64' }}"
+          src="release/xcagi-v${v}/enterprise"
+          test -f "${src}/latest-mac.yml"
+          test -f "${src}/XCAGI-Enterprise-${v}-mac-${arch}.zip"
+          grep -Fxq "buildSha: ${XCAGI_BUILD_SHA}" "${src}/latest-mac.yml"
+          grep -Eq "^releaseDate: ['\"]?[0-9]{4}-[0-9]{2}-[0-9]{2}T" "${src}/latest-mac.yml"
+          grep -Eq '^signature: ed25519:[A-Za-z0-9+/=]+$' "${src}/latest-mac.yml"
+
+      - name: Install startup video recorder
+        working-directory: FHD/desktop
+        run: npx playwright install ffmpeg
+
+      - name: Verify notarized DMG and packaged runtime
+        run: |
+          read -r v arch <<<"${{ inputs.version }} ${{ inputs.architecture || 'arm64' }}"; dmg="$(find "release/xcagi-v${v}/enterprise" -name "XCAGI-Enterprise-${v}-mac-${arch}.dmg" -print -quit)"
+          bash scripts/package/verify-macos-release-dmg.sh "${dmg}" "${v}" "${XCAGI_BUILD_SHA}"
+          if [ "${{ inputs.candidate_only }}" = true ]; then evidence_dir="release/xcagi-v${v}/enterprise/acceptance-evidence"; mkdir -p "${evidence_dir}"; XCAGI_ACCEPTANCE_SYSTEM_INTEGRATION=1 XCAGI_ACCEPTANCE_EVIDENCE_DIR="${evidence_dir}" bash scripts/package/acceptance-macos.sh --version "${v}" --dmg "${dmg}"; fi
+
+      - name: Upload macOS OTA artifacts for recovery
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ format('mac-acceptance-{0}-{1}', inputs.release_sha, inputs.architecture || 'arm64') }}
+          path: FHD/release/xcagi-v${{ github.event.inputs.version }}/enterprise
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Preserve failed staple candidate for diagnosis only
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ format('mac-staple-recovery-{0}-{1}', inputs.release_sha, inputs.architecture || 'arm64') }}
+          path: |
+            FHD/release-staple-recovery/${{ inputs.release_sha }}-${{ inputs.architecture || 'arm64' }}/XCAGI-Enterprise-${{ inputs.version }}-mac-${{ inputs.architecture || 'arm64' }}.dmg
+            FHD/release-staple-recovery/${{ inputs.release_sha }}-${{ inputs.architecture || 'arm64' }}/recovery-receipt.json
+          if-no-files-found: error
+          retention-days: 30

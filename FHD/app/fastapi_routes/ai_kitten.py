@@ -1,0 +1,476 @@
+"""Kitten 分析/图表/报告路由。
+
+Phase 2B 从 :mod:`app.fastapi_routes.archive_gap_batch1/2` 拆分而出,
+URL 保持不变:
+
+- ``GET /api/ai/kitten/business-snapshot``
+- ``GET /api/ai/kitten/financial/dashboard``
+- ``GET /api/ai/kitten/charts/{all,revenue,products,customers,profit,inventory}``
+- ``GET /api/ai/kitten/saved/list`` / ``GET /api/ai/kitten/saved/{id}`` /
+  ``GET /api/ai/kitten/saved/{id}/export`` / ``DELETE /api/ai/kitten/saved/{id}``
+- ``POST /api/ai/kitten/financial/report`` / ``POST /api/ai/kitten/report/export`` /
+  ``POST /api/ai/kitten/report/export-docx``
+- ``POST /api/ai/kitten/document/generate`` / ``GET /api/ai/kitten/document/pickup/{token}``
+
+归属理由: 小猫分析(Kitten) 是一个完整的业务域,前端 ``frontend/src/api/kitten.ts``、
+``views/AIEcosystemView.vue`` 成组使用。
+"""
+
+from __future__ import annotations
+
+import logging
+from io import BytesIO
+from typing import Any, Literal, cast
+from urllib.parse import quote
+
+from fastapi import APIRouter, Body, Query
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+
+from app.utils.operational_errors import RECOVERABLE_ERRORS
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(tags=["ai-kitten"])
+
+_KITTEN_UNAVAILABLE = "小猫分析服务暂时不可用，请稍后重试"
+_DOCUMENT_UNAVAILABLE = "文档生成服务暂时不可用，请稍后重试"
+
+
+def _trace_kitten_route(
+    payload: dict[str, Any],
+    *,
+    route: str,
+    message: str,
+    body: dict[str, Any] | None = None,
+    intent: str = "kitten_analysis",
+) -> dict[str, Any]:
+    from app.application.agent_orchestrator.chat_trace import attach_chat_trace_run
+
+    request_body = body if isinstance(body, dict) else {}
+    metadata = (
+        request_body.get("metadata") if isinstance(request_body.get("metadata"), dict) else {}
+    )
+    if not isinstance(metadata, dict):
+        metadata = {}
+    tenant_id = str(
+        request_body.get("tenant_id")
+        or request_body.get("tenantId")
+        or metadata.get("tenant_id")
+        or ""
+    ).strip()
+    user_id = str(
+        request_body.get("user_id")
+        or request_body.get("userId")
+        or metadata.get("user_id")
+        or tenant_id
+        or "ai-kitten-route"
+    ).strip()
+    return attach_chat_trace_run(
+        payload,
+        message=message,
+        runtime_context={
+            "route": route,
+            "source": "ai_kitten_route",
+            "tenant_id": tenant_id,
+            "dataset_id": str(
+                request_body.get("dataset_id")
+                or request_body.get("rag_dataset_id")
+                or metadata.get("dataset_id")
+                or ""
+            ).strip(),
+        },
+        user_id=user_id,
+        source="ai_kitten_route",
+        channel="ai_kitten_route",
+        intent=intent,
+    )
+
+
+def _agent_run_headers(payload: dict[str, Any], headers: dict[str, str]) -> dict[str, str]:
+    run_id = str(payload.get("run_id") or payload.get("agent_run_id") or "").strip()
+    if run_id:
+        headers["X-Agent-Run-Id"] = run_id
+    return headers
+
+
+@router.get("/api/ai/kitten/business-snapshot")
+def kitten_business_snapshot():
+    try:
+        from app.application.facades.kitten_facade import build_kitten_business_snapshot
+
+        snap = build_kitten_business_snapshot()
+        return {"success": True, "data": snap}
+    except RECOVERABLE_ERRORS:
+        logger.exception("kitten business-snapshot failed")
+        return JSONResponse({"success": False, "message": _KITTEN_UNAVAILABLE}, status_code=500)
+
+
+@router.get("/api/ai/kitten/financial/dashboard")
+def kitten_financial_dashboard(months: int = Query(default=6, ge=1, le=24)):
+    """经营/财报可视化看板：从业务库实时聚合 KPI、图表序列与明细表。"""
+    try:
+        from app.application.facades.kitten_facade import chart_service
+
+        return {"success": True, "data": chart_service.get_financial_dashboard(months)}
+    except RECOVERABLE_ERRORS:
+        logger.exception("kitten financial dashboard failed")
+        return JSONResponse({"success": False, "message": _KITTEN_UNAVAILABLE}, status_code=500)
+
+
+@router.get("/api/ai/kitten/charts/all")
+def kitten_charts_all():
+    try:
+        from app.application.facades.kitten_facade import chart_service
+
+        return {"success": True, "data": chart_service.get_all_charts_data()}
+    except RECOVERABLE_ERRORS:
+        logger.exception("kitten charts all failed")
+        return JSONResponse({"success": False, "message": _KITTEN_UNAVAILABLE}, status_code=500)
+
+
+@router.get("/api/ai/kitten/charts/revenue")
+def kitten_charts_revenue(months: int = Query(default=6)):
+    try:
+        from app.application.facades.kitten_facade import chart_service
+
+        return chart_service.get_revenue_chart_data(months)
+    except RECOVERABLE_ERRORS:
+        logger.exception("kitten revenue failed")
+        return {"success": False, "error": _KITTEN_UNAVAILABLE}
+
+
+@router.get("/api/ai/kitten/charts/products")
+def kitten_charts_products():
+    try:
+        from app.application.facades.kitten_facade import chart_service
+
+        return chart_service.get_product_pie_chart_data()
+    except RECOVERABLE_ERRORS:
+        logger.exception("kitten products failed")
+        return {"success": False, "error": _KITTEN_UNAVAILABLE}
+
+
+@router.get("/api/ai/kitten/charts/customers")
+def kitten_charts_customers():
+    try:
+        from app.application.facades.kitten_facade import chart_service
+
+        return chart_service.get_customer_bar_chart_data()
+    except RECOVERABLE_ERRORS:
+        logger.exception("kitten customers failed")
+        return {"success": False, "error": _KITTEN_UNAVAILABLE}
+
+
+@router.get("/api/ai/kitten/charts/profit")
+def kitten_charts_profit(months: int = Query(default=6)):
+    try:
+        from app.application.facades.kitten_facade import chart_service
+
+        return chart_service.get_profit_trend_chart_data(months)
+    except RECOVERABLE_ERRORS:
+        logger.exception("kitten profit failed")
+        return {"success": False, "error": _KITTEN_UNAVAILABLE}
+
+
+@router.get("/api/ai/kitten/charts/inventory")
+def kitten_charts_inventory():
+    try:
+        from app.application.facades.kitten_facade import chart_service
+
+        return chart_service.get_inventory_chart_data()
+    except RECOVERABLE_ERRORS:
+        logger.exception("kitten inventory chart failed")
+        return {"success": False, "error": _KITTEN_UNAVAILABLE}
+
+
+@router.get("/api/ai/kitten/saved/list")
+def kitten_saved_list(type: str | None = Query(default=None)):
+    try:
+        from app.application.facades.kitten_facade import analysis_save_service
+
+        analyses = analysis_save_service.list_saved_analyses(type)
+        stats = analysis_save_service.get_statistics_summary()
+        return {"success": True, "analyses": analyses, "statistics": stats}
+    except RECOVERABLE_ERRORS:
+        logger.exception("kitten saved list failed")
+        return JSONResponse({"success": False, "message": _KITTEN_UNAVAILABLE}, status_code=500)
+
+
+@router.get("/api/ai/kitten/saved/{analysis_id}")
+def kitten_saved_get(analysis_id: str):
+    try:
+        from app.application.facades.kitten_facade import analysis_save_service
+
+        analysis = analysis_save_service.get_analysis(analysis_id)
+        if not analysis:
+            return JSONResponse({"success": False, "message": "未找到该分析记录"}, status_code=404)
+        return {"success": True, "data": analysis}
+    except RECOVERABLE_ERRORS:
+        logger.exception("kitten saved get failed")
+        return JSONResponse({"success": False, "message": _KITTEN_UNAVAILABLE}, status_code=500)
+
+
+@router.get("/api/ai/kitten/saved/{analysis_id}/export")
+def kitten_saved_export(analysis_id: str):
+    try:
+        from app.application.facades.kitten_facade import analysis_save_service
+
+        result = analysis_save_service.export_analysis_to_xlsx(analysis_id)
+        if not result.get("success"):
+            return JSONResponse(result, status_code=400)
+        file_name = str(result.get("file_name") or "财务报告.xlsx")
+        content = result.get("content") or b""
+        return Response(
+            content=content,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{file_name}"'},
+        )
+    except RECOVERABLE_ERRORS:
+        logger.exception("kitten saved export failed")
+        return JSONResponse({"success": False, "message": _KITTEN_UNAVAILABLE}, status_code=500)
+
+
+@router.delete("/api/ai/kitten/saved/{analysis_id}")
+def kitten_saved_delete(analysis_id: str):
+    try:
+        from app.application.facades.kitten_facade import analysis_save_service
+
+        result = analysis_save_service.delete_analysis(analysis_id)
+        if isinstance(result, bool):
+            if result:
+                return {"success": True, "message": "删除成功"}
+            return JSONResponse(
+                {"success": False, "message": "Analysis not found"}, status_code=400
+            )
+        if result.get("success"):
+            return {"success": True, "message": "删除成功"}
+        return JSONResponse(result, status_code=400)
+    except RECOVERABLE_ERRORS:
+        logger.exception("kitten saved delete failed")
+        return JSONResponse({"success": False, "message": _KITTEN_UNAVAILABLE}, status_code=500)
+
+
+@router.post("/api/ai/kitten/financial/report")
+def ai_kitten_financial_report(body: dict = Body(default_factory=dict)):
+    try:
+        payload = body or {}
+        metadata = payload.get("metadata") or {}
+        from app.application.facades.kitten_facade import (
+            FinancialReportPlugin,
+            InventoryValuationPlugin,
+            analysis_save_service,
+        )
+
+        fin_result = FinancialReportPlugin().run(payload)
+        inv_result = InventoryValuationPlugin().run(payload)
+        analysis_data = {
+            "financial_report": {
+                "key": fin_result.key,
+                "title": fin_result.title,
+                "level": fin_result.level,
+                "summary": fin_result.summary,
+                "details": fin_result.details,
+            },
+            "inventory_valuation": {
+                "key": inv_result.key,
+                "title": inv_result.title,
+                "level": inv_result.level,
+                "summary": inv_result.summary,
+                "details": inv_result.details,
+            },
+        }
+        save_result = analysis_save_service.save_analysis(
+            analysis_type="financial",
+            data=analysis_data,
+            metadata=metadata,
+        )
+        if save_result.get("success"):
+            return _trace_kitten_route(
+                {
+                    "success": True,
+                    "response": "财务报告已生成并保存",
+                    "analysis_id": save_result.get("id"),
+                    "data": analysis_data,
+                    "saved_to": save_result.get("filename"),
+                    "message": "财务报告已生成并保存",
+                },
+                route="/api/ai/kitten/financial/report",
+                message="生成小猫财务报告",
+                body=payload,
+                intent="kitten_financial_report",
+            )
+        return _trace_kitten_route(
+            {
+                "success": True,
+                "response": "财务报告已生成（保存失败）",
+                "data": analysis_data,
+                "message": "财务报告已生成（保存失败）",
+            },
+            route="/api/ai/kitten/financial/report",
+            message="生成小猫财务报告",
+            body=payload,
+            intent="kitten_financial_report",
+        )
+    except RECOVERABLE_ERRORS:
+        logger.exception("kitten financial report failed")
+        return JSONResponse({"success": False, "message": _KITTEN_UNAVAILABLE}, status_code=500)
+
+
+@router.post("/api/ai/kitten/report/export")
+def ai_kitten_report_export(body: dict = Body(default_factory=dict)):
+    try:
+        from app.application.facades.kitten_facade import KittenReportExportService
+
+        service = KittenReportExportService()
+        report = service.build_report(body or {})
+        file_name = str(report.get("file_name") or "小猫分析报告.xlsx")
+        content = report.get("content") or b""
+        trace_payload = _trace_kitten_route(
+            {
+                "success": True,
+                "response": "小猫分析 Excel 报告已导出",
+                "data": {
+                    "text": "小猫分析 Excel 报告已导出",
+                    "document": {
+                        "file_name": file_name,
+                        "download_url": "/api/ai/kitten/report/export",
+                        "mime_type": (
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        ),
+                        "summary": "小猫分析 Excel 报告",
+                    },
+                },
+            },
+            route="/api/ai/kitten/report/export",
+            message="导出小猫分析 Excel 报告",
+            body=body or {},
+            intent="kitten_report_export",
+        )
+        return StreamingResponse(
+            BytesIO(content),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers=_agent_run_headers(
+                trace_payload,
+                {"Content-Disposition": f'attachment; filename="{file_name}"'},
+            ),
+        )
+    except RECOVERABLE_ERRORS:
+        logger.exception("kitten report export failed")
+        return JSONResponse({"success": False, "message": _KITTEN_UNAVAILABLE}, status_code=500)
+
+
+@router.post("/api/ai/kitten/report/export-docx")
+def ai_kitten_report_export_docx(body: dict = Body(default_factory=dict)):
+    try:
+        from app.application.facades.kitten_facade import build_kitten_docx
+
+        report = build_kitten_docx(body or {})
+        file_name = str(report.get("file_name") or "小猫分析报告.docx")
+        content = report.get("content") or b""
+        trace_payload = _trace_kitten_route(
+            {
+                "success": True,
+                "response": "小猫分析 Word 报告已导出",
+                "data": {
+                    "text": "小猫分析 Word 报告已导出",
+                    "document": {
+                        "file_name": file_name,
+                        "download_url": "/api/ai/kitten/report/export-docx",
+                        "mime_type": (
+                            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                        ),
+                        "summary": "小猫分析 Word 报告",
+                    },
+                },
+            },
+            route="/api/ai/kitten/report/export-docx",
+            message="导出小猫分析 Word 报告",
+            body=body or {},
+            intent="kitten_report_export_docx",
+        )
+        return StreamingResponse(
+            BytesIO(content),
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers=_agent_run_headers(
+                trace_payload,
+                {"Content-Disposition": f'attachment; filename="{file_name}"'},
+            ),
+        )
+    except RECOVERABLE_ERRORS:
+        logger.exception("kitten docx export failed")
+        return JSONResponse({"success": False, "message": _KITTEN_UNAVAILABLE}, status_code=500)
+
+
+@router.post("/api/ai/kitten/document/generate")
+def kitten_document_generate(body: dict = Body(default_factory=dict)):
+    """根据自然语言描述由 LLM 起草结构并生成 Word 或 Excel 文件（直接下载）。"""
+    payload = body or {}
+    prompt = str(payload.get("prompt") or payload.get("message") or "").strip()
+    fmt = str(payload.get("format") or "docx").lower().strip()
+    if fmt not in ("docx", "xlsx"):
+        fmt = "docx"
+    if not prompt:
+        return JSONResponse(
+            {"success": False, "message": "请提供文档需求描述（prompt）"}, status_code=400
+        )
+    try:
+        from app.application.facades.kitten_facade import generate_office_file
+
+        content, file_name = generate_office_file(prompt, cast("Literal['docx', 'xlsx']", fmt))
+        mime = (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            if fmt == "xlsx"
+            else "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
+        ascii_name = file_name.encode("ascii", "ignore").decode("ascii") or (
+            "doc.xlsx" if fmt == "xlsx" else "doc.docx"
+        )
+        disp = f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(file_name)}"
+        trace_payload = _trace_kitten_route(
+            {
+                "success": True,
+                "response": "办公文档已生成",
+                "data": {
+                    "text": "办公文档已生成",
+                    "document": {
+                        "file_name": file_name,
+                        "download_url": "/api/ai/kitten/document/generate",
+                        "mime_type": mime,
+                        "summary": prompt,
+                    },
+                },
+            },
+            route="/api/ai/kitten/document/generate",
+            message=prompt,
+            body=payload,
+            intent="kitten_document_generate",
+        )
+        return StreamingResponse(
+            BytesIO(content),
+            media_type=mime,
+            headers=_agent_run_headers(trace_payload, {"Content-Disposition": disp}),
+        )
+    except RuntimeError:
+        logger.exception("kitten document service unavailable")
+        return JSONResponse({"success": False, "message": _DOCUMENT_UNAVAILABLE}, status_code=503)
+    except RECOVERABLE_ERRORS:
+        logger.exception("kitten document generation failed")
+        return JSONResponse({"success": False, "message": _DOCUMENT_UNAVAILABLE}, status_code=500)
+
+
+@router.get("/api/ai/kitten/document/pickup/{token}")
+def kitten_document_pickup(token: str):
+    """一次性下载 Planner 工具 ``generate_office_document`` 生成的文档。"""
+    from app.application.facades.kitten_facade import pop_document_pickup
+
+    item = pop_document_pickup(token)
+    if not item:
+        return JSONResponse({"success": False, "message": "链接无效或已过期"}, status_code=404)
+    content, file_name, mime = item
+    ascii_name = file_name.encode("ascii", "ignore").decode("ascii") or "download.bin"
+    disp = f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(file_name)}"
+    return Response(
+        content=content,
+        media_type=mime or "application/octet-stream",
+        headers={"Content-Disposition": disp},
+    )

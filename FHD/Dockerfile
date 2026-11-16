@@ -1,0 +1,92 @@
+# XCAGI Backend Dockerfile
+# Multi-stage build for optimized production image
+
+# ============================================
+# Stage 1: Builder
+# ============================================
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# 生产镜像用 server-api 锁定依赖；XCAGI/requirements.txt 含 -e .. 仅适合本地 editable 安装
+COPY requirements-server-api.txt requirements.txt
+COPY packages /build/packages
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip wheel --no-cache-dir --wheel-dir /build/wheels -r requirements.txt
+
+# ============================================
+# Stage 2: Production
+# ============================================
+FROM python:3.11-slim AS production
+
+LABEL maintainer="XCAGI Team"
+LABEL version="1.0.0.0"
+LABEL description="XCAGI AI Employee - 基于 AI 的单据智能处理员工"
+
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONUTF8=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --shell /bin/bash appuser
+
+# Keep LangGraph imports on the audited source tree (same gate as Dockerfile.fhd-api).
+ENV PYTHONPATH=/app/packages/xcagi_langgraph_core:/app/packages/xcagi_langgraph_checkpoint:/app/packages/xcagi_langgraph_checkpoint_backends/checkpoint-sqlite:/app/packages/xcagi_langgraph_checkpoint_backends/checkpoint-postgres:/app/packages/xcagi_langgraph_prebuilt:/app/packages/xcagi_langgraph_sdk
+
+COPY --from=builder /build/wheels /wheels
+RUN pip install --no-cache-dir /wheels/* && rm -rf /wheels \
+    && pip install --no-cache-dir --upgrade 'wheel>=0.46.2' 'jaraco.context>=6.1.0' 'setuptools>=78.0.0'
+
+COPY --chown=appuser:appuser . .
+
+RUN mkdir -p /app/data /app/uploads /app/logs \
+    && chown -R appuser:appuser /app/data /app/uploads /app/logs
+
+USER appuser
+
+EXPOSE 5000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:5000/health || exit 1
+
+CMD ["gunicorn", "--config", "gunicorn_config.py", "run:app"]
+
+# ============================================
+# Stage 3: Development
+# ============================================
+FROM python:3.11-slim AS development
+
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONUTF8=1 \
+    XCAGI_ENV=development \
+    FASTAPI_HOST=0.0.0.0 \
+    FASTAPI_PORT=5000
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements-server-api.txt requirements.txt
+COPY packages /app/packages
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+EXPOSE 5000
+
+CMD ["python", "run.py"]

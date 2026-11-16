@@ -1,0 +1,322 @@
+# CI SSOT: generated from MODstore_deploy/.github/workflows/prod-deploy-receipt.yml — DO NOT edit here.
+# Edit that source, then run: python scripts/dev/publish_ci_workflows_to_root.py
+name: Finalize MODstore Production Deployment Receipt
+
+on:
+  workflow_run:
+    workflows: ["Deploy MODstore Production"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      source_deploy_run_id:
+        description: Successful Deploy MODstore Production run to reconcile
+        required: true
+        type: string
+      package_source_sha:
+        description: Optional ancestor commit that introduced employee packs
+        required: false
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+jobs:
+  receipt:
+    if: >-
+      ${{
+        (github.event_name == 'workflow_run' &&
+          github.event.workflow_run.conclusion == 'success') ||
+        github.event_name == 'workflow_dispatch'
+      }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download exact deployment correlation
+        uses: actions/download-artifact@v8
+        with:
+          name: modstore-deployment-correlation
+          path: ${{ runner.temp }}/modstore-deployment-correlation
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.event_name == 'workflow_dispatch' && inputs.source_deploy_run_id || github.event.workflow_run.id }}
+
+      - name: Resolve and attest source deployment
+        id: source
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PACKAGE_SOURCE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.package_source_sha || '' }}
+          SOURCE_WORKFLOW_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.source_deploy_run_id || github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_WORKFLOW_ID" =~ ^[0-9]+$ ]] || {
+            echo "::error::source deployment run id must be numeric"
+            exit 1
+          }
+          correlation="${RUNNER_TEMP}/modstore-deployment-correlation/modstore-deployment-correlation.json"
+          test -f "$correlation"
+          merge_sha="$(jq -r '.merge_sha // ""' "$correlation")"
+          [[ "$merge_sha" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::invalid deployment merge SHA"
+            exit 1
+          }
+          controller_sha="$(jq -r '.controller_sha // .merge_sha' "$correlation")"
+          [[ "$controller_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::invalid controller SHA"; exit 1; }
+          workflow="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/workflows/modstore-prod-deploy.yml")"
+          source_run="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_WORKFLOW_ID}")"
+          jq -e \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg controller_sha "$controller_sha" \
+            --argjson run_id "$SOURCE_WORKFLOW_ID" \
+            --argjson workflow "$workflow" \
+            '.id == $run_id
+              and .workflow_id == $workflow.id
+              and .path == ".github/workflows/modstore-prod-deploy.yml"
+              and .path == $workflow.path
+              and .event == "workflow_dispatch"
+              and .head_branch == "main"
+              and .status == "completed"
+              and .conclusion == "success"
+              and .repository.full_name == $repository
+              and .head_sha == $controller_sha' \
+            <<<"$source_run" >/dev/null || {
+              echo "::error::source run is not the successful exact deployment"
+              exit 1
+            }
+          if [ "$controller_sha" != "$merge_sha" ]; then
+            jq -e --arg sha "$merge_sha" \
+              '.git_sha == $sha and .environment == "production" and (.approval_reference | strings | length > 0)' \
+              "$correlation" >/dev/null
+            comparison="$(gh api "/repos/${GITHUB_REPOSITORY}/compare/${merge_sha}...${controller_sha}")"
+            jq -e --arg sha "$merge_sha" \
+              '.status == "ahead" and .merge_base_commit.sha == $sha' \
+              <<<"$comparison" >/dev/null || {
+                echo "::error::deployed product is not an ancestor of controller"
+                exit 1
+              }
+          fi
+          package_source_sha="${PACKAGE_SOURCE_SHA:-$merge_sha}"
+          [[ "$package_source_sha" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::invalid package source SHA"
+            exit 1
+          }
+          if [ "$package_source_sha" != "$merge_sha" ]; then
+            comparison="$(gh api \
+              "/repos/${GITHUB_REPOSITORY}/compare/${package_source_sha}...${merge_sha}")"
+            jq -e \
+              --arg package_source_sha "$package_source_sha" \
+              '.status == "ahead" and .merge_base_commit.sha == $package_source_sha' \
+              <<<"$comparison" >/dev/null || {
+                echo "::error::package source SHA is not an ancestor of deployed SHA"
+                exit 1
+              }
+          fi
+          {
+            echo "conclusion=success"
+            echo "merge_sha=$merge_sha"
+            echo "package_source_sha=$package_source_sha"
+            echo "workflow_id=$SOURCE_WORKFLOW_ID"
+            echo "workflow_url=$(jq -r '.html_url // ""' <<<"$source_run")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout exact deployed source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.source.outputs.merge_sha }}
+          fetch-depth: 0
+
+      - name: Record authenticated production receipt
+        env:
+          DEPLOYMENT_RECEIPT_URL: ${{ vars.MODSTORE_DEPLOYMENT_RECEIPT_URL || 'https://xiu-ci.com/api/ops/self-maintenance/deployment-receipt' }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPS_TOKEN: ${{ secrets.MODSTORE_OPS_INGEST_TOKEN }}
+          SOURCE_WORKFLOW_CONCLUSION: ${{ steps.source.outputs.conclusion }}
+          SOURCE_WORKFLOW_ID: ${{ steps.source.outputs.workflow_id }}
+          SOURCE_WORKFLOW_URL: ${{ steps.source.outputs.workflow_url }}
+        run: |
+          set -euo pipefail
+          test -n "${OPS_TOKEN:-}" || { echo "::error::MODSTORE_OPS_INGEST_TOKEN is required"; exit 1; }
+          correlation="${RUNNER_TEMP}/modstore-deployment-correlation/modstore-deployment-correlation.json"
+          test -f "$correlation"
+          merge_sha="$(jq -r '.merge_sha // ""' "$correlation")"
+          run_id="$(jq -r '.run_id // ""' "$correlation")"
+          environment="$(jq -r '.environment // "production"' "$correlation")"
+          [[ "$merge_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::invalid deployment merge SHA"; exit 1; }
+          pr_attestation="$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${GITHUB_REPOSITORY}/commits/${merge_sha}/pulls" \
+            | jq -c --arg merge_sha "$merge_sha" \
+              '[.[] | select(.merged_at != null and .merge_commit_sha == $merge_sha)] | if length == 1 then .[0] else empty end')"
+          attested_branch=""
+          attested_branch_head_sha=""
+          attested_pr_number=""
+          if [ -n "$pr_attestation" ]; then
+            attested_branch="$(jq -r '.head.ref // ""' <<<"$pr_attestation")"
+            attested_branch_head_sha="$(jq -r '.head.sha // ""' <<<"$pr_attestation")"
+            attested_pr_number="$(jq -r '.number // ""' <<<"$pr_attestation")"
+          fi
+          action_id=""
+          if [ -n "$run_id" ]; then
+            action_id="loop:${run_id}:deploy:${environment}:${merge_sha:0:12}"
+          fi
+          payload="$(jq -nc \
+            --arg action_id "$action_id" \
+            --arg attested_branch "$attested_branch" \
+            --arg attested_branch_head_sha "$attested_branch_head_sha" \
+            --arg attested_pr_number "$attested_pr_number" \
+            --arg environment "$environment" \
+            --arg merge_sha "$merge_sha" \
+            --arg run_id "$run_id" \
+            --arg workflow_conclusion "$SOURCE_WORKFLOW_CONCLUSION" \
+            --arg workflow_run_id "$SOURCE_WORKFLOW_ID" \
+            --arg workflow_status "completed" \
+            --arg workflow_url "$SOURCE_WORKFLOW_URL" \
+            '{action_id:$action_id,attested_branch:$attested_branch,attested_branch_head_sha:$attested_branch_head_sha,attested_pr_number:$attested_pr_number,environment:$environment,merge_sha:$merge_sha,run_id:$run_id,workflow_conclusion:$workflow_conclusion,workflow_run_id:$workflow_run_id,workflow_status:$workflow_status,workflow_url:$workflow_url}')"
+          response="$(curl --fail-with-body --silent --show-error \
+            -X POST "$DEPLOYMENT_RECEIPT_URL" \
+            -H "Authorization: Bearer $OPS_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "$payload")"
+          printf '%s\n' "$response" | jq -e --arg run_id "$run_id" \
+            '.ok == true and (($run_id == "") or .recorded == true or .idempotent == true)'
+
+      - name: Derive changed employee-pack identities
+        env:
+          PACKAGE_SOURCE_SHA: ${{ steps.source.outputs.package_source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$PACKAGE_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::invalid package source SHA"
+            exit 1
+          }
+          export EVOLUTION_PACKAGES_PATH="${RUNNER_TEMP}/evolution-packages.json"
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          sha = os.environ["PACKAGE_SOURCE_SHA"]
+          catalog_root = Path("成都修茈科技有限公司/MODstore_deploy/modstore_server/catalog_data")
+          changed = [
+              os.fsdecode(name)
+              for name in subprocess.check_output(
+                  ["git", "diff", "--name-only", "-z", f"{sha}^1", sha, "--", str(catalog_root)]
+              ).split(b"\0")
+              if name
+          ]
+          archives = {
+              Path(name).name
+              for name in changed
+              if name.endswith(".xcemp") and "/catalog_data/files/" in name
+          }
+          catalog = json.loads(
+              subprocess.check_output(
+                  ["git", "show", f"{sha}:{catalog_root / 'packages.json'}"]
+              ).decode("utf-8")
+          )
+          packages = [
+              {
+                  "id": str(row.get("id") or ""),
+                  "version": str(row.get("version") or ""),
+                  "stored_filename": str(row.get("stored_filename") or ""),
+              }
+              for row in catalog.get("packages", [])
+              if isinstance(row, dict)
+              and str(row.get("artifact") or "").lower() == "employee_pack"
+              and str(row.get("stored_filename") or "") in archives
+          ]
+          Path(os.environ["EVOLUTION_PACKAGES_PATH"]).write_text(
+              json.dumps(packages, ensure_ascii=False, sort_keys=True), encoding="utf-8"
+          )
+          print(f"changed employee packs: {len(packages)}")
+          PY
+
+      - name: Publish changed employee packs to public MODstore
+        env:
+          MODSTORE_AUTO_PUBLISH_TOKEN: ${{ secrets.MODSTORE_AUTO_PUBLISH_TOKEN }}
+          MODSTORE_BASE_URL: ${{ vars.MODSTORE_BASE_URL || 'https://xiu-ci.com' }}
+          PACKAGE_SOURCE_SHA: ${{ steps.source.outputs.package_source_sha }}
+          SOURCE_WORKFLOW_ID: ${{ steps.source.outputs.workflow_id }}
+        run: |
+          set -euo pipefail
+          packages="${RUNNER_TEMP}/evolution-packages.json"
+          receipts="${RUNNER_TEMP}/evolution-publication-receipts"
+          test -f "$packages"
+          if [ "$(jq 'length' "$packages")" -eq 0 ]; then
+            echo "No changed employee packs require public publication."
+            exit 0
+          fi
+          test -n "${MODSTORE_AUTO_PUBLISH_TOKEN:-}" || {
+            echo "::error::MODSTORE_AUTO_PUBLISH_TOKEN is required"
+            exit 1
+          }
+          [[ "$PACKAGE_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::exact package source SHA is required"
+            exit 1
+          }
+          [[ "$SOURCE_WORKFLOW_ID" =~ ^[1-9][0-9]*$ ]] || {
+            echo "::error::exact source deployment workflow id is required"
+            exit 1
+          }
+          mkdir -p "$receipts"
+          source_archives="${RUNNER_TEMP}/evolution-source-archives"
+          mkdir -p "$source_archives"
+          while IFS= read -r package; do
+            package_id="$(jq -r '.id // ""' <<<"$package")"
+            version="$(jq -r '.version // ""' <<<"$package")"
+            stored_filename="$(jq -r '.stored_filename // ""' <<<"$package")"
+            test -n "$package_id" && test -n "$version" && test -n "$stored_filename"
+            [ "$stored_filename" = "$(basename "$stored_filename")" ] || {
+              echo "::error::unsafe stored filename"
+              exit 1
+            }
+            archive="成都修茈科技有限公司/MODstore_deploy/modstore_server/catalog_data/files/${stored_filename}"
+            test -f "$archive"
+            source_archive="${source_archives}/${stored_filename}"
+            git show "${PACKAGE_SOURCE_SHA}:${archive}" > "$source_archive"
+            cmp --silent "$source_archive" "$archive" || {
+              echo "::error::deployed employee pack differs from exact package source SHA"
+              exit 1
+            }
+            python FHD/scripts/dev/publish_modstore.py "$source_archive" \
+              --base-url "$MODSTORE_BASE_URL" \
+              --token "$MODSTORE_AUTO_PUBLISH_TOKEN" \
+              --source-repository "$GITHUB_REPOSITORY" \
+              --source-sha "$PACKAGE_SOURCE_SHA" \
+              --workflow-run-id "$SOURCE_WORKFLOW_ID" \
+              --receipt "${receipts}/${package_id}-${version}.receipt.json"
+          done < <(jq -c '.[]' "$packages")
+
+      - name: Upload public evolution publication receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: modstore-evolution-publication-receipts
+          path: ${{ runner.temp }}/evolution-publication-receipts/*.receipt.json
+          if-no-files-found: ignore
+
+      - name: Record production MODstore evolution receipts
+        env:
+          EVOLUTION_RECEIPT_URL: ${{ vars.MODSTORE_EVOLUTION_RECEIPT_URL || 'https://xiu-ci.com/api/ops/self-maintenance/evolution-deployment-receipt' }}
+          OPS_TOKEN: ${{ secrets.MODSTORE_OPS_INGEST_TOKEN }}
+          SOURCE_WORKFLOW_CONCLUSION: ${{ steps.source.outputs.conclusion }}
+          SOURCE_WORKFLOW_ID: ${{ steps.source.outputs.workflow_id }}
+        run: |
+          set -euo pipefail
+          test -n "${OPS_TOKEN:-}" || { echo "::error::MODSTORE_OPS_INGEST_TOKEN is required"; exit 1; }
+          correlation="${RUNNER_TEMP}/modstore-deployment-correlation/modstore-deployment-correlation.json"
+          packages="${RUNNER_TEMP}/evolution-packages.json"
+          test -f "$packages"
+          payload="$(jq -nc \
+            --arg merge_sha "$(jq -r '.merge_sha // ""' "$correlation")" \
+            --arg workflow_conclusion "$SOURCE_WORKFLOW_CONCLUSION" \
+            --arg workflow_run_id "$SOURCE_WORKFLOW_ID" \
+            --arg workflow_status "completed" \
+            --slurpfile packages "$packages" \
+            '{merge_sha:$merge_sha,workflow_conclusion:$workflow_conclusion,workflow_run_id:$workflow_run_id,workflow_status:$workflow_status,packages:$packages[0]}')"
+          response="$(curl --fail-with-body --silent --show-error \
+            -X POST "$EVOLUTION_RECEIPT_URL" \
+            -H "Authorization: Bearer $OPS_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "$payload")"
+          printf '%s\n' "$response" | jq -e '.ok == true'

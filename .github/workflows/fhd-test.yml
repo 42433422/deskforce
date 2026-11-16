@@ -1,0 +1,106 @@
+# CI SSOT: generated from FHD/.github/workflows/test.yml — DO NOT edit here.
+# Edit that source, then run: python scripts/dev/publish_ci_workflows_to_root.py
+# Lightweight smoke CI for FHD (published to root as fhd-test.yml).
+# Full pipeline: ci-cd.yml → fhd-ci-cd.yml
+name: Smoke Tests
+
+on:
+  push:
+    branches: [main, develop, master]
+    paths:
+      - "FHD/app/**"
+      - "FHD/tests/**"
+      - "FHD/assets/evals/**"
+      - "FHD/frontend/**"
+      - "FHD/ops/deploy/requirements*.txt"
+      - "FHD/pyproject.toml"
+      - "FHD/metrics/coverage-dual-summary.json"
+      - "FHD/metrics/coverage_ratchet_baseline.json"
+      - "FHD/scripts/ci/check_coverage_ssot.py"
+      - "FHD/scripts/ci/guard_temp_scripts.py"
+      - "FHD/scripts/ci/check_repo_hygiene.sh"
+      - "FHD/scripts/dev/verify_version_anchors.py"
+      - ".github/workflows/fhd-test.yml"
+  pull_request:
+    branches: [main, develop, master]
+    paths:
+      - "FHD/app/**"
+      - "FHD/tests/**"
+      - "FHD/assets/evals/**"
+      - "FHD/frontend/**"
+      - "FHD/ops/deploy/requirements*.txt"
+      - "FHD/pyproject.toml"
+      - "FHD/metrics/coverage-dual-summary.json"
+      - "FHD/metrics/coverage_ratchet_baseline.json"
+      - "FHD/scripts/ci/check_coverage_ssot.py"
+      - "FHD/scripts/ci/guard_temp_scripts.py"
+      - "FHD/scripts/ci/check_repo_hygiene.sh"
+      - "FHD/scripts/dev/verify_version_anchors.py"
+      - ".github/workflows/fhd-test.yml"
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.11"
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+
+defaults:
+  run:
+    working-directory: FHD
+
+jobs:
+  repo-hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fail on tracked secrets or dependency caches
+        shell: bash
+        run: bash scripts/ci/check_repo_hygiene.sh
+
+  backend-smoke:
+    needs: repo-hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          pytest_pin="$(python "$GITHUB_WORKSPACE/FHD/scripts/dev/check_requirements_lock.py" --pytest-pin)"
+          [[ "$pytest_pin" =~ ^pytest==[0-9]+(\.[0-9]+){2}$ ]]
+          python -m pip install --upgrade pip
+          pip install -r requirements-server-api.txt
+          pip install -r ops/deploy/requirements-dev.txt "$pytest_pin"
+
+      - name: Verify stable version anchors
+        run: python scripts/dev/verify_version_anchors.py
+
+      - name: Validate coverage SSOT metadata
+        run: python scripts/ci/check_coverage_ssot.py
+
+      - name: Layer debt ratchet (services/ frozen, routes→application only)
+        run: python scripts/dev/check_layer_ratchet.py
+
+      - name: Ruff lint (app + tests)
+        run: ruff check app/ tests/
+
+      - name: Pytest smoke (route registry + health)
+        env:
+          XCAGI_SKIP_LEGACY_COMPAT_ROUTES: "1"
+        run: |
+          python -m pytest tests/test_routes/test_route_registry.py \
+            tests/test_routes/test_registry_unit.py -x -q --tb=short
+
+      - name: Offline Agent contract fixtures (process boundary tested separately)
+        env:
+          SECRET_KEY: "ci-agent-eval-secret-at-least-32-bytes"
+        run: python assets/evals/run_agent_eval.py

@@ -1,0 +1,152 @@
+name: Security metrics collect (daily)
+
+on:
+  schedule:
+    - cron: "30 8 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: security-metrics-collect
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Ensure metrics dir exists
+        run: mkdir -p metrics
+
+      - name: Compute metrics date
+        id: metrics-date
+        run: echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      # gitleaks: 密钥泄漏扫描（SARIF v2.1.0）
+      # continue-on-error=true：本 job 是指标采集，发现泄漏不应中止后续 Trivy/commit；
+      # 门禁语义由 gitleaks.yml（PR-only）负责。
+      # GITLEAKS_CONFIG 指向项目自定义 allowlist（默认只查 .gitleaks.toml 根目录）。
+      - name: Run gitleaks scan
+        uses: gitleaks/gitleaks-action@v2
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_COMMENTS: "false"
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+          GITLEAKS_CONFIG: .github/gitleaks-config.toml
+
+      - name: Export gitleaks SARIF to metrics
+        run: |
+          set -euo pipefail
+          export SCAN_DATE="$(date -u +%Y-%m-%d)"
+          set +e
+          docker run --rm -v "${PWD}:/repo" zricethezav/gitleaks:latest \
+            detect --source /repo --report-format sarif \
+            --report-path "/repo/metrics/gitleaks-${SCAN_DATE}.json" \
+            --no-banner --redact
+          status=$?
+          set -e
+          test "$status" -le 1
+          test -s "metrics/gitleaks-${SCAN_DATE}.json"
+          export SCAN_EXIT_CODE="$status"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path(f"metrics/gitleaks-{os.environ['SCAN_DATE']}.json")
+          payload = json.loads(path.read_text(encoding="utf-8"))
+          runs = payload.get("runs") if isinstance(payload, dict) else None
+          if not isinstance(runs, list) or any(
+              not isinstance(run, dict) or not isinstance(run.get("results"), list)
+              for run in runs
+          ):
+              raise SystemExit("Missing or invalid gitleaks SARIF")
+          findings = sum(len(run["results"]) for run in runs)
+          if os.environ["SCAN_EXIT_CODE"] == "1" and findings == 0:
+              raise SystemExit("Gitleaks failed but reported no findings")
+          print(f"gitleaks findings: {findings}")
+          PY
+
+      # Trivy: 容器/依赖漏洞扫描（JSON 格式）
+      - name: Run Trivy dependency scan
+        id: trivy
+        uses: aquasecurity/trivy-action@v0.36.0
+        continue-on-error: true
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: json
+          output: metrics/trivy-${{ steps.metrics-date.outputs.date }}.json
+          severity: CRITICAL,HIGH,MEDIUM
+          ignore-unfixed: false
+          exit-code: "1"
+
+      - name: Verify and summarize scanner evidence
+        run: |
+          set -euo pipefail
+          export SCAN_DATE="$(date -u +%Y-%m-%d)"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          base = Path("metrics")
+          day = os.environ["SCAN_DATE"]
+          leaks = json.loads((base / f"gitleaks-{day}.json").read_text(encoding="utf-8"))
+          trivy = json.loads((base / f"trivy-{day}.json").read_text(encoding="utf-8"))
+          if not isinstance(leaks, dict) or not isinstance(leaks.get("runs"), list):
+              raise SystemExit("Missing or invalid Gitleaks report")
+          if not isinstance(trivy, dict) or not isinstance(trivy.get("Results"), list):
+              raise SystemExit("Missing or invalid Trivy report")
+          counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0}
+          for result in trivy["Results"]:
+              if not isinstance(result, dict):
+                  raise SystemExit("Invalid Trivy result")
+              for category in ("Vulnerabilities", "Misconfigurations", "Secrets"):
+                  for finding in result.get(category) or []:
+                      if not isinstance(finding, dict):
+                          raise SystemExit("Invalid Trivy finding")
+                      severity = str(finding.get("Severity") or "").upper()
+                      if severity in counts:
+                          counts[severity] += 1
+          total_leaks = sum(len(run.get("results", [])) for run in leaks["runs"])
+          rows = [f"Gitleaks findings: {total_leaks}"]
+          rows += [f"Trivy {severity}: {value}" for severity, value in counts.items()]
+          summary = "\n".join(rows) + "\n"
+          print(summary, end="")
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as out:
+              out.write(summary)
+          PY
+
+      - name: Prune old metrics files (keep 120 days)
+        run: |
+          find metrics/ -name "gitleaks-*.json" -mtime +120 -delete 2>/dev/null || true
+          find metrics/ -name "trivy-*.json" -mtime +120 -delete 2>/dev/null || true
+
+      - name: Upload daily security evidence (protected main is read-only)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcagi-security-metrics-${{ steps.metrics-date.outputs.date }}-${{ github.run_id }}
+          path: |
+            FHD/metrics/gitleaks-${{ steps.metrics-date.outputs.date }}.json
+            FHD/metrics/trivy-${{ steps.metrics-date.outputs.date }}.json
+          retention-days: 120
+          if-no-files-found: error
+
+      - name: Fail after preserving evidence when Trivy found blockers or failed
+        if: always() && steps.trivy.outcome != 'success'
+        run: exit 1

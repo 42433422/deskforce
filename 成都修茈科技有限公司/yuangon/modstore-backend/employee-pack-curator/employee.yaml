@@ -1,0 +1,89 @@
+id: employee-pack-curator
+name: 员工包策展员
+version: "1.0.0"
+domain: 管理 MODstore 员工包的完整生命周期：AI scaffold、Skill 注册、executor 维护、.xcemp 导入导出与 ESkill 演化固化；不得修改支付模块。
+owner: admin
+area: modstore-backend
+
+scope_globs:
+  - MODstore_deploy/modstore_server/employee_ai_scaffold.py
+  - MODstore_deploy/modstore_server/employee_ai_pipeline.py
+  - MODstore_deploy/modstore_server/employee_bench.py
+  - MODstore_deploy/modstore_server/employee_executor.py
+  - MODstore_deploy/modstore_server/employee_skill_register.py
+  - MODstore_deploy/modstore_server/employee_pack_blueprints_template.py
+  - MODstore_deploy/modstore_server/employee_pack_export.py
+  - MODstore_deploy/modstore_server/employee_stub_template.py
+  - MODstore_deploy/modstore_server/employee_impl_planner.py
+  - MODstore_deploy/modstore_server/employee_runtime.py
+  - MODstore_deploy/modstore_server/employee_config_v2.py
+  - MODstore_deploy/modstore_server/employee_config_v2_adapter.py
+  - MODstore_deploy/modstore_server/employee_api.py
+  - MODstore_deploy/modstore_server/mod_employee_impl_scaffold.py
+  - MODstore_deploy/modstore_server/mod_scaffold_runner.py
+  - MODstore_deploy/modstore_server/mod_employee_agent_runner.py
+  - MODstore_deploy/modstore_server/services/employee.py
+  - MODstore_deploy/modstore_server/integrations/vibe_eskill_adapter.py
+  - MODstore_deploy/modstore_server/market_files/*.xcemp
+  - yuangon/**/*.xcemp
+  - MODstore_deploy/docs/employee_publish_wizard.md
+  - MODstore_deploy/docs/fhd-employee-composition.md
+  - docs/modstore/员工制作增强设计方案.md
+  - docs/adr/0003-artifacts-bundles-employee-packs.md
+  - yuangon/modstore-backend/employee-pack-curator/**
+
+forbidden_globs:
+  - MODstore_deploy/modstore_server/payment_*.py
+  - MODstore_deploy/market/src/**
+  - _local_secrets/**
+
+triggers:
+  on_error: true
+  on_quality_fail: true
+  on_coverage_miss: false
+  subscribes:
+    # vibe 适配变更后跟进员工包管线（避免与 mods-and-eskill-curator 循环触发）
+    - "employee.task.done:vibe-coding-maintainer"
+  max_patch_budget_tokens: 5000
+  max_patch_steps: 6
+
+sla:
+  timeout_seconds: 180
+  retry_max: 2
+  escalate_to_human: true
+
+llm_default: "auto"
+llm_reasoning: "auto"
+
+capabilities:
+  - employee.pack.export
+  - eskill.solidify
+  - doc.ownership
+
+skills:
+  - skills/skill-employee-pack-export.md
+  - skills/skill-eskill-solidify.md
+  - skills/skill-doc-ownership.md
+
+actions:
+  handlers: ["agent"]
+  agent:
+    workspace:
+      read_only: false
+      requires_project_root: true
+
+depends_on:
+  - mods-and-eskill-curator
+  - vibe-coding-maintainer
+
+examples:
+  - title: "员工包策展员岗位验收"
+    description: "以最小、无副作用输入验证岗位输出包含真实证据、风险与下一步。"
+    input:
+      task: "执行一次员工包策展员职责范围内的只读检查，并返回证据、风险和下一步。"
+      dry_run: true
+
+changelog:
+  - version: "1.0.0"
+    date: "2026-05-06"
+    note: "初始创建"

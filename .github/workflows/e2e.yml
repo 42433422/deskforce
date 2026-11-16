@@ -1,0 +1,31 @@
+name: e2e
+
+# 真实全栈 P0 回归（Playwright）— 实现见 .github/workflows/e2e-playwright-reusable.yml
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "FHD/frontend/**"
+      - "FHD/app/**"
+      - ".github/workflows/e2e.yml"
+      - ".github/workflows/e2e-playwright-reusable.yml"
+  pull_request:
+    branches: [main, master]
+    paths:
+      - "FHD/frontend/**"
+      - "FHD/app/**"
+  workflow_dispatch:
+  schedule:
+    - cron: "0 18 * * *"
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Every run gates a real FastAPI + browser path; main CI owns mock contracts.
+  playwright-p0-paths:
+    name: Playwright P0 关键路径
+    uses: ./.github/workflows/e2e-playwright-reusable.yml
+    with:
+      run_skeleton: true

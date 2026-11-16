@@ -1,0 +1,535 @@
+"""COVERAGE_RAMP Phase 1 (p0-core): routes/domains static, rbac, mobile ext (mocked TestClient)."""
+
+from __future__ import annotations
+
+import base64
+import os
+from datetime import timedelta
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+from uuid import uuid4
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+# mobile_api 末尾才挂载 extension_router，须先 import mobile_api 打破循环依赖
+import app.fastapi_routes.mobile_api as mobile_api_mod
+import app.fastapi_routes.mobile_api_extensions as mobile_ext
+from app.application.rbac_app_service import get_rbac_app_service
+from app.db.models.permission import Permission
+from app.db.models.user import Session as UserSession
+from app.db.models.user import User
+from app.db.session import get_host_db
+from app.fastapi_routes import rbac as rbac_routes
+from app.fastapi_routes.domains.static import routes as static_routes
+from app.infrastructure.auth import tenant_context
+from app.utils.time import utc_now_naive
+from tests.fixtures.backend_ci_isolation import isolated_login_host_db
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def admin_user() -> SimpleNamespace:
+    return SimpleNamespace(id=1, username="admin", role="admin", tier="admin", tenant_id=None)
+
+
+@pytest.fixture
+def rbac_client(admin_user: SimpleNamespace, request) -> TestClient:
+    request.getfixturevalue("isolated_login_host_db")
+    app = FastAPI()
+    app.include_router(rbac_routes.router)
+    app.dependency_overrides[rbac_routes._require_rbac_manager] = lambda: admin_user
+    app.dependency_overrides[rbac_routes._require_platform_admin] = lambda: admin_user
+    return TestClient(app, raise_server_exceptions=False)
+
+
+@pytest.fixture
+def static_client(tmp_path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    vue_dist = tmp_path / "templates" / "vue-dist"
+    static_dir = vue_dist / "static"
+    static_dir.mkdir(parents=True)
+    (vue_dist / "index.html").write_text("<html>spa</html>", encoding="utf-8")
+    (vue_dist / "vite.svg").write_text("<svg/>", encoding="utf-8")
+    (vue_dist / "brand-xc-logo.png").write_bytes(b"\x89PNG")
+    (vue_dist / "sw.js").write_text("// sw", encoding="utf-8")
+    (vue_dist / "workflow-employees.json").write_text("{}", encoding="utf-8")
+    (static_dir / "app.js").write_text("console.log(1)", encoding="utf-8")
+
+    monkeypatch.setattr(static_routes, "get_base_dir", lambda: str(tmp_path))
+    app = FastAPI()
+    app.include_router(static_routes.router)
+    return TestClient(app, raise_server_exceptions=False)
+
+
+@pytest.fixture
+def mobile_ext_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    from app.fastapi_routes.mobile_api import get_mobile_user
+
+    app = FastAPI()
+    app.include_router(mobile_ext.extension_router)
+    app.dependency_overrides[get_mobile_user] = lambda: SimpleNamespace(id=1, username="mobile")
+    return TestClient(app, raise_server_exceptions=False)
+
+
+# ---------------------------------------------------------------------------
+# RBAC routes
+# ---------------------------------------------------------------------------
+
+
+def test_rbac_list_tenants(rbac_client: TestClient) -> None:
+    r = rbac_client.get("/api/rbac/tenants")
+    assert r.status_code == 200
+    assert r.json()["success"] is True
+
+
+def test_rbac_list_roles(rbac_client: TestClient) -> None:
+    r = rbac_client.get("/api/rbac/roles")
+    assert r.status_code == 200
+    assert r.json()["success"] is True
+
+
+def test_rbac_create_role(rbac_client: TestClient) -> None:
+    code = f"test.{uuid4().hex}"
+    with get_host_db() as db:
+        db.add(Permission(code=code, name="Test read", module="test"))
+    name = f"editor-{uuid4().hex}"
+    r = rbac_client.post(
+        "/api/rbac/roles",
+        json={"name": name, "description": "编辑", "permissions": [code]},
+    )
+    assert r.status_code == 201
+    data = r.json()["data"]
+    assert data["name"] == name
+    assert [permission["code"] for permission in data["permissions"]] == [code]
+    get_rbac_app_service().delete_role(data["id"])
+    with get_host_db() as db:
+        db.query(Permission).filter(Permission.code == code).delete()
+
+
+def test_rbac_get_role(rbac_client: TestClient) -> None:
+    role = get_rbac_app_service().create_role(f"get-{uuid4().hex}", "", [])
+    r = rbac_client.get(f"/api/rbac/roles/{role['id']}")
+    assert r.status_code == 200
+    assert r.json()["data"]["id"] == role["id"]
+    get_rbac_app_service().delete_role(role["id"])
+
+
+def test_rbac_update_role(rbac_client: TestClient) -> None:
+    role = get_rbac_app_service().create_role(f"update-{uuid4().hex}", "", [])
+    r = rbac_client.put(
+        f"/api/rbac/roles/{role['id']}", json={"description": "新描述", "permissions": []}
+    )
+    assert r.status_code == 200
+    assert r.json()["data"]["description"] == "新描述"
+    get_rbac_app_service().delete_role(role["id"])
+
+
+def test_rbac_delete_role(rbac_client: TestClient) -> None:
+    role = get_rbac_app_service().create_role(f"delete-{uuid4().hex}", "", [])
+    r = rbac_client.delete(f"/api/rbac/roles/{role['id']}")
+    assert r.status_code == 200
+    from app.errors import AppError
+
+    with pytest.raises(AppError):
+        get_rbac_app_service().get_role(role["id"])
+
+
+def test_rbac_permissions_list(rbac_client: TestClient) -> None:
+    r = rbac_client.get("/api/rbac/permissions")
+    assert r.status_code == 200
+
+
+def test_rbac_permission_create(rbac_client: TestClient) -> None:
+    code = f"test.{uuid4().hex}"
+    r = rbac_client.post(
+        "/api/rbac/permissions",
+        json={"code": code, "name": "读取 ERP"},
+    )
+    assert r.status_code == 201
+    get_rbac_app_service().delete_permission(r.json()["data"]["id"])
+
+
+def test_rbac_user_permissions(rbac_client: TestClient) -> None:
+    role = get_rbac_app_service().create_role(f"user-perms-{uuid4().hex}", "", [])
+    with get_host_db() as db:
+        user = User(username=f"rbac-{uuid4().hex}", password="test", role=role["key"])
+        db.add(user)
+        db.flush()
+        user_id = user.id
+    r = rbac_client.get(f"/api/rbac/users/{user_id}/permissions")
+    assert r.status_code == 200
+    assert r.json()["data"] == []
+    with get_host_db() as db:
+        db.query(User).filter(User.id == user_id).delete()
+    get_rbac_app_service().delete_role(role["id"])
+
+
+def test_rbac_assign_user_role(rbac_client: TestClient) -> None:
+    role = get_rbac_app_service().create_role(f"assign-{uuid4().hex}", "", [])
+    with get_host_db() as db:
+        user = User(username=f"rbac-{uuid4().hex}", password="test", role="user")
+        db.add(user)
+        db.flush()
+        user_id = user.id
+    r = rbac_client.put(f"/api/rbac/users/{user_id}/role", json={"role": role["key"]})
+    assert r.status_code == 200
+    assert r.json()["data"]["role"] == role["key"]
+    with get_host_db() as db:
+        db.query(User).filter(User.id == user_id).delete()
+    get_rbac_app_service().delete_role(role["id"])
+
+
+def test_rbac_tenant_roles_and_user_assignments_are_isolated(rbac_client: TestClient) -> None:
+    service = get_rbac_app_service()
+    tenant_a, tenant_b = 870001, 870002
+    code = "etl.read"
+    with get_host_db() as db:
+        if db.query(Permission.id).filter(Permission.code == code).first() is None:
+            db.add(Permission(code=code, name="查看数据对接", module="etl"))
+    role_a = service.create_role("Test Operator", "A", [code], tenant_id=tenant_a)
+    role_b = service.create_role("Test Operator", "B", [], tenant_id=tenant_b)
+    with get_host_db() as db:
+        user_a = User(
+            username=f"tenant-a-{uuid4().hex}", password="test", role="user", tenant_id=tenant_a
+        )
+        user_b = User(
+            username=f"tenant-b-{uuid4().hex}", password="test", role="user", tenant_id=tenant_b
+        )
+        db.add_all([user_a, user_b])
+        db.flush()
+        user_a_id, user_b_id = user_a.id, user_b.id
+        db.add(
+            UserSession(
+                session_id=uuid4().hex,
+                user_id=user_a_id,
+                expires_at=utc_now_naive() + timedelta(days=1),
+            )
+        )
+    assert (
+        service.assign_user_role(user_a_id, role_a["key"], tenant_id=tenant_a)["sessions_revoked"]
+        == 1
+    )
+
+    rbac_client.app.dependency_overrides[rbac_routes._require_rbac_manager] = lambda: (
+        SimpleNamespace(
+            id=user_a_id, username="tenant-a", role="user", tier="enterprise", tenant_id=tenant_a
+        )
+    )
+    listed = rbac_client.get("/api/rbac/roles")
+    hidden_role = rbac_client.get(f"/api/rbac/roles/{role_b['id']}")
+    hidden_user = rbac_client.get(f"/api/rbac/users/{user_b_id}/permissions")
+    reassignment = rbac_client.put(
+        f"/api/rbac/users/{user_b_id}/role", json={"role": role_a["key"]}
+    )
+    assert listed.status_code == 200
+    assert any(item["id"] == role_a["id"] for item in listed.json()["data"])
+    assert all(item["id"] != role_b["id"] for item in listed.json()["data"])
+    assert hidden_role.status_code == hidden_user.status_code == reassignment.status_code == 404
+    assert service.list_users(tenant_a)[0]["role"] == role_a["key"]
+    assert service.get_user_permissions(user_a_id, tenant_id=tenant_a) == [code]
+
+    with get_host_db() as db:
+        db.add(
+            UserSession(
+                session_id=uuid4().hex,
+                user_id=user_a_id,
+                expires_at=utc_now_naive() + timedelta(days=1),
+            )
+        )
+    updated = service.update_role(role_a["id"], permissions=[], tenant_id=tenant_a)
+    assert updated["sessions_revoked"] == 1
+    assert service.get_user_permissions(user_a_id, tenant_id=tenant_a) == []
+    assert service.get_user_permissions(user_a_id, tenant_id=tenant_a) == []
+
+    with get_host_db() as db:
+        db.query(User).filter(User.id.in_([user_a_id, user_b_id])).delete(synchronize_session=False)
+    service.delete_role(role_a["id"], tenant_id=tenant_a)
+    service.delete_role(role_b["id"], tenant_id=tenant_b)
+
+
+def test_rbac_tenant_scope_fails_closed(rbac_client: TestClient) -> None:
+    from fastapi import HTTPException
+
+    rbac_client.app.dependency_overrides[rbac_routes._require_rbac_manager] = lambda: (
+        SimpleNamespace(
+            id=2, username="tenant-admin", role="user", tier="enterprise", tenant_id=None
+        )
+    )
+
+    def deny_platform():
+        raise HTTPException(status_code=403)
+
+    rbac_client.app.dependency_overrides[rbac_routes._require_platform_admin] = deny_platform
+    roles = rbac_client.get("/api/rbac/roles")
+    permissions = rbac_client.post(
+        "/api/rbac/permissions", json={"code": "rbac.invalid", "name": "Invalid"}
+    )
+    assert roles.status_code == permissions.status_code == 403
+
+
+def test_rbac_seed_permissions(rbac_client: TestClient) -> None:
+    r = rbac_client.post("/api/rbac/seed-missing-permissions")
+    assert r.status_code == 200
+    assert "added" in r.json()
+
+
+def test_rbac_tenant_data_scopes(rbac_client: TestClient) -> None:
+    r = rbac_client.get("/api/rbac/tenants/1/data-scopes")
+    assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Static / SPA routes
+# ---------------------------------------------------------------------------
+
+
+def test_static_index_serves_spa(static_client: TestClient) -> None:
+    r = static_client.get("/")
+    assert r.status_code == 200
+    assert "spa" in r.text
+
+
+def test_static_serve_js(static_client: TestClient) -> None:
+    r = static_client.get("/static/app.js")
+    assert r.status_code == 200
+
+
+def test_static_missing_asset_404(static_client: TestClient) -> None:
+    r = static_client.get("/static/missing.js")
+    assert r.status_code == 404
+
+
+def test_static_vite_svg(static_client: TestClient) -> None:
+    r = static_client.get("/vite.svg")
+    assert r.status_code == 200
+
+
+def test_static_brand_logo_png(static_client: TestClient) -> None:
+    r = static_client.get("/brand-xc-logo.png")
+    assert r.status_code == 200
+
+
+def test_static_favicon(static_client: TestClient) -> None:
+    r = static_client.get("/favicon.ico")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("image/")
+
+
+def test_static_sw_js(static_client: TestClient) -> None:
+    r = static_client.get("/sw.js")
+    assert r.status_code == 200
+
+
+def test_static_workflow_employees_json(static_client: TestClient) -> None:
+    r = static_client.get("/workflow-employees.json")
+    assert r.status_code == 200
+
+
+def test_static_console_route(static_client: TestClient) -> None:
+    r = static_client.get("/console")
+    assert r.status_code == 200
+
+
+def test_static_traditional_list(
+    monkeypatch: pytest.MonkeyPatch, static_client: TestClient
+) -> None:
+    monkeypatch.setattr(
+        static_routes,
+        "list_files_response",
+        lambda path: ({"success": True, "files": []}, 200),
+    )
+    r = static_client.get("/api/traditional-mode/list")
+    assert r.status_code == 200
+
+
+def test_static_traditional_root(
+    monkeypatch: pytest.MonkeyPatch, static_client: TestClient
+) -> None:
+    monkeypatch.setattr(static_routes, "root_info_response", lambda: {"root": "/"})
+    r = static_client.get("/api/traditional-mode/root")
+    assert r.status_code == 200
+
+
+def test_static_traditional_write_empty_body(static_client: TestClient) -> None:
+    r = static_client.post("/api/traditional-mode/write", json={})
+    assert r.status_code == 400
+
+
+def test_static_traditional_write_forbidden_path(
+    monkeypatch: pytest.MonkeyPatch, static_client: TestClient
+) -> None:
+    monkeypatch.setattr(static_routes, "resolve_safe_path", lambda rel: None)
+    r = static_client.post(
+        "/api/traditional-mode/write",
+        json={"file": "../etc/passwd", "type": "excel", "data": {}},
+    )
+    assert r.status_code == 403
+
+
+def test_static_traditional_agent_write_text(
+    monkeypatch: pytest.MonkeyPatch, static_client: TestClient
+) -> None:
+    monkeypatch.setattr(
+        static_routes,
+        "write_text_response",
+        lambda f, c, append=False: ({"success": True}, 200),
+    )
+    r = static_client.post(
+        "/api/traditional-mode/agent/write-text",
+        json={"file": "a.txt", "content": "hi"},
+    )
+    assert r.status_code == 200
+
+
+def test_static_traditional_agent_write_base64(
+    monkeypatch: pytest.MonkeyPatch, static_client: TestClient
+) -> None:
+    payload = base64.b64encode(b"hello").decode()
+    monkeypatch.setattr(
+        static_routes,
+        "write_base64_response",
+        lambda f, c: ({"success": True}, 200),
+    )
+    r = static_client.post(
+        "/api/traditional-mode/agent/write-base64",
+        json={"file": "a.bin", "content_base64": payload},
+    )
+    assert r.status_code == 200
+
+
+def test_static_traditional_agent_move_copy(
+    monkeypatch: pytest.MonkeyPatch, static_client: TestClient
+) -> None:
+    monkeypatch.setattr(
+        static_routes,
+        "move_response",
+        lambda src, dst, overwrite=False: ({"success": True}, 200),
+    )
+    monkeypatch.setattr(
+        static_routes,
+        "copy_response",
+        lambda src, dst, overwrite=False: ({"success": True}, 200),
+    )
+    assert (
+        static_client.post(
+            "/api/traditional-mode/agent/move",
+            json={"src": "a", "dst": "b"},
+        ).status_code
+        == 200
+    )
+    assert (
+        static_client.post(
+            "/api/traditional-mode/agent/copy",
+            json={"src": "a", "dst": "b"},
+        ).status_code
+        == 200
+    )
+
+
+def test_static_outputs_missing(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, static_client: TestClient, logged_in_session
+) -> None:
+    monkeypatch.setattr(
+        "app.utils.path_io.path_utils.get_app_data_dir",
+        lambda: str(tmp_path / "missing_outputs"),
+    )
+    monkeypatch.setattr(
+        "app.utils.path_io.path_utils.get_resource_path",
+        lambda *a, **k: str(tmp_path / "also_missing"),
+    )
+    r = static_client.get("/outputs/file.xlsx")
+    assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Mobile API extensions
+# ---------------------------------------------------------------------------
+
+
+def test_mobile_approval_list_unauthorized() -> None:
+    from app.fastapi_routes.mobile_api import get_mobile_user
+
+    app = FastAPI()
+    app.include_router(mobile_ext.extension_router)
+    app.dependency_overrides[get_mobile_user] = lambda: None
+    client = TestClient(app, raise_server_exceptions=False)
+    r = client.get("/approval/requests")
+    assert r.status_code == 401
+
+
+@patch("app.db.session.get_db")
+def test_mobile_approval_list_success(
+    mock_get_db: MagicMock, mobile_ext_client: TestClient
+) -> None:
+    mock_db = MagicMock()
+    cm = MagicMock()
+    cm.__enter__.return_value = mock_db
+    cm.__exit__.return_value = None
+    mock_get_db.return_value = cm
+    row = SimpleNamespace(
+        id=1,
+        title="请假",
+        status="pending",
+        request_no="R001",
+        applicant_id=2,
+        created_at=None,
+    )
+    q = MagicMock()
+    q.filter.return_value = q
+    q.count.return_value = 1
+    q.order_by.return_value = q
+    q.offset.return_value = q
+    q.limit.return_value = q
+    q.all.return_value = [row]
+    mock_db.query.return_value = q
+    r = mobile_ext_client.get("/approval/requests")
+    assert r.status_code == 200
+    assert r.json()["success"] is True
+
+
+def test_mobile_pairing_issue_rejects_non_desktop_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        mobile_ext,
+        "issue_pairing_nonce",
+        lambda host, port: {"nonce": "abc", "code": "123456"},
+    )
+    app = FastAPI()
+    app.include_router(mobile_ext.extension_router)
+    client = TestClient(app, raise_server_exceptions=False)
+    r = client.post("/pairing/issue", json={"host": "127.0.0.1", "port": 5000})
+    assert r.status_code == 401
+
+
+def test_mobile_pairing_lookup_rejects_anonymous(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(mobile_ext, "lookup_by_shortcode", lambda code: None)
+    app = FastAPI()
+    app.include_router(mobile_ext.extension_router)
+    client = TestClient(app, raise_server_exceptions=False)
+    r = client.post("/pairing/lookup", json={"code": "000000"})
+    assert r.status_code == 401
+
+
+def test_tenant_context_resolve(monkeypatch: pytest.MonkeyPatch) -> None:
+    req = MagicMock()
+    monkeypatch.setattr(tenant_context, "session_id_from_request", lambda r: "sid")
+    monkeypatch.setattr(
+        "app.application.facades.session_facade.get_session_service",
+        lambda: SimpleNamespace(validate_session=lambda sid: SimpleNamespace(tenant_id=7)),
+    )
+    assert tenant_context.resolve_tenant_id(req) == 7
+    assert tenant_context.tenant_id_for_user(SimpleNamespace(tenant_id=3)) == 3
+
+
+def test_tenant_context_resolve_none_on_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    req = MagicMock()
+    monkeypatch.setattr(tenant_context, "session_id_from_request", lambda r: "sid")
+
+    monkeypatch.setattr(
+        "app.application.facades.session_facade.get_session_service",
+        lambda: SimpleNamespace(validate_session=lambda sid: None),
+    )
+    assert tenant_context.resolve_tenant_id(req) is None

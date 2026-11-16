@@ -1,0 +1,17 @@
+# 根仓 SSOT：统一换行与二进制标记
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.mp4 binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.tar binary
+*.gz binary
+*.apk binary
+*.dmg binary
+*.exe binary
+*.log -text -eol whitespace=cr-at-eol

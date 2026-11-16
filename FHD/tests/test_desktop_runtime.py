@@ -1,0 +1,262 @@
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+
+import pytest
+
+from app.desktop_runtime import no_console_children
+from app.desktop_runtime.database_profile import (
+    apply_database_profile_to_env,
+    is_valid_remote_database_url,
+    load_or_create_profile,
+    resolve_storage_mode,
+    save_profile,
+)
+from app.desktop_runtime.desktop_runtime_paths import (
+    configure_desktop_environment,
+    ensure_desktop_dirs,
+    sqlite_database_url,
+)
+from app.desktop_runtime.model_downloader import load_manifest
+from app.desktop_runtime.sunbird_delivery_seed import (
+    apply_sunbird_roster_seed_if_needed,
+    sync_sunbird_delivery_files,
+)
+
+
+def test_configure_desktop_environment_sets_local_defaults(tmp_path, monkeypatch):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("CACHE_REDIS_URL", raising=False)
+    monkeypatch.delenv("CELERY_BROKER_URL", raising=False)
+
+    data_dir = configure_desktop_environment(tmp_path)
+
+    assert data_dir == tmp_path.resolve()
+    assert os.environ["XCAGI_DESKTOP_MODE"] == "1"
+    assert os.environ["DATABASE_URL"].startswith("sqlite:///")
+    assert os.environ["XCAGI_MOD_ISOLATED_DATABASES"] == "0"
+    assert os.environ["CACHE_REDIS_URL"] == ""
+    assert os.environ["CELERY_BROKER_URL"] == "memory://"
+    prof_path, profile = load_or_create_profile(tmp_path)
+    assert prof_path.is_file()
+    assert profile["mode"] == "local"
+    assert profile["remote"]["enabled"] is False
+
+
+def test_database_profile_creates_default_json(tmp_path):
+    path, profile = load_or_create_profile(tmp_path)
+    assert path.name == "database.json"
+    assert path.parent.name == "config"
+    assert profile["mode"] == "local"
+
+
+def test_resolve_storage_mode_local_sqlite():
+    assert resolve_storage_mode("sqlite:///C:/data/xcagi.db") == "local_sqlite"
+
+
+def test_is_valid_remote_database_url_requires_host():
+    assert is_valid_remote_database_url("") is False
+    assert is_valid_remote_database_url("sqlite:///x.db") is False
+    assert is_valid_remote_database_url("postgresql://") is False
+    assert is_valid_remote_database_url("postgresql://u:p@127.0.0.1:5432/xcagi") is True
+    assert is_valid_remote_database_url("postgresql+psycopg://u:p@h:5432/db") is True
+
+
+def test_save_profile_normalizes_string_false_enabled(tmp_path):
+    _, profile = save_profile(
+        tmp_path,
+        {
+            "mode": "remote",
+            "remote": {
+                "enabled": "false",
+                "database_url": "postgresql://u:p@h:5432/xcagi",
+            },
+        },
+    )
+    assert profile["remote"]["enabled"] is False
+
+
+def test_apply_database_profile_string_false_stays_local(tmp_path, monkeypatch):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    prof_path, _ = load_or_create_profile(tmp_path)
+    prof_path.write_text(
+        '{"version":1,"mode":"remote","remote":{"enabled":"false",'
+        '"database_url":"postgresql+psycopg://u:p@127.0.0.1:5432/xcagi"}}',
+        encoding="utf-8",
+    )
+    local_url = sqlite_database_url(tmp_path)
+    apply_database_profile_to_env(tmp_path, local_sqlite_url=local_url)
+    assert os.environ["DATABASE_URL"].startswith("sqlite:///")
+    assert os.environ.get("XCAGI_DESKTOP_KEEP_DATABASE_URL") is None
+
+
+def test_apply_database_profile_remote_when_enabled(tmp_path, monkeypatch):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    prof_path, _ = load_or_create_profile(tmp_path)
+    prof_path.write_text(
+        '{"version":1,"mode":"remote","remote":{"enabled":true,'
+        '"database_url":"postgresql+psycopg://u:p@127.0.0.1:5432/xcagi"}}',
+        encoding="utf-8",
+    )
+    local_url = sqlite_database_url(tmp_path)
+    apply_database_profile_to_env(tmp_path, local_sqlite_url=local_url)
+    assert os.environ["DATABASE_URL"].startswith("postgresql")
+    assert os.environ.get("XCAGI_DESKTOP_KEEP_DATABASE_URL") == "1"
+
+
+def test_ensure_desktop_dirs_creates_expected_layout(tmp_path):
+    dirs = ensure_desktop_dirs(tmp_path)
+
+    assert dirs["data"].is_dir()
+    assert dirs["uploads"].is_dir()
+    assert dirs["logs"].is_dir()
+    assert dirs["mods"].is_dir()
+    assert dirs["models"].is_dir()
+
+
+def test_model_manifest_loads_assets(tmp_path):
+    manifest = tmp_path / "models.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "name": "demo",
+                        "version": "1.0.0",
+                        "url": "https://models.example/demo.bin",
+                        "sha256": "0" * 64,
+                        "size": 12,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assets = load_manifest(manifest)
+
+    assert assets[0].name == "demo"
+    assert assets[0].version == "1.0.0"
+
+
+def test_sunbird_delivery_files_are_not_copied_before_authenticated_install(tmp_path, monkeypatch):
+    seed = tmp_path / "seed"
+    runtime = tmp_path / "runtime"
+    (seed / "424").mkdir(parents=True)
+    (seed / "config").mkdir()
+    (seed / "data" / "mod_dbs").mkdir(parents=True)
+    (seed / "424" / "考勤-2026-3月份考勤统计表.xlsx").write_bytes(b"template")
+    (seed / "config" / "sunbird-roster.json").write_text(
+        '{"employees":[]}\n',
+        encoding="utf-8",
+    )
+    (seed / "data" / "mod_dbs" / "taiyangniao_pro.db").write_bytes(b"db")
+    monkeypatch.setenv("XCAGI_SUNBIRD_SEED_ROOT", str(seed))
+
+    copied = sync_sunbird_delivery_files(runtime)
+
+    assert copied == 0
+    assert not runtime.exists()
+    assert (seed / "data" / "mod_dbs" / "taiyangniao_pro.db").read_bytes() == b"db"
+
+
+def test_sunbird_delivery_files_do_not_overwrite_existing_payload(tmp_path, monkeypatch):
+    seed = tmp_path / "seed"
+    runtime = tmp_path / "runtime"
+    (seed / "424").mkdir(parents=True)
+    (runtime / "424").mkdir(parents=True)
+    (runtime / "config").mkdir()
+    (runtime / "data" / "mod_dbs").mkdir(parents=True)
+    template_name = "考勤-2026-3月份考勤统计表.xlsx"
+    (seed / "424" / template_name).write_bytes(b"seed")
+    (runtime / "424" / template_name).write_bytes(b"customer")
+    (runtime / "config" / "sunbird-roster.json").write_text(
+        '{"employees":[]}\n',
+        encoding="utf-8",
+    )
+    (runtime / "data" / "mod_dbs" / "taiyangniao_pro.db").write_bytes(b"customer-db")
+    monkeypatch.setenv("XCAGI_SUNBIRD_SEED_ROOT", str(seed))
+
+    copied = sync_sunbird_delivery_files(runtime)
+
+    assert copied == 0
+    assert (runtime / "424" / template_name).read_bytes() == b"customer"
+
+
+def test_sunbird_legacy_marker_does_not_enable_ownerless_copy(tmp_path, monkeypatch):
+    seed = tmp_path / "seed"
+    runtime = tmp_path / "runtime"
+    (seed / "424").mkdir(parents=True)
+    (runtime / "config").mkdir(parents=True)
+    (seed / "424" / "考勤-2026-3月份考勤统计表.xlsx").write_bytes(b"template")
+    (runtime / "config" / "sunbird-roster.applied").write_text(
+        "already-applied\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XCAGI_SUNBIRD_SEED_ROOT", str(seed))
+
+    applied = apply_sunbird_roster_seed_if_needed(runtime)
+
+    assert applied is False
+    assert not (runtime / "424").exists()
+    assert (runtime / "config" / "sunbird-roster.applied").read_text() == "already-applied\n"
+
+
+def test_with_no_window_keeps_explicit_console_requests():
+    assert no_console_children.with_no_window(0) == no_console_children.CREATE_NO_WINDOW
+    assert no_console_children.with_no_window(0x00000200) == (
+        0x00000200 | no_console_children.CREATE_NO_WINDOW
+    )
+    assert no_console_children.with_no_window(0x00000008) == 0x00000008
+    assert no_console_children.with_no_window(0x00000010) == 0x00000010
+
+
+def test_install_is_skipped_when_children_inherit_a_console(monkeypatch):
+    monkeypatch.setattr(no_console_children, "_installed", False)
+    monkeypatch.setattr(no_console_children, "needs_no_console_default", lambda: False)
+
+    assert no_console_children.install_no_console_child_defaults() is False
+
+
+def test_install_is_idempotent(monkeypatch):
+    dummy = type("_DummyPopen", (), {"__init__": lambda self, *a, **k: None})
+    monkeypatch.setattr(subprocess, "Popen", dummy)
+    monkeypatch.setattr(no_console_children, "_installed", False)
+    monkeypatch.setattr(no_console_children, "needs_no_console_default", lambda: True)
+
+    assert no_console_children.install_no_console_child_defaults() is True
+    patched_init = dummy.__init__
+
+    assert no_console_children.install_no_console_child_defaults() is False
+    assert dummy.__init__ is patched_init
+
+
+def test_install_injects_creationflags_into_real_popen(monkeypatch):
+    if sys.platform != "win32":
+        pytest.skip("CREATE_NO_WINDOW is Windows-only")
+    original_init = subprocess.Popen.__init__
+    seen: list[int] = []
+
+    def _spy(self, *args, creationflags=0, **kwargs):
+        seen.append(creationflags)
+        return original_init(self, *args, creationflags=creationflags, **kwargs)
+
+    monkeypatch.setattr(subprocess.Popen, "__init__", _spy)
+    monkeypatch.setattr(no_console_children, "_installed", False)
+    monkeypatch.setattr(no_console_children, "needs_no_console_default", lambda: True)
+
+    assert no_console_children.install_no_console_child_defaults() is True
+
+    result = subprocess.run(
+        [sys.executable, "-c", "print('ok')"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ok"
+    assert seen == [no_console_children.CREATE_NO_WINDOW]

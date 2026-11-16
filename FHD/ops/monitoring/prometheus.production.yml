@@ -1,0 +1,50 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+# Production SLO SSOT.  Target labels are attached by Prometheus so every
+# series used by collect_slo_metrics.py can be selected fail-closed with
+# environment="production".  MODstore is required for external desktop install
+# receipts; those events do not pass through the FHD server process.
+# Relative paths resolve next to this file (/opt/prometheus/config on the host).
+rule_files:
+  - production-alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["127.0.0.1:19093"]
+
+scrape_configs:
+  - job_name: fhd-api-stable
+    static_configs:
+      - targets: ["127.0.0.1:5100"]
+        labels:
+          env: production
+          environment: production
+          channel: stable
+          service: fhd
+
+  - job_name: fhd-api-staging
+    static_configs:
+      - targets: ["127.0.0.1:5101"]
+        labels:
+          env: staging
+          environment: staging
+          channel: staging
+          service: fhd
+
+  - job_name: modstore-api-production
+    static_configs:
+      - targets: ["127.0.0.1:9999"]
+        labels:
+          env: production
+          environment: production
+          channel: stable
+          service: modstore
+
+  # Empty unless run_alert_drill.sh writes a deliberately unreachable target.
+  - job_name: alert-drill
+    file_sd_configs:
+      - files: ["file_sd/alert-drill*.json"]
+        refresh_interval: 15s

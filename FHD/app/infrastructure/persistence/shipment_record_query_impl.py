@@ -1,0 +1,326 @@
+from __future__ import annotations
+
+import json
+import logging
+from datetime import datetime
+from typing import Any
+
+from sqlalchemy import inspect as sa_inspect
+
+from app.db.models import ShipmentRecord
+from app.db.session import get_db
+from app.domain.shipment.ports import ShipmentRecordQueryPort
+from app.infrastructure.lookups import resolve_purchase_unit
+from app.utils.operational_errors import RECOVERABLE_ERRORS
+
+logger = logging.getLogger(__name__)
+_QUERY_ERRORS = RECOVERABLE_ERRORS
+
+
+def _record_to_dict(record: Any) -> dict[str, Any]:
+    row_dict: dict[str, Any] = {}
+    try:
+        columns = list(sa_inspect(ShipmentRecord).columns)
+    except _QUERY_ERRORS:
+        columns = []
+    for column in columns:
+        row_dict[column.name] = getattr(record, column.name)
+    if row_dict:
+        try:
+            parsed = json.loads(row_dict.get("parsed_data") or "{}")
+        except (TypeError, ValueError):
+            parsed = {}
+        document = parsed.get("document") if isinstance(parsed, dict) else None
+        if isinstance(document, dict):
+            row_dict.update(
+                order_number=document.get("order_number"),
+                date=document.get("date") or str(row_dict.get("created_at") or "")[:10],
+                total_amount=document.get("total_amount"),
+                total_quantity=document.get("total_quantity"),
+            )
+        return row_dict
+    raw = getattr(record, "__dict__", {}) or {}
+    for key, value in raw.items():
+        if not str(key).startswith("_"):
+            row_dict[str(key)] = value
+    if row_dict:
+        return row_dict
+    for key in ("id", "purchase_unit", "product_name", "model_number", "quantity", "created_at"):
+        if hasattr(record, key):
+            row_dict[key] = getattr(record, key)
+    return row_dict
+
+
+class SQLAlchemyShipmentRecordQuery(ShipmentRecordQueryPort):
+    """shipment_records 表的只读查询实现（Read side）。"""
+
+    def find_document_by_order_number(self, order_number: str) -> dict[str, Any] | None:
+        from app.infrastructure.tenant_scope import current_tenant_id
+
+        tenant_id = current_tenant_id()
+        if tenant_id is None:
+            raise ValueError("Shipment document lookup requires tenant scope")
+        with get_db() as db:
+            # parsed_data is legacy Text on both SQLite and PostgreSQL. Stream the
+            # tenant's rows rather than relying on dialect-specific JSON casts.
+            records = (
+                db.query(ShipmentRecord)
+                .filter(ShipmentRecord.tenant_id == tenant_id)
+                .order_by(ShipmentRecord.id)
+                .yield_per(200)
+            )
+            for record in records:
+                row = _record_to_dict(record)
+                if str(row.get("order_number") or "").strip() == order_number:
+                    return row
+        return None
+
+    def query_shipments(
+        self,
+        *,
+        unit_name: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        page: int = 1,
+        per_page: int = 20,
+    ) -> dict[str, Any]:
+        try:
+            query_unit = unit_name
+
+            # 兼容：unit 可能是简称/模糊名，统一归一到 customers 的规范名
+            if query_unit:
+                resolved = resolve_purchase_unit(query_unit)
+                if resolved:
+                    query_unit = resolved.unit_name
+
+            with get_db() as db:
+                inspector = sa_inspect(db.bind)
+                if "shipment_records" not in inspector.get_table_names():
+                    return {
+                        "success": True,
+                        "data": [],
+                        "total": 0,
+                        "page": page,
+                        "per_page": per_page,
+                    }
+
+                query = db.query(ShipmentRecord)
+
+                if query_unit:
+                    query = query.filter(ShipmentRecord.purchase_unit == query_unit)
+
+                if start_date:
+                    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+                    query = query.filter(ShipmentRecord.created_at >= start_dt)
+
+                if end_date:
+                    end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(
+                        hour=23, minute=59, second=59
+                    )
+                    query = query.filter(ShipmentRecord.created_at <= end_dt)
+
+                total = query.count()
+
+                offset = (page - 1) * per_page
+                records = (
+                    query.order_by(ShipmentRecord.created_at.desc(), ShipmentRecord.id.desc())
+                    .limit(per_page)
+                    .offset(offset)
+                    .all()
+                )
+
+                rows = [_record_to_dict(record) for record in records]
+
+            return {
+                "success": True,
+                "data": rows,
+                "total": int(total),
+                "page": page,
+                "per_page": per_page,
+            }
+        except _QUERY_ERRORS as e:
+            return {
+                "success": False,
+                "message": f"查询失败：{str(e)}",
+                "data": [],
+                "total": 0,
+                "page": page,
+                "per_page": per_page,
+            }
+
+    def search_shipments(self, query: str) -> list[dict[str, Any]]:
+        try:
+            query_str = (query or "").strip()
+            if not query_str:
+                return []
+
+            with get_db() as db:
+                inspector = sa_inspect(db.bind)
+                if "shipment_records" not in inspector.get_table_names():
+                    return []
+
+                records = (
+                    db.query(ShipmentRecord)
+                    .filter(
+                        (ShipmentRecord.purchase_unit.like(f"%{query_str}%"))
+                        | (ShipmentRecord.product_name.like(f"%{query_str}%"))
+                        | (ShipmentRecord.model_number.like(f"%{query_str}%"))
+                    )
+                    .order_by(ShipmentRecord.created_at.desc())
+                    .limit(50)
+                    .all()
+                )
+
+                return [_record_to_dict(record) for record in records]
+        except _QUERY_ERRORS:
+            return []
+
+    def get_shipment_by_id(self, order_id: str) -> dict[str, Any] | None:
+        try:
+            if order_id is None:
+                return None
+
+            order_id_str = str(order_id).strip()
+            if not order_id_str:
+                return None
+
+            shipment_id = int(order_id_str)
+
+            with get_db() as db:
+                inspector = sa_inspect(db.bind)
+                if "shipment_records" not in inspector.get_table_names():
+                    return None
+
+                record = db.query(ShipmentRecord).filter(ShipmentRecord.id == shipment_id).first()
+                if not record:
+                    return None
+
+                return _record_to_dict(record)
+        except _QUERY_ERRORS:
+            return None
+
+    def get_latest_shipments(self, limit: int) -> list[dict[str, Any]]:
+        try:
+            safe_limit = int(limit or 0)
+            if safe_limit <= 0:
+                return []
+
+            with get_db() as db:
+                inspector = sa_inspect(db.bind)
+                if "shipment_records" not in inspector.get_table_names():
+                    return []
+
+                records = (
+                    db.query(ShipmentRecord)
+                    .order_by(ShipmentRecord.created_at.desc(), ShipmentRecord.id.desc())
+                    .limit(safe_limit)
+                    .all()
+                )
+
+                return [_record_to_dict(record) for record in records]
+        except _QUERY_ERRORS:
+            return []
+
+    def get_shipment_records(
+        self,
+        unit_name: str | None = None,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """
+        后台管理接口使用的列表查询：
+        - unit_name: 可选，支持 resolve_purchase_unit 归一 + fuzzy fallback。
+        - limit: 默认 100（与旧实现一致）。
+        """
+        try:
+            safe_limit = int(limit or 0)
+            if safe_limit <= 0:
+                safe_limit = 100
+
+            with get_db() as db:
+                inspector = sa_inspect(db.bind)
+                if "shipment_records" not in inspector.get_table_names():
+                    return []
+
+                query = db.query(ShipmentRecord)
+
+                if unit_name:
+                    canonical_unit = str(unit_name or "").strip()
+                    try:
+                        resolved = resolve_purchase_unit(canonical_unit)
+                        if resolved:
+                            canonical_unit = str(resolved.unit_name or "").strip()
+                    except RECOVERABLE_ERRORS:
+                        logger.debug("suppressed exception", exc_info=True)
+
+                    records_exact = (
+                        query.filter(ShipmentRecord.purchase_unit == canonical_unit)
+                        .order_by(ShipmentRecord.created_at.desc())
+                        .limit(safe_limit)
+                        .all()
+                    )
+
+                    if records_exact:
+                        records = records_exact
+                    else:
+                        # 增加 strip 后精确兜底，兼容历史脏数据（单位首尾空格）
+                        records_strip_exact = (
+                            query.filter(ShipmentRecord.purchase_unit.isnot(None))
+                            .filter(
+                                ShipmentRecord.purchase_unit.in_(
+                                    [canonical_unit, f"{canonical_unit} "]
+                                )
+                            )
+                            .order_by(ShipmentRecord.created_at.desc())
+                            .limit(safe_limit)
+                            .all()
+                        )
+                        if records_strip_exact:
+                            records = records_strip_exact
+                        else:
+                            # fuzzy fallback：把历史上不一致的 purchase_unit 归一再匹配
+                            memo: dict[str, str | None] = {}
+
+                            def norm(val: str) -> str | None:
+                                if val in memo:
+                                    return memo[val]
+                                try:
+                                    r = resolve_purchase_unit(str(val or "").strip())
+                                    memo[val] = str(r.unit_name or "").strip() if r else None
+                                except RECOVERABLE_ERRORS:
+                                    memo[val] = None
+                                return memo[val]
+
+                            candidates = db.query(ShipmentRecord.purchase_unit).distinct().all()
+                            candidate_values: list[str] = []
+                            for (v,) in candidates:
+                                if not v:
+                                    continue
+                                if norm(v) == canonical_unit:
+                                    candidate_values.append(v)
+
+                            if candidate_values:
+                                records = (
+                                    query.filter(ShipmentRecord.purchase_unit.in_(candidate_values))
+                                    .order_by(ShipmentRecord.created_at.desc())
+                                    .limit(safe_limit)
+                                    .all()
+                                )
+                            else:
+                                records = []
+                else:
+                    records = (
+                        query.order_by(ShipmentRecord.created_at.desc()).limit(safe_limit).all()
+                    )
+
+                shipment_inspect = sa_inspect(ShipmentRecord)
+                rows: list[dict[str, Any]] = []
+                for record in records:
+                    row_dict: dict[str, Any] = {}
+                    for column in shipment_inspect.columns:
+                        row_dict[column.name] = getattr(record, column.name)
+                    rows.append(row_dict)
+
+                return rows
+        except RECOVERABLE_ERRORS:
+            return []

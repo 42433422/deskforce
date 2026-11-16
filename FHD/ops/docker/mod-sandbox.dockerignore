@@ -1,0 +1,26 @@
+# From repository root (e.g. E:\FHD):
+#   docker build --ignorefile docker/mod-sandbox.dockerignore -f docker/Dockerfile.mod-sandbox -t xcagi-mod-sandbox .
+# Shrinks build context and keeps frontend / MODstore / docs out of the image build.
+
+.git
+.github
+.cursor
+.archive
+frontend
+MODstore
+docs
+tests
+**/__pycache__
+**/*.pyc
+**/*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.venv
+venv
+node_modules
+*.md
+!**/README.md
+
+# The sandbox loads the application factory directly from FHD/app.
+XCAGI

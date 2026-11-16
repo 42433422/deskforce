@@ -1,0 +1,532 @@
+<template>
+  <div class="main-container">
+    <div class="sidebar-shell" :class="{ collapsed: sidebarCollapsed }" :style="sidebarShellStyle" @mouseenter="onSidebarMouseEnter">
+      <Sidebar :active-view="displayedActiveView" @change-view="handleViewChange" />
+      <PaneResizeHandle
+        v-if="isSidebarFeatureEnabled && !sidebarCollapsed"
+        orientation="vertical"
+        label="调整侧边栏宽度"
+        @resize-start="onSidebarResizeStart"
+        @reset="resetSidebarWidth"
+      />
+    </div>
+    <div
+      v-if="isSidebarFeatureEnabled && sidebarCollapsed"
+      class="sidebar-hover-trigger"
+      @mouseenter="onHoverTriggerEnter"
+      @mouseleave="onHoverTriggerLeave"
+    >
+      <button class="sidebar-peek-button" type="button" aria-label="展开侧边栏" title="展开侧边栏" @click="onHoverTriggerClick">▶</button>
+    </div>
+    <div class="main-content">
+      <div v-if="isImpersonating" class="impersonate-bar" role="status">
+        <span class="impersonate-bar__text">
+          正在代管：<strong>{{ impersonationLabel }}</strong>
+        </span>
+        <button type="button" class="impersonate-bar__end" :disabled="endingImpersonation" @click="endImpersonation">
+          {{ endingImpersonation ? '结束中…' : '结束代管' }}
+        </button>
+      </div>
+      <div class="top-bar">
+        <div class="page-title-wrap">
+          <div class="page-kicker">{{ topKickerText }}</div>
+          <div class="page-title">{{ currentViewTitle }}</div>
+          <div v-if="accountUsername && displayBrand" class="page-account-sub muted">
+            {{ accountUsername }}
+          </div>
+        </div>
+        <TopQuickNav @select="handleViewChange" />
+        <div class="top-bar-actions">
+          <button
+            type="button"
+            class="top-bar-settings-btn"
+            :class="{ active: currentRouteName === 'settings' }"
+            aria-label="系统设置"
+            title="系统设置"
+            data-tutorial-id="top-bar-settings"
+            @click="openSettings"
+          >
+            <i class="fa fa-cog" aria-hidden="true"></i>
+          </button>
+          <TopAssistantFloat />
+          <GlobalTaskCenter />
+        </div>
+      </div>
+      <div class="route-content" :aria-busy="pendingSidebarView ? 'true' : undefined">
+        <RouteLoadingFeedback :key="pendingSidebarView || failedSidebarView" :active="!!pendingSidebarView" :failed="!!failedSidebarView" :stage="pendingViewStage" class="route-nav-feedback" data-testid="route-nav-feedback" @retry="handleViewChange(failedSidebarView)" />
+        <div v-show="!pendingSidebarView" class="route-content-slot">
+          <slot></slot>
+        </div>
+      </div>
+    </div>
+    <DocumentPreviewPictureInPicture />
+    <FloatingChatAssistant :visible="shouldShowFloatingChatAssistant" :male-avatar="adminConsoleSpa" />
+    <VirtualCursor />
+    <OnboardingTutorial />
+    <TutorialOverlay v-if="!onboardingTutorialStore.active" />
+    <TutorialTrainingCoach />
+    <MobileBottomNav v-if="mobileBottomNavVisible" />
+  </div>
+</template>
+
+<script setup>
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { storeToRefs } from 'pinia'
+import { useRoute, useRouter } from 'vue-router'
+import { useIndustryStore } from '@/stores/industry'
+import { useModsStore } from '@/stores/mods'
+import { useAccountProfileStore } from '@/stores/accountProfile'
+import { xcmaxAdminApi } from '@/api/xcmaxAdmin'
+import { LS_MARKET_USER_JSON } from '@/api/marketAccount'
+import { isAdminConsoleSpa as detectAdminConsoleSpa } from '@/utils/adminConsoleUrl'
+import { ADMIN_OPERATOR_BRAND_SUBTITLE } from '@/constants/adminOperatorNav'
+import { appAlert } from '@/utils/appDialog'
+import { useResizablePane } from '@/composables/useResizablePane'
+import { DEFAULT_INDUSTRY_ID } from '@/constants/industryDefaults'
+import { getIndustryPreset } from '@/constants/industryPresets'
+import { resolveCoreNavLabel, INDUSTRY_MENU_LABELS, MENU_DEFAULT_NAMES } from '@/utils/coreNavLabel'
+import { isChatSidebarActive, normalizeSidebarActiveKey } from '@/utils/sidebarActiveKey'
+import { SIDEBAR_ROUTE_NAME_MAP } from '@/constants/sidebarRouteNameMap'
+import { isUnmatchedRoute, routeChunkErrorPath } from '@/utils/routeLoadState'
+import { navigateFromSidebarKey } from '@/utils/sidebarNavigation'
+import { clearAppNavIntentIfCurrent, getActiveAppNavIntent } from '@/utils/appNavigation'
+import RouteLoadingFeedback from './shell/RouteLoadingFeedback.vue'
+import { useModRoutes } from '@/composables/useModRoutes'
+import FloatingChatAssistant from './FloatingChatAssistant.vue'
+import { voiceCallActive } from '@/composables/voiceCallHost'
+import DocumentPreviewPictureInPicture from './DocumentPreviewPictureInPicture.vue'
+import PaneResizeHandle from './PaneResizeHandle.vue'
+import Sidebar from './Sidebar.vue'
+import TopAssistantFloat from './TopAssistantFloat.vue'
+import TopQuickNav from './TopQuickNav.vue'
+import TutorialOverlay from './TutorialOverlay.vue'
+import VirtualCursor from './VirtualCursor.vue'
+import OnboardingTutorial from './OnboardingTutorial.vue'
+import TutorialTrainingCoach from './tutorial/TutorialTrainingCoach.vue'
+import MobileBottomNav from './MobileBottomNav.vue'
+import GlobalTaskCenter from './task-center/GlobalTaskCenter.vue'
+import { useOnboardingTutorialStore } from '@/stores/onboardingTutorial'
+import { useTutorialStore } from '@/stores/tutorial'
+import { setTutorialBuildContextFactory } from '@/stores/tutorial'
+import { useTutorialCatalog } from '@/composables/useTutorialCatalog'
+import { documentPreviewPip } from '@/state/documentPreviewPip'
+const route = useRoute()
+const router = useRouter()
+const onboardingTutorialStore = useOnboardingTutorialStore()
+const tutorialStore = useTutorialStore()
+const { active: onboardingTutorialActive } = storeToRefs(onboardingTutorialStore)
+const { isActive: legacyTutorialActive } = storeToRefs(tutorialStore)
+const isAnyTutorialActive = computed(() => onboardingTutorialActive.value || legacyTutorialActive.value)
+const industryStore = useIndustryStore()
+const modsStore = useModsStore()
+const accountProfileStore = useAccountProfileStore()
+const { modsForUi } = storeToRefs(modsStore)
+const { displayBrand, isImpersonating, impersonatingUsername, companyBrand } = storeToRefs(accountProfileStore)
+const endingImpersonation = ref(false)
+const { modMenuItems } = useModRoutes()
+const SIDEBAR_INACTIVITY_MS = 15000
+const SIDEBAR_HOVER_OPEN_MS = 1000
+const SIDEBAR_DISABLE_MQ = '(max-width: 767px)'
+const MOBILE_BOTTOM_NAV_MQ = '(max-width: 768px)'
+const SIDEBAR_PANE_KEY = 'main-layout.sidebar'
+const ACTIVITY_EVENTS = ['mousemove', 'mousedown', 'keydown', 'wheel', 'touchstart']
+const sidebarCollapsed = ref(false)
+const isSidebarFeatureEnabled = ref(true)
+let sidebarCollapseTimer = null
+let sidebarHoverTimer = null
+let sidebarViewportMedia = null
+const showMobileBottomNav = ref(false)
+let mobileBottomNavMedia = null
+let layoutActive = true
+const adminConsoleSpa = detectAdminConsoleSpa()
+
+const { buildContext: tutorialBuildContext } = useTutorialCatalog()
+setTutorialBuildContextFactory(() => tutorialBuildContext.value)
+
+const workbenchKicker = computed(() => {
+  const id = String(industryStore.currentIndustryId || DEFAULT_INDUSTRY_ID).trim() || DEFAULT_INDUSTRY_ID
+  const name = getIndustryPreset(id).name
+  return `${name}工作台`
+})
+
+const topKickerText = computed(() => {
+  if (adminConsoleSpa) return ADMIN_OPERATOR_BRAND_SUBTITLE
+  const brand = String(displayBrand.value || '').trim()
+  if (brand) return brand
+  return workbenchKicker.value
+})
+
+const accountUsername = computed(() => {
+  try {
+    const raw = window.localStorage.getItem(LS_MARKET_USER_JSON)
+    if (!raw) return ''
+    const u = JSON.parse(raw)
+    return String(u?.username || '').trim()
+  } catch {
+    return ''
+  }
+})
+
+const impersonationLabel = computed(() => {
+  const brand = String(companyBrand.value || '').trim()
+  if (brand) return brand
+  const user = String(impersonatingUsername.value || '').trim()
+  return user || '目标用户'
+})
+
+async function endImpersonation() {
+  endingImpersonation.value = true
+  try {
+    await xcmaxAdminApi.endImpersonate()
+    await accountProfileStore.refreshFromServer()
+    try {
+      await modsStore.initialize(true)
+    } catch {
+      /* ignore */
+    }
+    window.location.reload()
+  } catch (e) {
+    await appAlert(`结束代管失败：${e instanceof Error ? e.message : String(e)}`)
+  } finally {
+    endingImpersonation.value = false
+  }
+}
+
+const modPathToSidebarKey = computed(() => {
+  const m = {}
+  for (const item of modMenuItems.value) {
+    if (item.path) m[item.path] = item.key
+  }
+  return m
+})
+
+const viewTitlesBase = {
+  ...MENU_DEFAULT_NAMES,
+  'admin-entitlements': '账号权益',
+  'xcmax-admin': '服务器后台总览',
+  'delivery-center': '客户交付中心',
+  'automation-policy': '自动化方针',
+  'duty-time-architecture': '同时完成时间架构',
+  'duty-roster-graph': '员工可视化',
+  'server-functions': '服务器功能模块',
+}
+
+const routeNameMap = SIDEBAR_ROUTE_NAME_MAP
+const UNMATCHED_ROUTE_KEY = '__route-not-found__'
+
+const currentRouteName = computed(() => {
+  // 无匹配页面时不回落成「对话」高亮，避免空白页被误认成运维对话
+  if (isUnmatchedRoute(route)) return UNMATCHED_ROUTE_KEY
+  const modKey = modPathToSidebarKey.value[route.path]
+  let raw = modKey || routeNameMap[route.path] || ''
+  if (!raw) {
+    for (const matched of [...route.matched].reverse()) {
+      if (matched.path && routeNameMap[matched.path]) {
+        raw = routeNameMap[matched.path]
+        break
+      }
+    }
+  }
+  if (!raw) raw = String(route.name || '') || 'chat'
+  return normalizeSidebarActiveKey(raw, route)
+})
+
+/** Optimistic sidebar highlight: paint target immediately while router/chunk catches up. */
+const pendingSidebarView = ref('')
+const failedSidebarView = ref('')
+let routeNavGeneration = 0
+const displayedActiveView = computed(() => currentRouteName.value)
+
+function syncPendingSidebarWithRoute() {
+  if (!pendingSidebarView.value) return
+  if (pendingSidebarView.value === currentRouteName.value || routeChunkErrorPath.value) {
+    pendingSidebarView.value = ''
+  }
+}
+
+function syncAppNavIntentWithRoute() {
+  const intent = getActiveAppNavIntent()
+  if (!intent) return
+  // Browser back/forward or external redirect landed on the intended page — release intent.
+  const key = String(intent.targetKey || '').replace(/^mod-/, '')
+  const current = String(currentRouteName.value || '').replace(/^mod-/, '')
+  if (key && current && (key === current || current.includes(key) || key.includes(current))) {
+    clearAppNavIntentIfCurrent(intent.id)
+  }
+}
+
+// Real route settlement: bump generation so in-flight sidebar UI cannot overwrite the landed page.
+watch([() => route.fullPath, routeChunkErrorPath], () => {
+  routeNavGeneration++
+  pendingSidebarView.value = ''
+  failedSidebarView.value = ''
+  syncAppNavIntentWithRoute()
+}, { flush: 'sync' })
+
+watch(currentRouteName, () => {
+  syncPendingSidebarWithRoute()
+  syncAppNavIntentWithRoute()
+})
+
+/** 对话与信息页收起悬浮入口，避免遮挡客服和员工的输入工具条；通话中必须保留，否则静音/挂断会丢失。 */
+const shouldShowFloatingChatAssistant = computed(() => voiceCallActive.value || (!isChatSidebarActive(currentRouteName.value, route) && currentRouteName.value !== 'im' && !documentPreviewPip.visible))
+
+const {
+  paneStyle: sidebarShellStyle,
+  resetSize: resetSidebarWidth,
+  startResize: onSidebarResizeStart,
+  stopResize: stopSidebarResize,
+} = useResizablePane({
+  paneKey: SIDEBAR_PANE_KEY,
+  cssVarName: '--sidebar-width',
+  orientation: 'vertical',
+  defaultSize: 236,
+  minSize: 220,
+  maxSize: 360,
+  enabled: () => isSidebarFeatureEnabled.value && !sidebarCollapsed.value,
+  onResizeStart: () => {
+    clearSidebarCollapseTimer()
+    clearSidebarHoverTimer()
+  },
+  onResizeEnd: () => {
+    if (isSidebarFeatureEnabled.value && !sidebarCollapsed.value) {
+      scheduleSidebarAutoCollapse()
+    }
+  },
+})
+
+/** 顶栏与页面标题：仅核心 + 行业（与侧栏 resolveCoreNavLabel / INDUSTRY_MENU_LABELS 同源），不含 Mod menu_overrides */
+const viewTitles = computed(() => {
+  const industryId = String(industryStore.currentIndustryId || DEFAULT_INDUSTRY_ID)
+  const byIndustry = INDUSTRY_MENU_LABELS[industryId] || INDUSTRY_MENU_LABELS[DEFAULT_INDUSTRY_ID]
+  return {
+    ...viewTitlesBase,
+    ...byIndustry,
+  }
+})
+
+const currentViewTitle = computed(() => {
+  const key = pendingSidebarView.value || currentRouteName.value
+  if (key === UNMATCHED_ROUTE_KEY) return '页面不存在'
+  const industryId = String(industryStore.currentIndustryId || DEFAULT_INDUSTRY_ID)
+  const fromNav = resolveCoreNavLabel(key, industryId, modsForUi.value)
+  if (fromNav) return fromNav
+  const fromMap = viewTitles.value[key]
+  if (typeof fromMap === 'string' && fromMap.trim()) return fromMap
+  const metaTitle = route.meta?.title
+  if (typeof metaTitle === 'string' && metaTitle.trim()) return metaTitle
+  return '未知页面'
+})
+const pendingViewStage = computed(() => {
+  const key = pendingSidebarView.value
+  const title = resolveCoreNavLabel(key, industryStore.currentIndustryId || DEFAULT_INDUSTRY_ID, modsForUi.value) || viewTitles.value[key]
+  return title ? `正在打开「${title}」` : '正在打开页面'
+})
+
+async function navigateToView(viewKey, source = 'shell') {
+  const normalized = String(viewKey || '').trim()
+  if (!normalized) return
+  // Same target while already pending: ignore duplicate click noise.
+  // Same target after failure: allow retry (failedSidebarView is set, pending cleared).
+  if (pendingSidebarView.value === normalized && !failedSidebarView.value) return
+  const generation = ++routeNavGeneration
+  // Optimistic: highlight immediately so cold chunk / mod-route wait does not look like a dead click.
+  pendingSidebarView.value = normalized
+  failedSidebarView.value = ''
+  try {
+    const applied = await navigateFromSidebarKey(router, normalized, {
+      modMenuItems: modMenuItems.value,
+      routeNameMap,
+      getModRoutes: () => modsStore.modRoutes,
+      source,
+    })
+    if (!applied && generation === routeNavGeneration && !routeChunkErrorPath.value) {
+      // Not applied and still current: either superseded race lost (shouldn't with matching gen)
+      // or target unresolved — show retry.
+      failedSidebarView.value = normalized
+    }
+  } catch (error) {
+    if (generation === routeNavGeneration && !routeChunkErrorPath.value) {
+      failedSidebarView.value = normalized
+      console.warn('[MainLayout] 页面切换失败', error)
+    }
+  } finally {
+    // Never let an older request clear a newer pending highlight.
+    if (generation === routeNavGeneration) {
+      pendingSidebarView.value = ''
+    }
+  }
+}
+
+const handleViewChange = (viewKey) => {
+  // Fire-and-forget: do not serialize UI behind a prior slow navigate promise.
+  void navigateToView(viewKey, 'sidebar-or-quicknav')
+}
+
+function openSettings() {
+  // Share the same intent channel as sidebar / ecosystem so races invalidate correctly.
+  void navigateToView('settings', 'top-settings')
+}
+
+const clearSidebarCollapseTimer = () => {
+  if (sidebarCollapseTimer) {
+    window.clearTimeout(sidebarCollapseTimer)
+    sidebarCollapseTimer = null
+  }
+}
+
+const clearSidebarHoverTimer = () => {
+  if (sidebarHoverTimer) {
+    window.clearTimeout(sidebarHoverTimer)
+    sidebarHoverTimer = null
+  }
+}
+
+const ensureSidebarExpandedForTutorial = () => {
+  clearSidebarCollapseTimer()
+  clearSidebarHoverTimer()
+  if (isSidebarFeatureEnabled.value) {
+    sidebarCollapsed.value = false
+  }
+}
+
+const scheduleSidebarAutoCollapse = () => {
+  clearSidebarCollapseTimer()
+  if (document.documentElement.classList.contains('xcagi-electron')) return void (sidebarCollapsed.value = false)
+  if (isAnyTutorialActive.value) return
+  if (!isSidebarFeatureEnabled.value || sidebarCollapsed.value) return
+  sidebarCollapseTimer = window.setTimeout(() => {
+    if (isAnyTutorialActive.value) return
+    sidebarCollapsed.value = true
+  }, SIDEBAR_INACTIVITY_MS)
+}
+watch(isAnyTutorialActive, (active) => {
+  if (active) {
+    ensureSidebarExpandedForTutorial()
+    return
+  }
+  if (isSidebarFeatureEnabled.value && !sidebarCollapsed.value) {
+    scheduleSidebarAutoCollapse()
+  }
+})
+
+const handleGlobalActivity = () => {
+  if (!isSidebarFeatureEnabled.value) return
+  if (sidebarCollapsed.value) return
+  scheduleSidebarAutoCollapse()
+}
+
+const onSidebarMouseEnter = () => {
+  handleGlobalActivity()
+}
+
+const onHoverTriggerEnter = () => {
+  if (!isSidebarFeatureEnabled.value || !sidebarCollapsed.value) return
+  clearSidebarHoverTimer()
+  sidebarHoverTimer = window.setTimeout(() => {
+    sidebarCollapsed.value = false
+    scheduleSidebarAutoCollapse()
+  }, SIDEBAR_HOVER_OPEN_MS)
+}
+
+const onHoverTriggerLeave = () => {
+  clearSidebarHoverTimer()
+}
+
+const onHoverTriggerClick = () => {
+  clearSidebarHoverTimer()
+  sidebarCollapsed.value = false
+  scheduleSidebarAutoCollapse()
+}
+
+const onViewportChange = (event) => {
+  const matches = Boolean(event?.matches)
+  isSidebarFeatureEnabled.value = !matches
+  clearSidebarHoverTimer()
+  clearSidebarCollapseTimer()
+  if (!isSidebarFeatureEnabled.value) {
+    sidebarCollapsed.value = false
+    stopSidebarResize()
+    return
+  }
+  scheduleSidebarAutoCollapse()
+}
+
+const onMobileNavViewportChange = (event) => {
+  showMobileBottomNav.value = Boolean(event?.matches)
+}
+
+const mobileBottomNavVisible = computed(() => showMobileBottomNav.value && !adminConsoleSpa && route.meta?.hideChrome !== true)
+
+onMounted(async () => {
+  if (!accountProfileStore.loaded) {
+    try {
+      await accountProfileStore.refreshFromServer()
+    } catch {
+      /* ignore */
+    }
+  }
+  if (!industryStore.isLoaded) {
+    try {
+      await industryStore.initialize()
+    } catch (_e) {
+      // 行业信息加载失败时，顶部标题保持默认文案
+    }
+  }
+  if (!layoutActive || typeof window === 'undefined') return
+  sidebarViewportMedia = window.matchMedia?.(SIDEBAR_DISABLE_MQ) ?? null
+  if (sidebarViewportMedia) {
+    onViewportChange(sidebarViewportMedia)
+    if (typeof sidebarViewportMedia.addEventListener === 'function') {
+      sidebarViewportMedia.addEventListener('change', onViewportChange)
+    } else if (typeof sidebarViewportMedia.addListener === 'function') {
+      sidebarViewportMedia.addListener(onViewportChange)
+    }
+  }
+  mobileBottomNavMedia = window.matchMedia?.(MOBILE_BOTTOM_NAV_MQ) ?? null
+  if (mobileBottomNavMedia) {
+    onMobileNavViewportChange(mobileBottomNavMedia)
+    if (typeof mobileBottomNavMedia.addEventListener === 'function') {
+      mobileBottomNavMedia.addEventListener('change', onMobileNavViewportChange)
+    } else if (typeof mobileBottomNavMedia.addListener === 'function') {
+      mobileBottomNavMedia.addListener(onMobileNavViewportChange)
+    }
+  }
+  ACTIVITY_EVENTS.forEach((eventName) => {
+    window.addEventListener(eventName, handleGlobalActivity, { passive: true })
+  })
+})
+
+onBeforeUnmount(() => {
+  layoutActive = false
+  stopSidebarResize()
+  clearSidebarHoverTimer()
+  clearSidebarCollapseTimer()
+  ACTIVITY_EVENTS.forEach((eventName) => {
+    window.removeEventListener(eventName, handleGlobalActivity)
+  })
+  if (sidebarViewportMedia) {
+    if (typeof sidebarViewportMedia.removeEventListener === 'function') {
+      sidebarViewportMedia.removeEventListener('change', onViewportChange)
+    } else if (typeof sidebarViewportMedia.removeListener === 'function') {
+      sidebarViewportMedia.removeListener(onViewportChange)
+    }
+  }
+  if (mobileBottomNavMedia) {
+    if (typeof mobileBottomNavMedia.removeEventListener === 'function') {
+      mobileBottomNavMedia.removeEventListener('change', onMobileNavViewportChange)
+    } else if (typeof mobileBottomNavMedia.removeListener === 'function') {
+      mobileBottomNavMedia.removeListener(onMobileNavViewportChange)
+    }
+  }
+})
+</script>
+
+<style scoped src="./main-layout/main-layout.css"></style>
+
+<style scoped src="./MainLayoutActions.css"></style>
+
+<style scoped>
+/* .route-content-slot 必须同约束：否则被页面内容撑高，视口底部的输入区会被推出屏外。 */
+.route-content, .route-content-slot { display: flex; flex: 1 1 auto; flex-direction: column; min-height: 0; min-width: 0; overflow: hidden; }
+</style>

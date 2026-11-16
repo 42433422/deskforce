@@ -1,0 +1,79 @@
+"""Tests for app.fastapi_routes.domains.excel.excel_extract — pure helper functions."""
+
+from __future__ import annotations
+
+import os
+import tempfile
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from app.fastapi_routes.domains.excel.excel_extract import (
+    TEMP_EXCEL_DIR,
+    _extract_from_excel,
+    _generate_excel,
+)
+
+
+@pytest.fixture(autouse=True)
+def _configured_etl_workspace(tmp_path, monkeypatch):
+    """Keep test workbooks within an explicitly configured, narrow workspace."""
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    named_temporary_file = tempfile.NamedTemporaryFile
+
+    def named_file_in_workspace(*args, **kwargs):
+        kwargs.setdefault("dir", tmp_path)
+        return named_temporary_file(*args, **kwargs)
+
+    monkeypatch.setattr(tempfile, "NamedTemporaryFile", named_file_in_workspace)
+    managed_temp_root = tmp_path / "managed-temp-excel"
+    managed_temp_root.mkdir()
+    monkeypatch.setattr("app.fastapi_routes.excel_extract.TEMP_EXCEL_DIR", str(managed_temp_root))
+
+
+# ========================= _extract_from_excel ===========================
+
+
+class TestExtractFromExcel:
+    def test_file_not_found(self):
+        result, status = _extract_from_excel("/nonexistent/file.xlsx")
+        assert status == 404
+        assert result["success"] is False
+
+    def test_extract_basic(self):
+        """Test extraction from a real xlsx file."""
+        from openpyxl import Workbook
+
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Sheet1"
+            ws.append(["Name", "Age"])
+            ws.append(["Alice", 30])
+            ws.append(["Bob", 25])
+            wb.save(f.name)
+            path = f.name
+
+        try:
+            result, status = _extract_from_excel(path)
+            assert status == 200
+            assert result["success"] is True
+            assert result["total_rows"] == 2
+            assert len(result["headers"]) == 2
+        finally:
+            os.unlink(path)
+
+
+# ========================= _generate_excel ===============================
+
+
+class TestGenerateExcel:
+    def test_empty_data(self):
+        result, status = _generate_excel([])
+        assert status == 400
+        assert result["success"] is False
+
+    def test_invalid_data(self):
+        result, status = _generate_excel("not a list")
+        assert status == 400
+        assert result["success"] is False

@@ -1,0 +1,100 @@
+id: site-content-editor
+name: 静态站内容编辑员
+version: "1.0.0"
+domain: 维护 xiu-ci.com 营销静态页面的内容、文案、图片引用与数据 JSON；不涉及服务器配置或后端逻辑。
+owner: admin
+area: site-and-marketing
+
+scope_globs:
+  - ./developer.html
+  - ./download-release.json
+  - ./index.html
+  - ./about.html
+  - ./cases.html
+  - ./services.html
+  - ./solutions.html
+  - ./news.html
+  - ./contact.html
+  - ./honors.html
+  - ./case-edu.html
+  - ./case-manufacture.html
+  - ./case-park.html
+  - ./excel-to-ai.html
+  - ./styles.css
+  - ./main.js
+  - ./news.json
+  - ./activities.json
+  - ./privacy.html
+  - ./assets/**
+  - corp-butler/**/*.html
+  - corp-butler/**/*.js
+  - corp-butler/**/*.css
+  - corp-butler/**/*.jpg
+  - corp-butler/**/*.json
+  # 根 Vite 工具链（与 MODstore_deploy/market 是两套，不要混用）
+  - ./src/**
+  - ./package.json
+  - ./package-lock.json
+  - ./vite.config.ts
+  - ./tsconfig.json
+  - ./tsconfig.node.json
+  - ./tsconfig.strict.json
+  - ./tsconfig.strict-baseline.json
+  - ./eslint.config.js
+  - ./.prettierrc
+  - ./.prettierignore
+  - ./env.d.ts
+
+forbidden_globs:
+  - app.py
+  - requirements.txt
+  - nginx-*.conf
+  - MODstore_deploy/**
+  - vibe-coding/**
+  - _local_secrets/**
+  - deploy/**
+  - docker/**
+  - sitemap.xml             # 归 seo-sitemap-curator
+  - robots.txt              # 归 seo-sitemap-curator
+
+triggers:
+  on_error: true
+  on_quality_fail: true
+  on_coverage_miss: false
+  max_patch_budget_tokens: 3000
+  max_patch_steps: 4
+
+sla:
+  timeout_seconds: 90
+  retry_max: 2
+  escalate_to_human: true
+
+llm_default: "auto"
+llm_reasoning: "auto"
+
+capabilities:
+  - static.page.update
+
+skills:
+  - skills/skill-static-page-update.md
+
+actions:
+  handlers: ["agent"]
+  agent:
+    workspace:
+      read_only: false
+      requires_project_root: true
+
+depends_on: []
+
+examples:
+  - title: "静态站内容编辑员岗位验收"
+    description: "以最小、无副作用输入验证岗位输出包含真实证据、风险与下一步。"
+    input:
+      task: "执行一次静态站内容编辑员职责范围内的只读检查，并返回证据、风险和下一步。"
+      dry_run: true
+
+changelog:
+  - version: "1.0.0"
+    date: "2026-05-06"
+    note: "初始创建"

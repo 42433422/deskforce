@@ -1,0 +1,135 @@
+# CI SSOT: edit this file, then run: python scripts/dev/publish_ci_workflows_to_root.py
+name: Fix macOS update feed
+on:
+  workflow_dispatch:
+    inputs:
+      version: {description: Four-part frozen version, required: true, type: string}
+      build_sha: {description: Exact main commit of BOTH candidates, required: true, type: string}
+      arm64_run_id: {description: Successful native ARM candidate run, required: true, type: string}
+      x64_run_id: {description: Successful native Intel candidate run, required: true, type: string}
+      publish: {description: Requires explicit release-owner SHA authorization, default: false, type: boolean}
+      security_scan_run_id: {description: Current exact-SHA full security scan, required: false, type: string}
+      previous_security_scan_run_id: {description: Prior-day exact-SHA full security scan, required: false, type: string}
+permissions: {actions: read, contents: read}
+defaults:
+  run:
+    working-directory: FHD
+jobs:
+  frozen-pair:
+    runs-on: macos-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BUILD_SHA: ${{ inputs.build_sha }}
+      PRODUCT_VERSION: ${{ inputs.version }}
+      ARM_RUN: ${{ inputs.arm64_run_id }}
+      X64_RUN: ${{ inputs.x64_run_id }}
+      XCAGI_UPDATE_ED25519_PRIVATE_KEY: ${{ secrets.XCAGI_UPDATE_ED25519_PRIVATE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: '${{ inputs.build_sha }}'}
+      - uses: actions/setup-python@v7
+        with: {python-version: '3.12'}
+      - name: Validate main identity and publication authorization
+        env:
+          PUBLISH: ${{ inputs.publish }}
+          AUTHORIZED_SHA: ${{ vars.MACOS_FROZEN_PAIR_AUTHORIZED_SHA }}
+          ENABLED: ${{ vars.MACOS_FROZEN_PAIR_PUBLICATION_ENABLED }}
+          RELEASE_PROTECTION_TOKEN: ${{ secrets.RELEASE_PROTECTION_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ "$BUILD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$PRODUCT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$ARM_RUN" =~ ^[1-9][0-9]*$ && "$X64_RUN" =~ ^[1-9][0-9]*$ ]]
+          test "$ARM_RUN" != "$X64_RUN"
+          test "$(git rev-parse HEAD)" = "$BUILD_SHA"
+          relation="$(gh api "repos/$GITHUB_REPOSITORY/compare/$BUILD_SHA...main" --jq .status)"; case "$relation" in ahead|identical) ;; *) exit 1 ;; esac
+          if [ "$PUBLISH" = true ]; then
+            test "$ENABLED" = true
+            test "$AUTHORIZED_SHA" = "$BUILD_SHA"
+            protection="$(GH_TOKEN="${RELEASE_PROTECTION_TOKEN:?Admin-read protection token required}" gh api "repos/$GITHUB_REPOSITORY/branches/main/protection/required_status_checks")"
+            checks="$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/commits/$BUILD_SHA/check-runs?per_page=100")"
+            statuses="$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/commits/$BUILD_SHA/statuses?per_page=100")"
+            export protection checks statuses
+            python - <<'PY'
+          import json, os
+          p,c,s=(json.loads(os.environ[n]) for n in ('protection','checks','statuses'))
+          required=set(p.get('contexts',[]))|{v['context'] for v in p.get('checks',[])}
+          assert required, 'Readable protected checks required'
+          for name in required:
+              runs=sorted((v for page in c for v in page['check_runs'] if v['name']==name),key=lambda v:v['id'])
+              states=sorted((v for page in s for v in page if v['context']==name),key=lambda v:v['id'])
+              assert (runs[-1]['conclusion']=='success' if runs else bool(states and states[-1]['state']=='success')), name
+          PY
+          fi
+      - name: Retrieve immutable native run and artifact identities
+        run: |
+          set -euo pipefail
+          export PAIR_ROOT="$RUNNER_TEMP/frozen-mac-pair" PAIR_OUTPUT="$RUNNER_TEMP/frozen-mac-pair-output"
+          printf 'PAIR_ROOT=%s\nPAIR_OUTPUT=%s\n' "$PAIR_ROOT" "$PAIR_OUTPUT" >> "$GITHUB_ENV"
+          mkdir -p "$PAIR_ROOT"
+          for spec in "arm64:$ARM_RUN" "x64:$X64_RUN"; do
+            arch="${spec%%:*}"; run="${spec##*:}"; dest="$PAIR_ROOT/$arch"; mkdir "$dest"
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run" > "$dest/run.json"
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run/jobs?per_page=100" > "$dest/jobs.json"
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run/artifacts?per_page=100" --jq \
+              ".artifacts | map(select(.name == \"mac-acceptance-$BUILD_SHA-$arch\" and .expired == false)) | if length == 1 then .[0] else error(\"unique candidate artifact required\") end" > "$dest/artifact.json"
+            id="$(jq -er .id "$dest/artifact.json")"
+            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > "$dest/artifact.zip"
+          done
+      - name: Validate original bytes and generate pair metadata offline
+        run: |
+          set -euo pipefail
+          pip install --quiet cryptography PyYAML
+          export XCAGI_UPDATE_ED25519_PUBLIC_KEY="$(python -c 'from scripts.release.prepare_mac_candidate_pair import desktop_public_key; print(desktop_public_key())')"
+          { echo 'XCAGI_UPDATE_ED25519_PUBLIC_KEY<<MAC_CLIENT_KEY'; printf '%s\n' "$XCAGI_UPDATE_ED25519_PUBLIC_KEY"; echo 'MAC_CLIENT_KEY'; } >> "$GITHUB_ENV"
+          python scripts/release/prepare_mac_candidate_pair.py --input "$PAIR_ROOT" --output "$PAIR_OUTPUT" --sha "$BUILD_SHA" --version "$PRODUCT_VERSION"
+          python scripts/dev/sign_update_metadata.py "$PAIR_OUTPUT/latest-mac.yml"
+          for arch in arm64 x64; do
+            dmg="$PAIR_OUTPUT/XCAGI-Enterprise-$PRODUCT_VERSION-mac-$arch.dmg"
+            codesign --verify --verbose=2 "$dmg"
+            xcrun stapler validate "$dmg"
+            spctl -a -vv -t open --context context:primary-signature "$dmg"
+            mount_dir="$(mktemp -d)"
+            hdiutil attach -nobrowse -readonly -quiet -mountpoint "$mount_dir" "$dmg"
+            trap 'hdiutil detach "$mount_dir" -quiet' EXIT
+            app="$mount_dir/XCAGI.app"
+            codesign --verify --deep --strict --verbose=2 "$app"
+            spctl -a -vv -t exec "$app"
+            codesign -dv --verbose=4 "$app" 2>&1 | grep -Fx "TeamIdentifier=G26WSH472M"
+            python - "$app" "$BUILD_SHA" "$PRODUCT_VERSION" "$arch" <<'PY'
+          import json, pathlib, struct, sys
+          app=pathlib.Path(sys.argv[1]);info=json.loads((app/'Contents/Resources/build-info.json').read_text())
+          assert info['gitSha']==sys.argv[2] and info['version']==sys.argv[3]
+          assert struct.unpack('<II',(app/'Contents/MacOS/XCAGI').read_bytes()[:8])==(0xfeedfacf,{'arm64':0x100000c,'x64':0x1000007}[sys.argv[4]])
+          PY
+            hdiutil detach "$mount_dir" -quiet; trap - EXIT; rmdir "$mount_dir"
+            zip_dir="$(mktemp -d)"; ditto -x -k "$PAIR_OUTPUT/XCAGI-Enterprise-$PRODUCT_VERSION-mac-$arch.zip" "$zip_dir"
+            codesign --verify --deep --strict --verbose=2 "$zip_dir/XCAGI.app"
+            xcrun stapler validate "$zip_dir/XCAGI.app"
+            spctl -a -vv -t exec "$zip_dir/XCAGI.app"
+            codesign -dv --verbose=4 "$zip_dir/XCAGI.app" 2>&1 | grep -Fx "TeamIdentifier=G26WSH472M"
+            rm -rf "$zip_dir"
+          done
+          bash scripts/package/publish-macos-download-center.sh "$PRODUCT_VERSION" "$BUILD_SHA" "$PAIR_OUTPUT" --dry-run
+      - uses: actions/download-artifact@v8
+        if: ${{ inputs.publish }}
+        with: {name: xcagi-security-release-reports, path: '${{ runner.temp }}/security/current', run-id: '${{ inputs.security_scan_run_id }}', github-token: '${{ github.token }}'}
+      - uses: actions/download-artifact@v8
+        if: ${{ inputs.publish }}
+        with: {name: xcagi-security-release-reports, path: '${{ runner.temp }}/security/previous', run-id: '${{ inputs.previous_security_scan_run_id }}', github-token: '${{ github.token }}'}
+      - name: Enforce unchanged exact-SHA two-day security clearance
+        if: ${{ inputs.publish }}
+        run: python scripts/security/verify_security_scan_pair.py --previous-dir "$RUNNER_TEMP/security/previous" --current-dir "$RUNNER_TEMP/security/current" --release-sha "$BUILD_SHA"
+      - name: Publish authorized original pair and read back both architectures
+        if: ${{ inputs.publish }}
+        env:
+          DESKTOP_SSH_KEY: ${{ secrets.SERVER_SSH_KEY || secrets.FHD_PUSH_SSH_KEY }}
+          XCAGI_MAC_PUBLICATION_AUTHORIZED_SHA: ${{ vars.MACOS_FROZEN_PAIR_AUTHORIZED_SHA }}
+          FHD_PUSH_HOST: ${{ vars.FHD_PUSH_HOST || '119.27.178.147' }}
+        run: |
+          set -euo pipefail
+          relation="$(gh api "repos/$GITHUB_REPOSITORY/compare/$BUILD_SHA...main" --jq .status)"; case "$relation" in ahead|identical) ;; *) exit 1 ;; esac
+          bash scripts/package/publish-macos-download-center.sh "$PRODUCT_VERSION" "$BUILD_SHA" "$PAIR_OUTPUT" --publish
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with: {name: 'mac-frozen-pair-review-${{ inputs.build_sha }}', path: '${{ runner.temp }}/frozen-mac-pair-output', if-no-files-found: error}

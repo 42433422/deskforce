@@ -1,0 +1,327 @@
+"""COVERAGE_RAMP Phase 2 (p2-p1-biz): application / infrastructure / domain / ai_engines helpers."""
+
+from __future__ import annotations
+
+import math
+from contextlib import contextmanager
+from datetime import date
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import numpy as np
+import pytest
+from fastapi.responses import JSONResponse
+
+from app.ai_engines.deepseek.intent_service import INTENT_DESCRIPTIONS, _IntentRecognitionCache
+from app.application import aibiz_web_terminal_service as aibiz_mod
+from app.application.rbac_app_service import RbacAppService, get_rbac_app_service
+from app.domain.shared_services.deepseek_intent_service import _make_intent_cache_key, cn_to_number
+from app.infrastructure.documents.price_list_export import (
+    _detect_header_row_count,
+    _format_price_cell,
+    _header_text,
+    _parse_header_serial_and_column_map,
+    _product_row_cell_values,
+    _row_keyword_score,
+    build_price_list_template_preview_json,
+)
+from app.infrastructure.llm.providers.openai_compatible_provider import OpenAICompatibleProvider
+from app.infrastructure.persistence.compat_db.writes import (
+    _customers_delete_by_norm_name_pg,
+    _products_delete_by_unit_pg,
+    _purchase_units_delete_by_norm_unit_pg,
+)
+from app.infrastructure.persistence.sqlite_vector_store import SQLiteVectorStore
+from app.infrastructure.rag.rag_service import RagService, is_rag_enabled
+from app.infrastructure.repositories.product_repository_impl import SQLAlchemyProductRepository
+from tests.fixtures.backend_ci_isolation import isolated_login_host_db
+
+# ---------------------------------------------------------------------------
+# price_list_export helpers
+# ---------------------------------------------------------------------------
+
+
+class _MockCell:
+    def __init__(self, text: str = "") -> None:
+        self.text = text
+
+
+class _MockRow:
+    def __init__(self, texts: list[str]) -> None:
+        self.cells = [_MockCell(t) for t in texts]
+
+
+class _MockTable:
+    def __init__(self, rows: list[_MockRow]) -> None:
+        self.rows = rows
+
+
+def test_format_price_cell_variants() -> None:
+    assert _format_price_cell(None) == ""
+    assert _format_price_cell(12.0) == "12"
+    assert _format_price_cell(12.5) == "12.50"
+    assert _format_price_cell("abc") == "abc"
+
+
+def test_product_row_cell_values_cn_keys() -> None:
+    vals = _product_row_cell_values({"型号": "M1", "产品名称": "漆", "规格": "5L", "单价": 99})
+    assert vals == ["M1", "漆", "5L", "99"]
+
+
+def test_row_keyword_score_counts_headers() -> None:
+    row = _MockRow(["序号", "型号", "名称", "规格", "单价"])
+    assert _row_keyword_score(row.cells) >= 4
+
+
+def test_detect_header_row_count_single() -> None:
+    table = _MockTable([_MockRow(["产品价目表"])])
+    assert _detect_header_row_count(table) == 1
+
+
+def test_detect_header_row_count_two_rows() -> None:
+    table = _MockTable(
+        [
+            _MockRow(["2026年度价目表"]),
+            _MockRow(["序号", "型号", "名称", "规格", "单价"]),
+        ]
+    )
+    assert _detect_header_row_count(table) == 2
+
+
+def test_parse_header_serial_and_column_map() -> None:
+    cells = [
+        _MockCell("序号"),
+        _MockCell("型号"),
+        _MockCell("名称"),
+        _MockCell("规格"),
+        _MockCell("单价"),
+    ]
+    with_serial, col_map = _parse_header_serial_and_column_map(cells)
+    assert with_serial is True
+    assert col_map["price"] == 4
+
+
+def test_header_text_strips() -> None:
+    assert _header_text(_MockCell("  hello ")) == "hello"
+
+
+@patch("app.infrastructure.documents.price_list_export.resolve_price_list_docx_template")
+def test_build_price_list_template_preview_json(mock_resolve: MagicMock) -> None:
+    mock_resolve.return_value = ("/tmp/t.docx", "templates/t.docx")
+    out = build_price_list_template_preview_json()
+    assert out["success"] is True
+    assert "headers" in out
+
+
+# ---------------------------------------------------------------------------
+# aibiz_web_terminal_service surface helpers
+# ---------------------------------------------------------------------------
+
+
+def test_aibiz_unwrap_json_response() -> None:
+    resp = JSONResponse({"err": True})
+    out = aibiz_mod._unwrap(resp)
+    assert "_error_response" in out
+
+
+def test_aibiz_strip_b64_attach_image_urls_web() -> None:
+    surface = {
+        "captured_at": "2026-06-14T10:00:00Z",
+        "pages": [
+            {"id": "home", "name": "首页", "preview": True, "screenshot_b64": "xxx"},
+            {"id": "chat", "name": "智能对话"},
+        ],
+    }
+    out = aibiz_mod._strip_b64_attach_image_urls(surface, terminal="web")
+    assert "screenshot_b64" not in out["pages"][0]
+    assert "image_url" in out["pages"][0]
+    assert out["preview_index"] == 0
+
+
+def test_aibiz_strip_b64_software_skips_admin() -> None:
+    surface = {
+        "cached_at": "2026-06-14",
+        "pages": [
+            {"id": "admin_users", "name": "管理"},
+            {"id": "chat", "name": "智能对话"},
+        ],
+    }
+    out = aibiz_mod._strip_b64_attach_image_urls(surface, terminal="software")
+    assert out["preview_index"] == 1
+
+
+def test_aibiz_compact_surface_pages_passthrough() -> None:
+    s = {"pages": []}
+    assert aibiz_mod._compact_surface_pages(s, compact=True) is s
+
+
+# ---------------------------------------------------------------------------
+# product_repository find_all_dict 字典输出
+# ---------------------------------------------------------------------------
+
+
+def _mock_db_ctx(mock_db):
+    @contextmanager
+    def _ctx():
+        yield mock_db
+
+    return _ctx()
+
+
+def test_product_repository_find_all_dict_output() -> None:
+    """新版仓储 find_all_dict 返回 (list[dict], total) 元组，字典字段对齐新版契约。
+
+    旧版私有辅助 _api_scalar/_product_to_dict 已删除，改为直接断言字典输出。
+    """
+    from datetime import datetime
+
+    repo = SQLAlchemyProductRepository()
+    mock_model = MagicMock()
+    mock_model.id = 1
+    mock_model.model_number = "MOD-001"
+    mock_model.name = "测试产品"
+    mock_model.specification = "100x200"
+    mock_model.price = 99.5
+    mock_model.quantity = 50
+    mock_model.description = "描述"
+    mock_model.category = "电子"
+    mock_model.brand = "品牌A"
+    mock_model.unit = "个"
+    mock_model.is_active = 1
+    mock_model.created_at = datetime(2026, 1, 1)
+    mock_model.updated_at = datetime(2026, 1, 2)
+
+    mock_db = MagicMock()
+    mock_query = MagicMock()
+    mock_query.filter.return_value = mock_query
+    mock_query.order_by.return_value = mock_query
+    mock_query.limit.return_value = mock_query
+    mock_query.offset.return_value = mock_query
+    mock_query.count.return_value = 1
+    mock_query.all.return_value = [mock_model]
+    mock_db.query.return_value = mock_query
+
+    with patch("app.infrastructure.repositories.product_repository_impl.get_db") as mock_get_db:
+        mock_get_db.return_value = _mock_db_ctx(mock_db)
+        dicts, total = repo.find_all_dict(page=1, per_page=20)
+
+    assert isinstance((dicts, total), tuple)
+    assert total == 1
+    assert dicts[0]["name"] == "测试产品"
+    assert dicts[0]["model_number"] == "MOD-001"
+    assert dicts[0]["price"] == 99.5
+    assert dicts[0]["unit"] == "个"
+
+
+# ---------------------------------------------------------------------------
+# compat_db writes early returns
+# ---------------------------------------------------------------------------
+
+
+def test_products_delete_by_unit_pg_empty() -> None:
+    assert _products_delete_by_unit_pg(MagicMock(), "") == 0
+    assert _products_delete_by_unit_pg(MagicMock(), "   ") == 0
+
+
+def test_purchase_units_delete_by_norm_unit_pg_empty() -> None:
+    assert _purchase_units_delete_by_norm_unit_pg(MagicMock(), "") == 0
+
+
+def test_customers_delete_by_norm_name_pg_empty() -> None:
+    eng = MagicMock()
+    insp = MagicMock()
+    assert _customers_delete_by_norm_name_pg(eng, insp, "") == 0
+
+
+# ---------------------------------------------------------------------------
+# rag_service
+# ---------------------------------------------------------------------------
+
+
+def test_rag_service_answer_fixed_chunks() -> None:
+    svc = RagService(embedder=None)
+    out = svc.answer(
+        user_message="什么是发货单",
+        knowledge_text="发货单用于记录出货。\n第二段说明。",
+        llm_call=lambda _u, _p: "发货单是出货凭证。",
+        chunk_strategy="fixed",
+    )
+    assert "answer" in out
+    assert out["chunks"]
+
+
+def test_is_rag_enabled_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("XCAGI_RAG_ENABLED", raising=False)
+    assert is_rag_enabled() is True
+    monkeypatch.setenv("XCAGI_RAG_ENABLED", "true")
+    assert is_rag_enabled() is True
+    monkeypatch.setenv("XCAGI_RAG_ENABLED", "0")
+    assert is_rag_enabled() is False
+
+
+# ---------------------------------------------------------------------------
+# deepseek / ai_engines
+# ---------------------------------------------------------------------------
+
+
+def test_deepseek_cn_to_number() -> None:
+    assert cn_to_number("五") == 5
+    assert cn_to_number("abc3") == 3
+
+
+def test_make_intent_cache_key_stable() -> None:
+    k1 = _make_intent_cache_key(" Hello ")
+    k2 = _make_intent_cache_key("hello")
+    assert k1 == k2
+    assert len(k1) == 64
+
+
+def test_intent_descriptions_has_shipment() -> None:
+    assert "shipment_generate" in INTENT_DESCRIPTIONS
+    assert len(INTENT_DESCRIPTIONS) > 10
+
+
+def test_deepseek_intent_cache_ttl() -> None:
+    cache = _IntentRecognitionCache(max_size=2, ttl_seconds=0)
+    cache.set("hi", {"intent": "greet"})
+    assert cache.get("hi") is None
+
+
+# ---------------------------------------------------------------------------
+# sqlite_vector_store cosine
+# ---------------------------------------------------------------------------
+
+
+def test_sqlite_vector_cosine_similarity(tmp_path) -> None:
+    store = SQLiteVectorStore(str(tmp_path / "vec.db"))
+    a = np.array([1.0, 0.0], dtype=np.float32)
+    b = np.array([1.0, 0.0], dtype=np.float32)
+    assert math.isclose(store._cosine_similarity(a, b), 1.0)
+    zero = np.array([0.0, 0.0], dtype=np.float32)
+    assert store._cosine_similarity(a, zero) == 0.0
+
+
+# LLM provider and RBAC application
+
+
+def test_openai_compatible_provider_configured_with_adapter() -> None:
+    adapter = MagicMock()
+    adapter.is_configured = True
+    provider = OpenAICompatibleProvider(adapter=adapter)
+    assert provider.is_configured is True
+
+
+@pytest.mark.usefixtures("isolated_login_host_db")
+def test_rbac_app_service_crud_shapes() -> None:
+    from uuid import uuid4
+
+    svc = RbacAppService()
+    code = f"test.read.{uuid4().hex}"
+    permission = svc.create_permission(code, "Read", "", "test")
+    name = f"admin-{uuid4().hex}"
+    role = svc.create_role(name, "管理员", [code])
+    assert role["name"] == name
+    assert svc.get_role(role["id"])["id"] == role["id"]
+    svc.delete_role(role["id"])
+    svc.delete_permission(permission["id"])
+    assert get_rbac_app_service() is get_rbac_app_service()

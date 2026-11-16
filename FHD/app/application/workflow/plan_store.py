@@ -1,0 +1,222 @@
+"""``WorkflowPlanStore`` — 动态工作流计划的数据库持久化与跨会话恢复。
+
+工作流规划产出的 ``PlanGraph``（含节点/条件边/待办）序列化后按 ``plan_id`` 落库到
+``workflow_plans`` 表。配合 DB 化的 checkpoint（``DatabaseWorkflowCheckpointer``），
+进程重启或用户换会话后，可凭 ``plan_id`` 载入计划并从最新 checkpoint 续跑，实现
+真正的长任务跨会话续跑。
+
+与 ``DatabaseWorkflowCheckpointer`` 一致的会话模式：每次操作独立开会话、惰性建表
+（幂等 ``create_all checkfirst``）、保存失败仅告警不阻断主流程。
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import unicodedata
+from typing import Any, cast
+
+from sqlalchemy import Table
+
+from app.application.workflow.workflow_types import PlanGraph, plan_from_dict, plan_to_dict
+from app.utils.operational_errors import RECOVERABLE_ERRORS
+
+logger = logging.getLogger(__name__)
+
+# Shared namespace contract: catalog code must reuse these exact prefixes.
+CATALOG_OPERATION_PREFIX = "catalog-price-operation-v1:"
+CATALOG_HEAD_PREFIX = "catalog-price-active-v1:"
+CATALOG_RECEIPT_PREFIX = "catalog-price-receipt-v1:"
+OWNED_KNOWLEDGE_CONTROL_KEY = "etl-owned-knowledge-v1"
+_RESERVED_PLAN_KEYS = (OWNED_KNOWLEDGE_CONTROL_KEY,)
+_RESERVED_PLAN_PREFIXES = (CATALOG_OPERATION_PREFIX, CATALOG_HEAD_PREFIX, CATALOG_RECEIPT_PREFIX)
+
+
+def reserved_workflow_plan_id(value: str) -> bool:
+    """Generic workflow APIs never interpret protected operation/receipt records."""
+    if not isinstance(value, str):
+        return False
+    normalized = unicodedata.normalize("NFKC", value).strip().casefold()
+    return normalized in _RESERVED_PLAN_KEYS or normalized.startswith(_RESERVED_PLAN_PREFIXES)
+
+
+def _require_ordinary_plan_id(value: str) -> None:
+    if reserved_workflow_plan_id(value):
+        raise ValueError("protected catalog authority is not an ordinary workflow plan")
+
+
+# 生命周期状态常量。
+STATUS_RUNNING = "running"
+STATUS_PENDING = "pending_awaiting"
+STATUS_SUCCEEDED = "succeeded"
+STATUS_FAILED = "failed"
+STATUS_CANCELLED = "cancelled"
+
+# 可视为「待续跑」的终态/非终态集合。
+_ACTIVE_STATUSES = {STATUS_RUNNING, STATUS_PENDING}
+
+
+def _dump_json(value: Any) -> str:
+    if value is None or value == "":
+        return ""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+class WorkflowPlanStore:
+    """持久化动态工作流计划，支持按计划/用户查询与状态流转。"""
+
+    def __init__(self, session_factory=None) -> None:
+        # 测试可注入自定义 session_factory（返回一个 SQLAlchemy Session）
+        self._session_factory = session_factory
+        self._schema_ensured = False
+
+    def _ensure_schema(self, session) -> None:
+        if self._schema_ensured:
+            return
+        try:
+            from app.db.db_base import Base
+            from app.db.models.workflow import WorkflowPlan
+
+            Base.metadata.create_all(
+                bind=session.get_bind(),
+                tables=[cast("Table", WorkflowPlan.__table__)],
+                checkfirst=True,
+            )
+        except RECOVERABLE_ERRORS:
+            logger.warning("workflow_plans 建表失败，计划持久化降级", exc_info=True)
+        finally:
+            self._schema_ensured = True
+
+    def _get_session(self):
+        if self._session_factory is not None:
+            return self._session_factory()
+        from app.db import SessionLocal
+
+        return SessionLocal()
+
+    def save(
+        self,
+        *,
+        plan: PlanGraph,
+        runtime_context: dict[str, Any] | None = None,
+        status: str = STATUS_RUNNING,
+        user_id: str | None = None,
+        session_id: str | None = None,
+        message: str | None = None,
+        require_commit: bool = False,
+    ) -> str:
+        """按 ``plan.plan_id`` upsert 计划快照，返回 ``plan_id``。"""
+        plan_id = plan.plan_id
+        _require_ordinary_plan_id(plan_id)
+        session = self._get_session()
+        try:
+            from sqlalchemy.exc import IntegrityError
+
+            from app.db.models.workflow import WorkflowPlan
+
+            self._ensure_schema(session)
+            row = session.query(WorkflowPlan).filter(WorkflowPlan.plan_id == plan_id).first()
+            if row is None:
+                row = WorkflowPlan(plan_id=plan_id)
+                session.add(row)
+            row.session_id = session_id or row.session_id
+            row.user_id = user_id or row.user_id
+            row.intent = plan.intent or row.intent
+            row.plan_json = _dump_json(plan_to_dict(plan))
+            row.runtime_context = _dump_json(dict(runtime_context or {}))
+            row.status = status
+            if message is not None:
+                row.message = message
+            try:
+                session.commit()
+            except IntegrityError:
+                # 并发 upsert 竞态：退避重查一次后更新。
+                session.rollback()
+                row = session.query(WorkflowPlan).filter(WorkflowPlan.plan_id == plan_id).first()
+                if row is not None:
+                    row.plan_json = _dump_json(plan_to_dict(plan))
+                    row.runtime_context = _dump_json(dict(runtime_context or {}))
+                    row.status = status
+                    session.commit()
+                elif require_commit:
+                    raise RuntimeError("workflow_plan concurrent save did not commit")
+        except RECOVERABLE_ERRORS:
+            session.rollback()
+            logger.warning("workflow_plan 保存失败 plan=%s（主流程继续）", plan_id)
+            if require_commit:
+                raise
+        finally:
+            session.close()
+        return plan_id
+
+    def load(self, plan_id: str) -> dict[str, Any] | None:
+        """按 ``plan_id`` 载入计划快照 dict；不存在返回 ``None``。"""
+        if reserved_workflow_plan_id(plan_id):
+            return None
+        session = self._get_session()
+        try:
+            from app.db.models.workflow import WorkflowPlan
+
+            row = session.query(WorkflowPlan).filter(WorkflowPlan.plan_id == plan_id).first()
+            return row.to_dict() if row is not None else None
+        finally:
+            session.close()
+
+    def load_plan(self, plan_id: str) -> PlanGraph | None:
+        """按 ``plan_id`` 载入并还原 ``PlanGraph``；不存在返回 ``None``。"""
+        data = self.load(plan_id)
+        if not data:
+            return None
+        return plan_from_dict(data.get("plan") or {})
+
+    def list_active(
+        self, user_id: str, limit: int = 10, *, session_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """列出某用户的可续跑计划（running / pending_awaiting），按最近更新倒序。"""
+        session = self._get_session()
+        try:
+            from app.db.models.workflow import WorkflowPlan
+
+            query = session.query(WorkflowPlan).filter(
+                WorkflowPlan.user_id == user_id,
+                WorkflowPlan.status.in_(list(_ACTIVE_STATUSES)),
+            )
+            if session_id is not None:
+                query = query.filter(WorkflowPlan.session_id == session_id)
+            query = query.filter(WorkflowPlan.plan_id.not_in(_RESERVED_PLAN_KEYS))
+            for prefix in _RESERVED_PLAN_PREFIXES:
+                query = query.filter(~WorkflowPlan.plan_id.startswith(prefix, autoescape=True))
+            result = []
+            # Filter normalized aliases before the visible limit/deserialization;
+            # SQL excludes canonical keys without dialect-specific custom functions.
+            for row in query.order_by(WorkflowPlan.updated_at.desc()).yield_per(100):
+                if reserved_workflow_plan_id(row.plan_id):
+                    continue
+                result.append(row.to_dict())
+                if len(result) >= max(1, limit):
+                    break
+            return result
+        finally:
+            session.close()
+
+    def update_status(self, plan_id: str, status: str, message: str | None = None) -> None:
+        """更新计划终态/状态；计划不存在则忽略。"""
+        _require_ordinary_plan_id(plan_id)
+        session = self._get_session()
+        try:
+            from app.db.models.workflow import WorkflowPlan
+
+            row = session.query(WorkflowPlan).filter(WorkflowPlan.plan_id == plan_id).first()
+            if row is None:
+                return
+            row.status = status
+            if message is not None:
+                row.message = message
+            session.commit()
+        except RECOVERABLE_ERRORS:
+            session.rollback()
+            logger.warning("workflow_plan 状态更新失败 plan=%s", plan_id)
+        finally:
+            session.close()

@@ -1,0 +1,626 @@
+"""Desktop installer packaging policy checks."""
+
+from __future__ import annotations
+
+import ast
+import json
+from pathlib import Path
+
+import pytest
+
+pytestmark = pytest.mark.release_gate
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _desktop_runtime_source(*names: str) -> str:
+    return "\n".join((REPO_ROOT / "desktop" / name).read_text(encoding="utf-8") for name in names)
+
+
+def test_weekly_backup_keeps_cadence_after_missed_sunday() -> None:
+    scripts = REPO_ROOT / "scripts" / "backup"
+    install = (scripts / "Install-BackupTask.ps1").read_text(encoding="utf-8")
+    backup = (scripts / "XcagiBackup.ps1").read_text(encoding="utf-8")
+    installer = (REPO_ROOT / "desktop" / "build" / "installer.nsh").read_text(encoding="utf-8")
+    custom_install = installer.split("!macro customInstall", 1)[1].split("!macroend", 1)[0]
+    assert "$task.Settings.StartWhenAvailable = $true" in install
+    assert 'if ($Cadence -eq "Weekly") { "$baseArgs -Weekly" }' in install
+    assert "$action.Arguments" in install
+    assert "XcagiDailyBackup" in install and "XcagiWeeklyBackup" in install
+    assert "$trigger.DaysOfWeek = 1" in install
+    assert '-DataDir "$APPDATA\\XCAGI"' in custom_install
+    assert "Installation continues." in custom_install
+    assert "Abort" not in custom_install
+    assert "backup scheduled task registration failed" not in installer
+    assert "[switch]$Weekly" in backup and "($Weekly -or (Get-Date).DayOfWeek" in backup
+    assert 'Write-Log "ERROR: failed to create weekly copy: $_"\n      throw' in backup
+
+
+def test_desktop_enterprise_installer_builds_full_frontend() -> None:
+    scripts = REPO_ROOT / "scripts" / "package"
+    ps_backend = (scripts / "build-backend.ps1").read_text(encoding="utf-8")
+    ps_sync = (scripts / "sync-desktop-frontend.ps1").read_text(encoding="utf-8")
+    sh_backend = (scripts / "build-backend.sh").read_text(encoding="utf-8")
+    sh_windows = (scripts / "build-windows-installer.sh").read_text(encoding="utf-8")
+    sh_thin = (scripts / "build-windows-electron-only.sh").read_text(encoding="utf-8")
+    spec = (scripts / "xcagi_backend.spec").read_text(encoding="utf-8")
+
+    assert "personal = 'full'" in ps_backend
+    assert "enterprise = 'full'" in ps_backend
+    assert "build:minimal" not in ps_backend
+    assert "build:generic" not in ps_backend
+    assert "personal   = 'full'" in ps_sync
+    assert "enterprise = 'full'" in ps_sync
+    assert "build:minimal" not in ps_sync
+    assert "build:generic" not in ps_sync
+
+    assert "build-installer.ps1" in sh_windows and "-ProductSku" in sh_windows
+    for script in (sh_thin,):
+        assert (
+            "VITE_XCAGI_PRODUCT_SKU=enterprise VITE_XCAGI_EDITION=full npm run build:full"
+        ) in script
+        assert "VITE_XCAGI_PRODUCT_SKU=enterprise npm run build" not in script
+        assert "admin-console && npm run build" not in script
+        assert "(cd admin-console && npm run build)" not in script
+
+    sh_frontend = (scripts / "build-frontend.sh").read_text(encoding="utf-8")
+    assert "build-frontend.sh" in sh_backend
+    assert (
+        'VITE_XCAGI_PRODUCT_SKU="${VITE_SKU}" VITE_XCAGI_EDITION=full npm run build:full'
+        in sh_frontend
+    )
+    assert "VITE_XCAGI_PRODUCT_SKU=enterprise npm run build" not in sh_backend
+    assert "admin-console && npm run build" not in sh_backend
+    assert "(cd admin-console && npm run build)" not in sh_backend
+
+    assert "admin-console" not in ps_backend or "不构建 admin-console" in ps_backend
+    assert 'Push-Location (Join-Path $Root "admin-console")' not in ps_backend
+    assert "templates/admin-vue-dist" not in spec
+    assert "app/application/agent_orchestrator/tool_spec_data/input_schemas.json" in spec
+    assert "app/application/agent_orchestrator/tool_spec_data/output_schemas.json" in spec
+    assert '"app.legacy.routes"' in spec
+    assert "admin-console" not in ps_sync
+    assert "does not include admin-vue-dist" in ps_sync
+    assert "vue-dist gate" in sh_backend
+    assert "bundled vue-dist" in sh_backend
+    assert "vue-dist gate" in ps_backend
+    assert "bundled vue-dist" in ps_backend
+    after_pack = (REPO_ROOT / "desktop" / "build" / "after-pack.cjs").read_text(encoding="utf-8")
+    assert "assertBundledVueDist" in after_pack
+    sync_sh = (scripts / "sync-desktop-frontend.sh").read_text(encoding="utf-8")
+    assert "templates/vue-dist" in sync_sh
+
+
+def test_desktop_windows_runtime_matches_mac_shell_policy() -> None:
+    desktop_runtime = _desktop_runtime_source("main.ts", "desktop-config.ts")
+    ps_installer = (REPO_ROOT / "scripts" / "package" / "build-installer.ps1").read_text(
+        encoding="utf-8"
+    )
+    sh_installer = (REPO_ROOT / "scripts" / "package" / "build-windows-installer.sh").read_text(
+        encoding="utf-8"
+    )
+    smoke = (REPO_ROOT / "scripts" / "package" / "smoke-installed-windows.ps1").read_text(
+        encoding="utf-8"
+    )
+    acceptance = (REPO_ROOT / "scripts" / "package" / "acceptance-sunbird-windows.ps1").read_text(
+        encoding="utf-8"
+    )
+    router = (REPO_ROOT / "frontend" / "src" / "router" / "index.ts").read_text(encoding="utf-8")
+    spec = (REPO_ROOT / "scripts" / "package" / "xcagi_backend.spec").read_text(encoding="utf-8")
+
+    assert "return 17500" in desktop_runtime
+    assert "process.platform === 'darwin' ? 17500 : 5000" not in desktop_runtime
+    assert '"return 17500"' in ps_installer
+    assert "build-installer.ps1" in sh_installer
+    assert '"backendHealthMs"' in ps_installer
+    assert "[string]$BaseUrl = 'http://127.0.0.1:17500'" in smoke
+    assert "[string]$BaseUrl = 'http://127.0.0.1:17500'" in acceptance
+    assert "isDesktopShell" in router
+    assert "resolveAdminConsoleHomeUrl()" in router
+    assert "profile.isAdminAccount" in router
+    assert "DESKTOP_ADMIN_FORBIDDEN_MESSAGE" in router
+    assert "next({ name: 'chat', replace: true });" not in router
+    assert "console=False" in spec
+
+
+def test_windows_release_requires_sslcom_signing_and_system_authenticode() -> None:
+    workflow = (REPO_ROOT / ".github" / "workflows" / "release-desktop.yml").read_text(
+        encoding="utf-8"
+    )
+    build = (REPO_ROOT / "scripts" / "package" / "build-installer.ps1").read_text(encoding="utf-8")
+    assert "SkipUiInstaller" not in build
+    assert "XcagiInstaller.csproj" in build
+    signer = (REPO_ROOT / "desktop" / "build" / "windows-sign.cjs").read_text(encoding="utf-8")
+    post_gate = (REPO_ROOT / "scripts" / "package" / "pre-release-security.ps1").read_text(
+        encoding="utf-8"
+    )
+    verifier = (REPO_ROOT / "scripts" / "package" / "verify-windows-signature.ps1").read_text(
+        encoding="utf-8"
+    )
+    installed_runtime = (
+        REPO_ROOT / "scripts" / "package" / "verify-windows-installed-runtime.ps1"
+    ).read_text(encoding="utf-8")
+
+    for name in (
+        "ES_USERNAME",
+        "ES_PASSWORD",
+        "CREDENTIAL_ID",
+        "ES_TOTP_SECRET",
+    ):
+        assert name in workflow
+        assert name in build
+        assert name in signer
+
+    assert 'XCAGI_REQUIRE_WINDOWS_SIGNING: "1"' in workflow
+    assert "XCAGI_WINDOWS_SIGNING_PROVIDER: sslcom" in workflow
+    assert "SSLcom/esigner-codesign@cf5f6c1d38ad10f47e3ed9aca873f429b1a8d85b" in workflow
+    assert "--config.forceCodeSigning=true" in build
+    assert "--config.win.signtoolOptions.sign=build/windows-sign.cjs" in build
+    assert "--config.win.signtoolOptions.signingHashAlgorithms=sha256" in build
+    assert "--config.win.publisherName=" in build
+    assert "AZURE_TRUSTED_SIGNING" not in workflow
+    assert "AZURE_TRUSTED_SIGNING" not in build
+    assert "-override=true" in signer
+    assert "spawn(java, args" in signer
+    assert "Get-AuthenticodeSignature -LiteralPath" in verifier
+    assert "$signature.Status -ne 'Valid'" in verifier
+    assert "$signature.TimeStamperCertificate" in verifier
+    assert post_gate.count("verify-windows-signature.ps1") == 3
+    assert "verify-windows-installed-runtime.ps1" in workflow
+    assert "verify-public-windows-signature:" in workflow
+    assert "Get-AuthenticodeSignature -LiteralPath $installer" in workflow
+    assert "Published Windows installer is not Authenticode-valid" in workflow
+    assert "verify-windows-signature.ps1 `" in workflow
+    assert "-ExpectedPublisher $env:XCAGI_WINDOWS_PUBLISHER_NAME" in workflow
+    assert '-ExpectedBuildSha "${{ inputs.release_sha }}"' in workflow
+    assert "-ExpectedProductVersion $v" in workflow
+    assert "verify-windows-signature.ps1" in installed_runtime
+    assert "smoke-installed-windows.ps1" in installed_runtime
+    assert "Start-Process" in installed_runtime
+    assert "@('/S', \"/D=$InstallDir\")" in installed_runtime
+    assert "Uninstall XCAGI.exe" in installed_runtime
+    assert "Wait-PathRemoved -Path $installedExe" in installed_runtime
+    assert "deleteAppDataOnUninstall must remain false" in installed_runtime
+
+
+def test_desktop_release_preflights_both_platforms_and_publishes_as_one_unit() -> None:
+    workflow = (REPO_ROOT / ".github" / "workflows" / "release-desktop.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "release-preflight:" in workflow
+    assert workflow.count("needs: [release-preflight]") == 2
+    assert 'missing+=("APPLE_TEAM_ID|IOS_TEAM_ID")' in workflow
+    assert 'missing+=("SERVER_SSH_KEY|FHD_PUSH_SSH_KEY")' in workflow
+    assert "deploy-windows:" not in workflow
+    assert "deploy-macos:" not in workflow
+    assert "needs: [release-preflight, windows, macos]" in workflow
+    assert "Publish unified Windows + macOS release to CVM" in workflow
+    assert "publish-website-pointer:" in workflow
+    assert (
+        "needs: [generate-manifest, cross-platform-parity, verify-download, "
+        "verify-public-windows-signature]" in workflow
+    )
+    assert "needs.verify-public-windows-signature.result == 'success'" in workflow
+    assert "--delay-updates" in workflow
+    assert workflow.index('official_root="/var/www/xcagi-v${version}"') < workflow.index(
+        'stable_root="/var/www/update/releases/stable"'
+    )
+
+
+def test_windows_release_scripts_are_parsed_on_a_real_windows_ci_runner() -> None:
+    workflow = (REPO_ROOT / ".github" / "workflows" / "ci-cd.yml").read_text(encoding="utf-8")
+
+    job = workflow.split("  desktop-windows-release-script-smoke:", 1)[1].split(
+        "\n  # SSOT drift gate", 1
+    )[0]
+    assert "runs-on: windows-latest" in job
+    # 全量解析 scripts/package/*.ps1 + 空清单 fail-closed；acceptance-windows.ps1 曾整体语法错误却长期绿，故显式守卫。
+    assert "Get-ChildItem -LiteralPath 'scripts/package' -Filter '*.ps1' -File" in job
+    assert "$paths.Count -eq 0" in job
+    assert (REPO_ROOT / "scripts" / "package" / "acceptance-windows.ps1").is_file()
+    assert "[scriptblock]::Create" in job
+    assert "node --check desktop/build/windows-sign.cjs" in job
+    assert "SSLcom/esigner-codesign@cf5f6c1d38ad10f47e3ed9aca873f429b1a8d85b" in job
+    assert "CODE_SIGN_TOOL_PATH" in job
+    assert "code_sign_tool-1.3.0.jar" in job
+    assert "& $java -Xmx1024M -jar $jar --version" in job
+    assert "rollback-windows.test.ts" in job
+    assert "updater-install.test.ts" in job
+
+
+def test_desktop_update_rollback_is_fail_closed_and_windows_full_app() -> None:
+    runtime = _desktop_runtime_source("main.ts", "backend-process.ts", "window-manager.ts")
+    rollback = (REPO_ROOT / "desktop" / "rollback.ts").read_text(encoding="utf-8")
+    windows = (REPO_ROOT / "desktop" / "rollback-windows.ts").read_text(encoding="utf-8")
+    # installUpdate 已从 updater.ts 拆至 desktop-install-update.ts（source-governance
+    # electron 600 行上限）；buildSha 身份截断的 fail-closed 断言跟随新位置。
+    install_update = (REPO_ROOT / "desktop" / "desktop-install-update.ts").read_text(
+        encoding="utf-8"
+    )
+    entrypoint = (REPO_ROOT / "XCAGI" / "run_fastapi.py").read_text(encoding="utf-8")
+
+    assert "继续更新但不支持回滚" not in runtime
+    assert "cancelPreparedRollback()" in runtime
+    assert "attachDatabaseBackupToRollback" in runtime
+    assert "consumeRollbackApplied()" in runtime
+    assert (
+        "if (pendingRollback) {\n"
+        "          await waitForMainApplicationReady()\n"
+        "          await waitForPostUpdateStartupStability()\n"
+        "          commitRollback()"
+    ) in runtime
+    assert "mainApplicationReady = ready" in runtime
+    assert "POST_UPDATE_STABILITY_MS = 5_000" in runtime
+    assert "rendererFailedDuringStartup = true" in runtime
+    assert "throw error" in runtime
+    assert "mode: 'windows-full'" in rollback
+    assert "launchWindowsFullRollback" in rollback
+    assert "windows-app-current" in rollback
+    assert "[IO.Directory]::Move($stagingDir, $installDir)" in windows
+    assert "Copy-Item -LiteralPath $databaseBackupPath" in windows
+    assert "state.buildSha.slice(0, 12)" in install_update
+    assert "migration backup failed; refusing to continue" in entrypoint
+
+
+def test_windows_builders_pass_four_part_product_version_metadata() -> None:
+    """XCAGI.exe 属性须为四段产品版本（验收协议 §身份核对），由 electron-builder
+    buildVersion→FileVersion、extraMetadata.shortVersionWindows→ProductVersion 透传。"""
+    scripts = REPO_ROOT / "scripts" / "package"
+    ps_installer = (scripts / "build-installer.ps1").read_text(encoding="utf-8")
+
+    assert '"--config.buildVersion=$Version"' in ps_installer
+    assert '"--config.extraMetadata.shortVersionWindows=$Version"' in ps_installer
+    for sh_name in ("build-windows-electron-only.sh",):
+        sh_installer = (scripts / sh_name).read_text(encoding="utf-8")
+        assert '"--config.buildVersion=${VERSION}"' in sh_installer
+        assert '"--config.extraMetadata.shortVersionWindows=${VERSION}"' in sh_installer
+
+    acceptance = (scripts / "acceptance-windows.ps1").read_text(encoding="utf-8")
+    assert "6.exe版本" in acceptance
+    assert "Record '6.exe版本' 'FAIL'" in acceptance
+
+
+def test_desktop_package_includes_chat_voice_runtime() -> None:
+    spec = (REPO_ROOT / "scripts" / "package" / "xcagi_backend.spec").read_text(encoding="utf-8")
+    build = (REPO_ROOT / "scripts" / "package" / "build-backend.sh").read_text(encoding="utf-8")
+    normalizer = (
+        REPO_ROOT / "scripts" / "package" / "normalize-macos-python-binaries.sh"
+    ).read_text(encoding="utf-8")
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+
+    excludes = spec.split("desktop_excludes = [", 1)[1].split("]", 1)[0]
+    assert '"faster_whisper"' not in excludes
+    assert '"av"' not in excludes
+    assert "collect_submodules(module)" in spec
+    assert "collect_dynamic_libs(module)" in spec
+    assert "binaries=binaries" in spec
+    assert '"av>=17.1,<18"' in pyproject
+    assert "normalize-macos-python-binaries.sh" in build
+    assert "find \"${SITE_PACKAGES}\" -type f -name '*.dylib' -print0" in normalizer
+    assert "find \"${SITE_PACKAGES}\" -type f -name '*.so' -print0" in normalizer
+    assert "codesign --force --sign -" in normalizer
+    assert "import av" in normalizer
+    assert "import ctranslate2" in normalizer
+    assert "import gevent" in normalizer
+
+
+def test_macos_after_pack_uses_unambiguous_developer_id_and_fails_closed() -> None:
+    after_pack = (REPO_ROOT / "desktop" / "build" / "after-pack.cjs").read_text(encoding="utf-8")
+
+    assert "`Developer ID Application: ${fromEnv}`" in after_pack
+    assert "/^[0-9a-f]{40}$/i.test(fromEnv)" in after_pack
+    assert "match[2] === fullName" in after_pack
+    assert "log(`native sign warn" not in after_pack
+
+
+def test_desktop_package_includes_commercial_safe_office_employee_runtimes() -> None:
+    spec = (REPO_ROOT / "scripts" / "package" / "xcagi_backend.spec").read_text(encoding="utf-8")
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    entrypoint = (REPO_ROOT / "XCAGI" / "run_fastapi.py").read_text(encoding="utf-8")
+    workflow = (REPO_ROOT / ".github" / "workflows" / "release-desktop.yml").read_text(
+        encoding="utf-8"
+    )
+    workflow += (REPO_ROOT / "scripts/package/verify-macos-release-dmg.sh").read_text(
+        encoding="utf-8"
+    )
+    employee_root = REPO_ROOT / "mods" / "_employees"
+    employee_runtime = "\n".join(
+        path.read_text(encoding="utf-8")
+        for employee_name in ("pdf-generate-employee", "pdf-full-read-employee")
+        for path in (employee_root / employee_name / "backend").rglob("*.py")
+    )
+
+    assert '"pypdf>=6.20.1,<7"' in pyproject
+    assert '"reportlab>=5,<6"' in pyproject
+    assert "PyMuPDF" not in pyproject
+    assert "collect_submodules(module)" in spec
+    required = {"docx", "openpyxl", "xlrd", "pptx", "xlsxwriter", "pypdf", "reportlab"}
+    collected = set()
+    for loop in ast.walk(ast.parse(spec)):
+        if not (
+            isinstance(loop, ast.For)
+            and isinstance(loop.target, ast.Name)
+            and isinstance(loop.iter, (ast.List, ast.Tuple, ast.Set))
+        ):
+            continue
+        for call in ast.walk(loop):
+            if not (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and isinstance(call.func.value, ast.Name)
+                and call.func.value.id == "hiddenimports"
+                and call.func.attr == "extend"
+                and len(call.args) == 1
+            ):
+                continue
+            collector = call.args[0]
+            if (
+                isinstance(collector, ast.Call)
+                and isinstance(collector.func, ast.Name)
+                and collector.func.id == "collect_submodules"
+                and len(collector.args) == 1
+                and isinstance(collector.args[0], ast.Name)
+                and collector.args[0].id == loop.target.id
+            ):
+                collected.update(
+                    item.value
+                    for item in loop.iter.elts
+                    if isinstance(item, ast.Constant) and isinstance(item.value, str)
+                )
+    assert required <= collected, f"Missing collected office runtimes: {required - collected}"
+    assert '"xlrd>=2.0.1"' in pyproject
+    assert '"app.application.office_plaintext_generate"' in spec
+    assert '"python-docx>=1.1.0"' in pyproject
+    assert "openpyxl==3.1.5" in pyproject
+    assert '"python-pptx>=1.0.2"' in pyproject
+    assert "import fitz" not in employee_runtime
+    assert "from pypdf import PdfReader" in employee_runtime
+    assert "from reportlab.pdfgen import canvas" in employee_runtime
+    assert "--verify-frozen-critical-runtime" in entrypoint
+    assert "import faster_whisper" in entrypoint
+    assert 'bundled_root = Path(sys._MEIPASS) / "mods" / "_employees"' in entrypoint
+    assert "installed != bundled" in entrypoint
+    assert workflow.count("--verify-frozen-critical-runtime") == 2
+
+
+def test_desktop_package_preserves_vendored_langgraph_provenance() -> None:
+    spec = (REPO_ROOT / "scripts" / "package" / "xcagi_backend.spec").read_text(encoding="utf-8")
+
+    assert 'f"vendored-provenance/{package_dir}"' in spec
+    assert "raise FileNotFoundError" in spec
+    for package_dir in (
+        "xcagi_langgraph_core",
+        "xcagi_langgraph_prebuilt",
+        "xcagi_langgraph_checkpoint",
+        "xcagi_langgraph_checkpoint_backends/checkpoint-sqlite",
+        "xcagi_langgraph_checkpoint_backends/checkpoint-postgres",
+        "xcagi_langgraph_sdk",
+    ):
+        assert f'"{package_dir}"' in spec
+    for module_name in (
+        "langgraph.graph.state",
+        "langgraph.prebuilt.tool_node",
+        "langgraph.checkpoint.base",
+        "langgraph.checkpoint.sqlite",
+        "langgraph.checkpoint.postgres",
+        "langgraph_sdk.client",
+    ):
+        assert f'"{module_name}"' in spec
+
+
+def test_windows_package_probes_real_elt_runtime_without_development_dependencies() -> None:
+    spec = (REPO_ROOT / "scripts/package/xcagi_backend.spec").read_text(encoding="utf-8")
+    assert 'collect_submodules("defusedxml", on_error="raise")' in spec
+    assert 'importlib.util.find_spec("defusedxml") is None' in spec
+    entrypoint = ast.parse((REPO_ROOT / "XCAGI/run_fastapi.py").read_text(encoding="utf-8"))
+    critical_probe = next(
+        node
+        for node in entrypoint.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_verify_frozen_critical_runtime"
+    )
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_verify_frozen_elt_runtime"
+        for node in ast.walk(critical_probe)
+    )
+    for filename in ("build-backend.ps1", "verify-windows-installed-runtime.ps1"):
+        script = (REPO_ROOT / "scripts/package" / filename).read_text(encoding="utf-8-sig")
+        assert "Start-Process -FilePath $backendExe" in script
+        assert "--verify-frozen-critical-runtime" in script
+        assert "-WorkingDirectory $probeDir -PassThru" in script
+        assert "$probe.WaitForExit(300000)" in script
+        assert "Stop-Process -Id $probe.Id -Force" in script
+        assert "$probe.WaitForExit(5000)" in script
+        assert "$probe.ExitCode -ne 0" in script
+    build = (REPO_ROOT / "scripts/package/build-backend.ps1").read_text(encoding="utf-8-sig")
+    assert 'pip install -c ops/deploy/requirements-server-api.lock.txt -e ".[server-api]"' in build
+    assert build.index("PyInstaller --noconfirm") < build.index(
+        "Start-Process -FilePath $backendExe"
+    )
+    for phase in (
+        "frontend started",
+        "runtime dependency installation started",
+        "runtime dependency installation completed",
+        "PyInstaller started",
+        "PyInstaller completed",
+        "frozen runtime probe started",
+        "frozen runtime probe completed",
+    ):
+        assert phase in build
+    first_python = build.index("& python scripts/dev/mods_ssot.py check")
+    assert build.index("$env:PYTHONUTF8 = '1'") < first_python
+    assert build.index("$env:PYTHONIOENCODING = 'utf-8'") < first_python
+    cleanup = build.split("} finally {", 1)[1]
+    assert "data\\logs\\backend-bootstrap.log" in cleanup
+    assert cleanup.index("Get-Content -LiteralPath $probeLog") < cleanup.index(
+        "Remove-Item -LiteralPath $probeDir"
+    )
+
+
+def test_desktop_package_includes_and_probes_dynamic_xcmax_sync_appliers() -> None:
+    spec = (REPO_ROOT / "scripts" / "package" / "xcagi_backend.spec").read_text(encoding="utf-8")
+    entrypoint = (REPO_ROOT / "XCAGI" / "run_fastapi.py").read_text(encoding="utf-8")
+
+    for module_name in (
+        "app.domain.shared_services.xcmax_sync_basic_appliers",
+        "app.domain.shared_services.xcmax_sync_extended_appliers",
+    ):
+        assert f'"{module_name}"' in spec
+    assert (
+        "from app.domain.shared_services.xcmax_sync_service import _ENTITY_APPLIERS" in entrypoint
+    )
+    assert '"account_entitlements"' in entrypoint
+    assert "missing_sync_appliers" in entrypoint
+
+
+def test_frozen_excel_temp_files_use_writable_app_data() -> None:
+    modules = [
+        REPO_ROOT / "app" / "application" / "excel_template_http_app_service.py",
+        REPO_ROOT / "app" / "fastapi_routes" / "domains" / "excel" / "excel_extract.py",
+    ]
+
+    for path in modules:
+        source = path.read_text(encoding="utf-8")
+        assert "get_app_data_dir" in source
+        assert 'os.path.join(get_app_data_dir(), "temp_excel")' in source
+        assert 'str(_REPO_ROOT / "temp_excel")' not in source
+
+    template_service = modules[0].read_text(encoding="utf-8")
+    assert "os.makedirs(TEMPLATE_DIR" not in template_service
+
+
+def test_server_api_runtime_excludes_unmaintained_python_ecdsa_stack() -> None:
+    """CVE-2024-23342 has no patched python-ecdsa release; PyJWT is the SSOT."""
+    dependency_files = (
+        REPO_ROOT / "pyproject.toml",
+        REPO_ROOT / "requirements.txt",
+        REPO_ROOT / "requirements-server-api.txt",
+        REPO_ROOT / "ops" / "deploy" / "requirements-server-api.lock.txt",
+        REPO_ROOT / "uv.lock",
+    )
+    for dependency_file in dependency_files:
+        contents = dependency_file.read_text(encoding="utf-8").lower()
+        assert "python-jose" not in contents, dependency_file
+        assert 'name = "ecdsa"' not in contents, dependency_file
+
+
+def test_macos_installer_reuses_clean_local_electron_distribution() -> None:
+    installer = (REPO_ROOT / "scripts" / "package" / "build-installer.sh").read_text(
+        encoding="utf-8"
+    )
+    dmg_builder = (REPO_ROOT / "scripts" / "package" / "create-mac-dmg.sh").read_text(
+        encoding="utf-8"
+    )
+    notarize = (REPO_ROOT / "desktop" / "build" / "notarize.cjs").read_text(encoding="utf-8")
+
+    assert all(s in installer for s in ("electron/install.js", "xattr -cr"))
+    assert '"--config.electronDist=node_modules/electron/dist"' in installer
+    assert '"--config.directories.output=${package_stage}"' in installer
+    assert 'for staged_file in "${package_stage}"/*' in installer
+    assert 'ditto --norsrc "${staged_file}" "${out_dir}/$(basename "${staged_file}")"' in installer
+    assert 'ditto --norsrc "${package_stage}" "${out_dir}"' not in installer
+    assert "--config .electron-builder.release.yml --mac zip" in installer
+    assert 'builder_config="desktop/.electron-builder.release.yml"' in installer
+    assert (
+        'sed "s/__XCAGI_PRODUCT_VERSION__/${VERSION}/g" desktop/electron-builder.yml > "${builder_config}"'
+        in installer
+    )
+    assert 'rm -f "${builder_config}"' in installer
+    assert "electron-builder --mac dmg" not in installer
+    assert "scripts/package/create-mac-dmg.sh" in installer
+    assert "hdiutil create" in dmg_builder
+    assert "notarytool submit" in dmg_builder
+    assert "scripts/package/staple-macos-dmg.py" in dmg_builder
+    assert installer.index('if [ -f "${MAC_SIGNING_ENV}" ]') < installer.index(
+        'if [ -n "${CSC_KEYCHAIN:-}" ]'
+    )
+    assert "unset CSC_LINK" in installer
+    assert "SKIP_DESKTOP_BUILD=1 but desktop/dist/main.js is missing" in installer
+    assert "msg.includes('abortedUpload')" in notarize
+    assert "msg.includes('deadlineExceeded')" in notarize
+
+
+def test_desktop_staging_bundles_visible_office_employee_executors() -> None:
+    scripts = REPO_ROOT / "scripts" / "package"
+    sh_stage = (scripts / "stage-bundled-mods.sh").read_text(encoding="utf-8")
+    ps_stage = (scripts / "stage-bundled-mods.ps1").read_text(encoding="utf-8")
+
+    for stage_script in (sh_stage, ps_stage):
+        assert "office_pack_catalog.json" in stage_script
+        assert "_employees" in stage_script
+        assert "Missing required Office employee pack" in stage_script
+        assert "bundled_employees" in stage_script
+    for manifest in (REPO_ROOT / "mods").glob("*/manifest.json"):
+        declared = json.loads(manifest.read_text(encoding="utf-8")).get("bundled_employees", [])
+        assert all((REPO_ROOT / "mods" / "_employees" / e).is_dir() for e in declared), manifest
+    cs = json.loads(
+        (REPO_ROOT / "mods/bridge/xcagi-customer-service-bridge/manifest.json").read_text()
+    )
+    assert cs["bundled_employees"] == ["user-customer-service-officer"]
+
+
+def test_frozen_backend_dispatches_multiprocessing_workers_before_cli() -> None:
+    entrypoint = (REPO_ROOT / "XCAGI" / "run_fastapi.py").read_text(encoding="utf-8")
+    frozen_main = entrypoint.split('if __name__ == "__main__":', 1)[1]
+
+    assert "multiprocessing.freeze_support()" in frozen_main
+    assert frozen_main.index("multiprocessing.freeze_support()") < frozen_main.index("main()")
+
+
+def test_missing_industry_seed_does_not_block_desktop_release() -> None:
+    scripts = REPO_ROOT / "scripts" / "package"
+    ps_stage = (scripts / "stage-industry-seeds.ps1").read_text(encoding="utf-8")
+    sh_stage = (scripts / "stage-industry-seeds.sh").read_text(encoding="utf-8")
+    ps_verify = (scripts / "verify-industry-seeds.ps1").read_text(encoding="utf-8")
+
+    assert "Skipped missing industry seed mod(s)" in ps_stage
+    assert "Skipped missing industry seed mod(s)" in sh_stage
+    assert '"${ROOT}/mods"' in sh_stage
+    assert '"${ROOT}/XCAGI/mods"' in sh_stage
+    assert 'for mods_root in "${MODS_ROOTS[@]}"' in sh_stage
+    assert "Skipped missing industry seed mod(s)" in ps_verify
+    assert 'throw "Missing industry seed mod(s)' not in ps_stage
+    assert 'throw "industry-seeds/ missing open industry mod(s)' not in ps_verify
+    assert "exit 1" not in sh_stage.split("Skipped missing industry seed mod(s)", 1)[-1]
+
+
+@pytest.mark.parametrize("sku", ["enterprise", "personal", "generic", "minimal", "unknown"])
+def test_frontend_entry_normalizes_legacy_personal_without_changing_runtime_sku(tmp_path, sku):
+    import os
+    import subprocess
+
+    script = tmp_path / "scripts/package/build-frontend.sh"
+    script.parent.mkdir(parents=True)
+    script.write_text((REPO_ROOT / "scripts/package/build-frontend.sh").read_text())
+    (tmp_path / "frontend").mkdir()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    npm = bin_dir / "npm"
+    npm.write_text(
+        "#!/bin/sh\n"
+        'test "$VITE_XCAGI_PRODUCT_SKU:$VITE_XCAGI_EDITION:$XCAGI_PRODUCT_SKU" '
+        '= "enterprise:full:personal" || exit 71\n'
+        "mkdir -p ../templates/vue-dist\n"
+        "echo index-test.js > ../templates/vue-dist/index.html\n"
+        "echo mods/test/frontend/views/ > ../templates/vue-dist/index-test.js\n"
+    )
+    npm.chmod(0o755)
+    result = subprocess.run(
+        ["bash", str(script), sku],
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "SKIP_FRONTEND_INSTALL": "1",
+            "XCAGI_PRODUCT_SKU": "personal",
+        },
+    )
+    assert (result.returncode == 0) == (sku in {"enterprise", "personal"}), result.stderr
+    identity = tmp_path / "build/vue-dist-identity.json"
+    if result.returncode == 0:
+        assert json.loads(identity.read_text())["sku"] == "enterprise"
+    else:
+        assert not identity.exists()

@@ -1,0 +1,52 @@
+id: ecosystem-investor-portal-officer
+name: 投资方只读门户员
+version: 1.0.0
+domain: O-B B4 投资方/伙伴只读 Portal · 里程碑与风险视图 · 进度只读 API。
+owner: admin
+area: partner-ecosystem
+five_line_id: ops_partner
+subzone: investor-portal
+also_serves: []
+scope_globs:
+- MODstore_deploy/market/src/**/admin/**
+- MODstore_deploy/market/src/views/**/Investor*
+- MODstore_deploy/modstore_server/**/investor*
+forbidden_globs:
+- _local_secrets/**
+triggers:
+  on_error: true
+sla:
+  timeout_seconds: 120
+  retry_max: 1
+  escalate_to_human: true
+llm_default: auto
+capabilities:
+  - investor.readonly.report
+  - delivery.metrics.summary
+
+skills:
+  - skills/skill-ecosystem-investor-portal-officer.md
+actions:
+  handlers: ["llm_md", "echo"]
+
+depends_on:
+- market-frontend-dev
+- ecosystem-delivery-reporter
+examples:
+  - title: "投资方只读门户员岗位验收"
+    description: "以最小、无副作用输入验证岗位输出包含真实证据、风险与下一步。"
+    input:
+      task: "执行一次投资方只读门户员职责范围内的只读检查，并返回证据、风险和下一步。"
+      dry_run: true
+
+changelog:
+- version: 1.0.0
+  date: '2026-06-03'
+  note: O-B B4 投资方只读视图专岗
+business_context:
+  five_line: O-B
+  subzone: investor-portal
+  kpis:
+  - 投资人门户可用性
+  - 披露材料完整性
+  summary: O-B B4 投资方/伙伴只读 Portal · 里程碑与风险视图 · 进度只读 API。

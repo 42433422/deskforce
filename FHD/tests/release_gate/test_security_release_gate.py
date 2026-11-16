@@ -1,0 +1,465 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import pytest
+
+
+def _module():
+    script = (
+        Path(__file__).resolve().parents[2] / "scripts" / "security" / "security_release_gate.py"
+    )
+    spec = importlib.util.spec_from_file_location("security_release_gate", script)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _normalizer_module():
+    script = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "security"
+        / "normalize_security_report.py"
+    )
+    spec = importlib.util.spec_from_file_location("normalize_security_report", script)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _dnf_collector_module():
+    script = (
+        Path(__file__).resolve().parents[2] / "scripts" / "security" / "collect_dnf_updateinfo.py"
+    )
+    spec = importlib.util.spec_from_file_location("collect_dnf_updateinfo", script)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _write_reports(directory: Path, mod, now: datetime) -> None:
+    directory.mkdir(exist_ok=True)
+    for scanner in mod.REQUIRED_SCANNERS:
+        (directory / f"{scanner}.json").write_text(
+            json.dumps(
+                {
+                    "available": True,
+                    "scanned_at": now.isoformat(),
+                    "findings": [],
+                }
+            )
+        )
+
+
+def test_all_scanners_must_be_fresh_and_zero(tmp_path: Path) -> None:
+    mod = _module()
+    now = datetime(2026, 9, 4, tzinfo=UTC)
+    _write_reports(tmp_path, mod, now)
+    assert mod.evaluate(tmp_path, now=now)["passed"] is True
+
+    (tmp_path / "trivy-image.json").unlink()
+    failed = mod.evaluate(tmp_path, now=now)
+    assert failed["passed"] is False
+    assert "trivy-image:report_missing" in failed["blockers"]
+
+
+def test_high_and_secret_findings_block(tmp_path: Path) -> None:
+    mod = _module()
+    now = datetime(2026, 9, 4, tzinfo=UTC)
+    _write_reports(tmp_path, mod, now)
+    (tmp_path / "codeql.json").write_text(
+        json.dumps(
+            {
+                "available": True,
+                "scanned_at": now.isoformat(),
+                "findings": [{"id": "ql-1", "severity": "high", "status": "open"}],
+            }
+        )
+    )
+    (tmp_path / "gitleaks.json").write_text(
+        json.dumps(
+            {
+                "available": True,
+                "scanned_at": now.isoformat(),
+                "findings": [{"id": "secret-1", "severity": "unknown", "secret": True}],
+            }
+        )
+    )
+
+    failed = mod.evaluate(tmp_path, now=now)
+
+    assert failed["passed"] is False
+    assert failed["applicable_open"]["high"] == 1
+    assert any("unresolved_secret" in blocker for blocker in failed["blockers"])
+
+
+def test_scanner_error_json_cannot_be_normalized_as_zero_findings() -> None:
+    mod = _normalizer_module()
+
+    for kind, payload in (
+        ("codeql", [{"message": "service unavailable", "status": "503"}]),
+        ("dependabot", [{"message": "not accessible", "status": "403"}]),
+        ("npm-audit", {"error": {"summary": "registry unavailable"}}),
+        ("pip-audit", {"error": "index unavailable"}),
+        ("trivy", {"ArtifactName": "repo"}),
+        ("sarif", {"version": "2.1.0"}),
+        ("credential-incidents", {"schema": "credential-incidents/v1"}),
+        ("dnf-updateinfo", {"schema": "dnf-security-updateinfo/v1"}),
+    ):
+        with pytest.raises(ValueError):
+            mod._validate_native_payload(kind, payload)
+
+
+def test_dnf_vendor_updateinfo_deduplicates_advisories_and_maps_important_to_high() -> None:
+    collector = _dnf_collector_module()
+    normalizer = _normalizer_module()
+    advisories = collector.parse_updateinfo(
+        "\n".join(
+            (
+                "TSSA-2026:0001 Important/Sec. package-a-2.0.x86_64",
+                "TSSA-2026:0001 Important/Sec. package-b-2.0.x86_64",
+                "TSSA-2026:0002 Critical/Sec. kernel-2.0.x86_64",
+                "TSSA-2026:0003 Moderate/Sec. package-c-2.0.x86_64",
+            )
+        )
+    )
+    payload = {
+        "schema": "dnf-security-updateinfo/v1",
+        "os_id": "tencentos",
+        "os_version": "3.3",
+        "running_kernel": "5.4.241-24.0017.28",
+        "installed_kernel": "5.4.241-24.0017.41.5.tl3.x86_64",
+        "running_kernel_current": False,
+        "advisories": advisories,
+    }
+
+    normalizer._validate_native_payload("dnf-updateinfo", payload)
+    findings = normalizer.normalize("dnf-updateinfo", payload)
+
+    assert [row["id"] for row in findings] == [
+        "TSSA-2026:0001",
+        "TSSA-2026:0002",
+        "TSSA-2026:0003",
+        "RUNNING-KERNEL-STALE",
+    ]
+    assert [row["severity"] for row in findings] == ["high", "critical", "medium", "high"]
+    assert findings[0]["packages"] == [
+        "package-a-2.0.x86_64",
+        "package-b-2.0.x86_64",
+    ]
+
+
+def test_pending_credential_rotation_blocks_release() -> None:
+    normalizer = _normalizer_module()
+    payload = {
+        "schema": "credential-incidents/v1",
+        "incidents": [
+            {
+                "id": "INC-1",
+                "fingerprint_sha256": "a" * 64,
+                "status": "rotation_pending",
+                "author": "fix-author",
+            }
+        ],
+    }
+    normalizer._validate_native_payload("credential-incidents", payload)
+    finding = normalizer.normalize("credential-incidents", payload)[0]
+    assert finding["status"] == "open"
+    assert finding["secret"] is True
+
+
+def test_credential_rotation_requires_independent_hashed_evidence() -> None:
+    normalizer = _normalizer_module()
+    now = datetime.now(UTC)
+    row = {
+        "id": "INC-1",
+        "fingerprint_sha256": "a" * 64,
+        "status": "resolved",
+        "author": "fix-author",
+        "reviewer": "security-reviewer",
+        "required_actions": ["revoke", "rotate", "verify_old_credential_rejected"],
+        "revoked_at": (now - timedelta(minutes=20)).isoformat(),
+        "rotated_at": (now - timedelta(minutes=10)).isoformat(),
+        "old_credential_rejected_at": (now - timedelta(minutes=5)).isoformat(),
+        "reviewed_at": now.isoformat(),
+        "review_due": (now + timedelta(days=30)).isoformat(),
+        "resolution_evidence_sha256": "b" * 64,
+    }
+    assert normalizer._credential_resolution_is_valid(row) is True
+
+    row["reviewer"] = "fix-author"
+    assert normalizer._credential_resolution_is_valid(row) is False
+    row["reviewer"] = "security-reviewer"
+    row.pop("old_credential_rejected_at")
+    assert normalizer._credential_resolution_is_valid(row) is False
+    row["old_credential_rejected_at"] = (now - timedelta(minutes=5)).isoformat()
+    row["required_actions"] = ["revoke", "rotate"]
+    assert normalizer._credential_resolution_is_valid(row) is False
+
+
+def test_owner_accepted_risk_does_not_close_credential_incident() -> None:
+    normalizer = _normalizer_module()
+    now = datetime.now(UTC)
+    row = {
+        "id": "INC-1",
+        "fingerprint_sha256": "a" * 64,
+        "status": "accepted_risk",
+        "author": "codex-security-remediation",
+        "reviewer": "owner-42433422",
+        "required_actions": ["revoke", "rotate", "verify_old_credential_rejected"],
+        "accepted_at": (now - timedelta(hours=2)).isoformat(),
+        "reviewed_at": (now - timedelta(hours=1)).isoformat(),
+        "review_due": (now + timedelta(days=30)).isoformat(),
+        "resolution_evidence_sha256": "b" * 64,
+    }
+    rows = normalizer.normalize(
+        "credential-incidents", {"schema": "credential-incidents/v1", "incidents": [row]}
+    )
+    assert rows[0]["status"] == "open"
+    assert rows[0]["secret"] is True
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"reviewer": "codex-security-remediation"},
+        {"resolution_evidence_sha256": "not-a-hash"},
+        {"reviewed_at": "2099-01-01T00:00:00+00:00"},
+        {"review_due": "2020-01-01T00:00:00+00:00"},
+        {"accepted_at": ""},
+        {"status": "rotation_pending"},
+    ],
+)
+def test_owner_accepted_risk_never_closes_credential_incident(mutation) -> None:
+    normalizer = _normalizer_module()
+    now = datetime.now(UTC)
+    row = {
+        "id": "INC-1",
+        "fingerprint_sha256": "a" * 64,
+        "status": "accepted_risk",
+        "author": "codex-security-remediation",
+        "reviewer": "owner-42433422",
+        "required_actions": ["revoke", "rotate", "verify_old_credential_rejected"],
+        "accepted_at": (now - timedelta(hours=2)).isoformat(),
+        "reviewed_at": (now - timedelta(hours=1)).isoformat(),
+        "review_due": (now + timedelta(days=30)).isoformat(),
+        "resolution_evidence_sha256": "b" * 64,
+    }
+    row.update(mutation)
+    rows = normalizer.normalize(
+        "credential-incidents", {"schema": "credential-incidents/v1", "incidents": [row]}
+    )
+    assert rows[0]["status"] == "open"
+    assert rows[0]["secret"] is True
+
+
+def test_false_positive_requires_independent_fresh_review(tmp_path: Path) -> None:
+    mod = _module()
+    now = datetime(2026, 9, 4, tzinfo=UTC)
+    _write_reports(tmp_path, mod, now)
+    finding = {
+        "id": "ql-reviewed",
+        "severity": "critical",
+        "status": "open",
+        "author": "developer-a",
+        "disposition": "false_positive",
+        "false_positive_approval": {
+            "reviewer": "security-reviewer-b",
+            "evidence": "validated closed command grammar and shell=False",
+            "reviewed_at": now.isoformat(),
+            "review_due": (now + timedelta(days=30)).isoformat(),
+        },
+    }
+    (tmp_path / "codeql.json").write_text(
+        json.dumps({"available": True, "scanned_at": now.isoformat(), "findings": [finding]})
+    )
+    assert mod.evaluate(tmp_path, now=now)["passed"] is True
+
+    finding["false_positive_approval"]["reviewer"] = "developer-a"
+    (tmp_path / "codeql.json").write_text(
+        json.dumps({"available": True, "scanned_at": now.isoformat(), "findings": [finding]})
+    )
+    assert mod.evaluate(tmp_path, now=now)["passed"] is False
+
+
+@pytest.mark.parametrize("author", ["", "  ", "SECURITY-REVIEWER", "security-reviewer"])
+def test_false_positive_cannot_omit_author_or_change_account_case(author):
+    now = datetime(2026, 9, 5, tzinfo=UTC)
+    finding = {
+        "author": author,
+        "false_positive_approval": {
+            "reviewer": "security-reviewer",
+            "evidence": "reviewed source and data flow",
+            "reviewed_at": now.isoformat(),
+            "review_due": (now + timedelta(days=30)).isoformat(),
+        },
+    }
+    assert _module()._false_positive_is_valid(finding, now) is False
+
+
+def test_dismissed_alert_requires_structured_independent_review() -> None:
+    normalizer = _normalizer_module()
+    rows = normalizer.normalize(
+        "codeql",
+        [
+            {
+                "number": 71,
+                "state": "dismissed",
+                "rule": {"security_severity_level": "high"},
+                "dismissed_by": {"login": "security-reviewer"},
+                "dismissed_at": "2026-09-04T00:00:00Z",
+                "dismissed_reason": "false positive",
+                "dismissed_comment": json.dumps(
+                    {
+                        "author": "fix-author",
+                        "evidence": "review-record-sha256:abc",
+                        "review_due": "2026-10-04T00:00:00Z",
+                    }
+                ),
+            }
+        ],
+    )
+
+    assert rows[0]["status"] == "active"
+    assert rows[0]["disposition"] == "false_positive"
+    assert rows[0]["author"] == "fix-author"
+    assert rows[0]["false_positive_approval"]["reviewer"] == "security-reviewer"
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["won't fix", "used in tests", "tolerable_risk", "no_bandwidth", "fix_started", "not_used", ""],
+)
+def test_risk_acceptance_cannot_masquerade_as_false_positive(reason):
+    fields = _normalizer_module()._dismissal_fields({"dismissed_reason": reason})
+    assert fields["status"] == "active"
+    assert fields["disposition"] == "unapproved_dismissal"
+
+
+@pytest.mark.parametrize("reason", ["false positive", "inaccurate"])
+def test_only_native_false_positive_reasons_enter_review_gate(reason):
+    fields = _normalizer_module()._dismissal_fields({"dismissed_reason": reason})
+    assert fields["disposition"] == "false_positive"
+    assert _module()._false_positive_is_valid(fields, datetime.now(UTC)) is False
+
+
+def test_sarif_numeric_and_error_severity_cannot_evade_high_gate() -> None:
+    normalizer = _normalizer_module()
+    findings = normalizer.normalize(
+        "sarif",
+        {
+            "runs": [
+                {
+                    "results": [
+                        {"ruleId": "electron-unsafe", "level": "error"},
+                        {
+                            "ruleId": "electron-critical",
+                            "properties": {"security-severity": "9.8"},
+                        },
+                    ]
+                }
+            ]
+        },
+    )
+
+    assert [row["severity"] for row in findings] == ["high", "critical"]
+
+
+def test_codeql_provenance_requires_fresh_exact_sha_for_each_language() -> None:
+    normalizer = _normalizer_module()
+    now = datetime(2026, 9, 5, tzinfo=UTC)
+    sha = "a" * 40
+    analyses = [
+        {
+            "category": "/language:python",
+            "commit_sha": sha,
+            "created_at": (now - timedelta(hours=1)).isoformat(),
+        },
+        {
+            "category": "/language:javascript-typescript",
+            "commit_sha": sha,
+            "created_at": (now - timedelta(hours=1)).isoformat(),
+        },
+    ]
+
+    assert (
+        normalizer._validate_codeql_provenance(
+            analyses,
+            release_sha=sha,
+            required_categories=[
+                "/language:python",
+                "/language:javascript-typescript",
+            ],
+            now=now,
+        )
+        == sha
+    )
+
+    analyses[1]["commit_sha"] = "b" * 40
+    with pytest.raises(ValueError, match="SHA mismatch"):
+        normalizer._validate_codeql_provenance(
+            analyses,
+            release_sha=sha,
+            required_categories=[
+                "/language:python",
+                "/language:javascript-typescript",
+            ],
+            now=now,
+        )
+
+
+def test_release_gate_rejects_relabelled_scanner_evidence(tmp_path: Path) -> None:
+    mod = _module()
+    now = datetime(2026, 9, 5, tzinfo=UTC)
+    release_sha = "a" * 40
+    _write_reports(tmp_path, mod, now)
+    for scanner in mod.REQUIRED_SCANNERS:
+        path = tmp_path / f"{scanner}.json"
+        payload = json.loads(path.read_text())
+        payload["release_sha"] = release_sha
+        payload["source_sha"] = release_sha
+        path.write_text(json.dumps(payload))
+
+    assert mod.evaluate(tmp_path, now=now, release_sha=release_sha)["passed"] is True
+    payload = json.loads((tmp_path / "codeql.json").read_text())
+    payload["source_sha"] = "b" * 40
+    (tmp_path / "codeql.json").write_text(json.dumps(payload))
+    failed = mod.evaluate(tmp_path, now=now, release_sha=release_sha)
+    assert failed["passed"] is False
+    assert "codeql:source_sha_mismatch" in failed["blockers"]
+
+
+def test_full_scan_collects_and_uploads_evidence_after_individual_scanner_failure() -> None:
+    workflow = (
+        Path(__file__).resolve().parents[2] / ".github" / "workflows" / "security-full-scan.yml"
+    ).read_text()
+
+    assert "Build and scan final FHD production image\n        continue-on-error: true" in workflow
+    assert "--config /repo/.github/gitleaks-config.toml" in workflow
+    assert "credential-rotation credential-incidents" in workflow
+    assert "secrets.CI_COMMIT_TOKEN || github.token" in workflow
+    assert "--no-emit-local" in workflow
+    assert "collect_dnf_updateinfo.py" in workflow
+    assert "dnf -q --refresh" in workflow
+    assert "updateinfo list --security updates" in workflow
+    assert "normalize production-host dnf-updateinfo" in workflow
+    assert "mktemp -d /tmp/xcmax-security-scan.XXXXXX" in workflow
+    assert "production-host-installed-kernel" in workflow
+    assert "scp " not in workflow
+    assert "docker run --rm -v /:/host:ro aquasec/trivy:latest" not in workflow
+    assert (
+        "continue-on-error: true\n        working-directory: .\n        run: docker build"
+        in workflow
+    )
+    assert "Normalize all scanner reports\n        if: always()" in workflow
+    assert "Enforce all-source zero critical/high gate\n        if: always()" in workflow
+    assert (
+        "Upload auditable security evidence even when gate fails\n        if: always()" in workflow
+    )

@@ -1,0 +1,337 @@
+package com.modstore.controller;
+
+import com.modstore.model.Order;
+import com.modstore.model.Transaction;
+import com.modstore.model.User;
+import com.modstore.repository.TransactionRepository;
+import com.modstore.repository.UserRepository;
+import com.modstore.repository.WalletRepository;
+import com.modstore.service.AlipayService;
+import com.modstore.service.OrderService;
+import com.modstore.service.WalletService;
+import com.modstore.service.WechatPayService;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.springframework.data.domain.PageImpl;
+import org.springframework.data.domain.Pageable;
+import org.springframework.test.util.ReflectionTestUtils;
+import org.springframework.web.server.ResponseStatusException;
+
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.Map;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+class InternalPaymentControllerTest {
+
+    private OrderService orderService;
+    private InternalPaymentController controller;
+    private UserRepository userRepository;
+    private AlipayService alipayService;
+    private WechatPayService wechatPayService;
+    private WalletService walletService;
+    private TransactionRepository transactionRepository;
+
+    @BeforeEach
+    void setUp() {
+        orderService = mock(OrderService.class);
+        userRepository = mock(UserRepository.class);
+        alipayService = mock(AlipayService.class);
+        wechatPayService = mock(WechatPayService.class);
+        walletService = mock(WalletService.class);
+        transactionRepository = mock(TransactionRepository.class);
+        controller = new InternalPaymentController(
+                userRepository,
+                orderService,
+                alipayService,
+                wechatPayService,
+                walletService,
+                mock(WalletRepository.class),
+                transactionRepository
+        );
+        ReflectionTestUtils.setField(controller, "internalApiKey", "test-internal-key");
+        ReflectionTestUtils.setField(controller, "deployTier", "production");
+        ReflectionTestUtils.setField(controller, "alipayDebug", false);
+        ReflectionTestUtils.setField(controller, "publicOrigin", "https://www.xiu-ci.com");
+        ReflectionTestUtils.setField(controller, "marketPrefix", "/market");
+    }
+
+    @Test
+    void walletPaginationPreservesNonAlignedOffsets() {
+        when(userRepository.findAll(any(Pageable.class))).thenAnswer(invocation -> {
+            Pageable page = invocation.getArgument(0);
+            assertEquals(3, page.getOffset());
+            assertEquals(2, page.getPageSize());
+            return new PageImpl<>(List.of(), page, 5);
+        });
+        assertEquals(5L, controller.wallets("test-internal-key", 2, 3).get("total"));
+    }
+
+    @Test
+    void transactionPaginationPreservesOffsetAndBreaksTimestampTies() {
+        when(transactionRepository.findAll(any(Pageable.class))).thenAnswer(invocation -> {
+            Pageable page = invocation.getArgument(0);
+            assertEquals(3, page.getOffset());
+            assertEquals(2, page.getPageSize());
+            assertEquals("createdAt: DESC,id: DESC", page.getSort().toString());
+            return new PageImpl<>(List.of(), page, 5);
+        });
+        assertEquals(5L, controller.transactions("test-internal-key", 2, 3).get("total"));
+    }
+
+    @Test
+    void customDeliveryCheckoutCreatesDedicatedServiceOrder() {
+        User user = new User();
+        user.setId(7L);
+        when(userRepository.findById(7L)).thenReturn(java.util.Optional.of(user));
+        when(orderService.createOrder(
+                eq(user), any(), eq("合同复核新增开发"), eq(new BigDecimal("8800.00")),
+                eq("custom_delivery"), eq(null), eq(null), any()
+        )).thenAnswer(invocation -> {
+            Order order = new Order();
+            order.setOutTradeNo(invocation.getArgument(1));
+            return order;
+        });
+        when(alipayService.createPagePay(
+                any(), eq("合同复核新增开发"), eq(new BigDecimal("8800.00")), any()
+        )).thenReturn(Map.of(
+                "ok", true,
+                "type", "page",
+                "redirect_url", "https://alipay.example/pay"
+        ));
+
+        Map<String, Object> result = controller.customDeliveryCheckout(
+                "test-internal-key",
+                Map.of(
+                        "user_id", 7,
+                        "ticket_no", "CD202608290001",
+                        "subject", "合同复核新增开发",
+                        "total_amount", "8800.00",
+                        "pay_channel", "alipay"
+                )
+        );
+
+        assertEquals(true, result.get("ok"));
+        assertEquals("custom_delivery", result.get("order_kind"));
+        assertEquals("8800.00", result.get("total_amount"));
+        assertEquals("https://alipay.example/pay", result.get("redirect_url"));
+        assertTrue(String.valueOf(result.get("checkout_path")).startsWith("/market/checkout/CDP"));
+        verify(orderService).updatePaymentMetadata(any(), eq("page"), eq(null));
+    }
+
+    @Test
+    void valueEvidenceRequiresInternalKey() {
+        assertThrows(
+                ResponseStatusException.class,
+                () -> controller.valueEvidence("wrong-key", 90, 1000, 0)
+        );
+    }
+
+    @Test
+    void enterpriseIdentityIsFrozenInJavaPaymentOwnerBeforeCheckout() {
+        User user = new User();
+        user.setId(73L);
+        when(userRepository.findById(73L)).thenReturn(java.util.Optional.of(user));
+
+        Map<String, Object> result = controller.freezeEnterpriseIdentity(
+                "test-internal-key",
+                Map.of(
+                        "user_id", 73,
+                        "verified_by_user_id", 5,
+                        "enterprise_subject_id", "credit-code-001",
+                        "legal_name", "真实客户甲有限公司",
+                        "verification_sha256", "a".repeat(64)
+                )
+        );
+
+        assertEquals(true, result.get("frozen"));
+        assertEquals("credit-code-001", user.getEnterpriseSubjectId());
+        assertEquals("真实客户甲有限公司", user.getEnterpriseLegalName());
+        assertEquals("a".repeat(64), user.getEnterpriseVerificationSha256());
+        assertTrue(user.isEnterprise());
+        verify(userRepository).save(user);
+
+        ResponseStatusException conflict = assertThrows(
+                ResponseStatusException.class,
+                () -> controller.freezeEnterpriseIdentity(
+                        "test-internal-key",
+                        Map.of(
+                                "user_id", 73,
+                                "verified_by_user_id", 5,
+                                "enterprise_subject_id", "credit-code-other",
+                                "legal_name", "其他客户有限公司",
+                                "verification_sha256", "b".repeat(64)
+                        )
+                )
+        );
+        assertEquals(409, conflict.getStatusCode().value());
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void valueEvidenceReturnsOnlyMinimalProviderProof() {
+        Order order = new Order();
+        User owner = new User();
+        owner.setId(73L);
+        order.setUser(owner);
+        order.setEnterpriseSubjectId("credit-code-001");
+        order.setOutTradeNo("customer-order-001");
+        order.setStatus("paid");
+        order.setSubject("Customer delivery");
+        order.setOrderKind("item");
+        order.setItemId(42L);
+        order.setTotalAmount(new BigDecimal("99.00"));
+        order.setPaidAt(LocalDateTime.of(2026, 7, 22, 20, 0));
+        order.setPayType("page");
+        order.setTradeNo("provider-trade-001");
+        order.setRefundStatus("none");
+        order.setFulfilled(true);
+        when(orderService.getCustomerValueFulfillmentEvidence(order)).thenReturn(Map.of(
+                "verified", true,
+                "reason", "verified",
+                "artifact_id", "catalog:customer-value-pack@1.2.3",
+                "artifact_sha256", "a".repeat(64),
+                "fulfilled_at", LocalDateTime.of(2026, 7, 22, 20, 5)
+        ));
+        when(orderService.findPaidValueEvidenceSince(any(), eq(1000), eq(0)))
+                .thenReturn(List.of(order));
+        when(orderService.countPaidValueEvidenceSince(any())).thenReturn(1L);
+
+        Map<String, Object> result = controller.valueEvidence(
+                "test-internal-key",
+                90,
+                1000,
+                0
+        );
+        List<Map<String, Object>> rows = (List<Map<String, Object>>) result.get("orders");
+        Map<String, Object> row = rows.get(0);
+
+        assertEquals("java_postgresql", result.get("source"));
+        assertEquals("production", result.get("environment"));
+        assertEquals("alipay", row.get("payment_provider"));
+        assertEquals("java_gateway_verified", row.get("provider_verification"));
+        assertEquals("production", row.get("payment_environment"));
+        assertEquals("2026-07-22T12:00:00Z", row.get("paid_at"));
+        assertEquals("item", row.get("order_kind"));
+        assertEquals(42L, row.get("item_id"));
+        assertEquals("", row.get("plan_id"));
+        assertEquals(true, row.get("fulfillment_verified"));
+        assertEquals("catalog:customer-value-pack@1.2.3", row.get("fulfillment_artifact_id"));
+        assertEquals("a".repeat(64), row.get("fulfillment_artifact_sha256"));
+        assertEquals("2026-07-22T12:05:00Z", row.get("fulfilled_at"));
+        assertEquals(false, row.get("acceptance_verified"));
+        assertEquals("", row.get("accepted_at"));
+        assertEquals(73L, row.get("user_id"));
+        assertEquals("credit-code-001", row.get("enterprise_subject_id"));
+        assertTrue(row.keySet().stream().noneMatch(key -> key.contains("username")));
+        assertTrue(row.keySet().stream().noneMatch(key -> key.contains("email")));
+        assertTrue(row.keySet().stream().noneMatch(key -> key.contains("buyer")));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void valueEvidenceExportsPlanActivationAndObservedUsageWithoutCustomerIdentity() {
+        Order order = new Order();
+        order.setOutTradeNo("customer-plan-order-001");
+        order.setStatus("paid");
+        order.setSubject("Customer plan");
+        order.setOrderKind("plan");
+        order.setPlanId("pro");
+        order.setTotalAmount(new BigDecimal("19.90"));
+        order.setPaidAt(LocalDateTime.of(2026, 7, 22, 20, 0));
+        order.setPayType("page");
+        order.setTradeNo("provider-plan-trade-001");
+        order.setRefundStatus("none");
+        order.setFulfilled(true);
+        when(orderService.getCustomerValueFulfillmentEvidence(order)).thenReturn(Map.of(
+                "verified", true,
+                "reason", "verified",
+                "artifact_id", "service-plan:pro@0123456789abcdef",
+                "artifact_sha256", "b".repeat(64),
+                "artifact_kind", "service_plan_activation",
+                "fulfilled_at", LocalDateTime.of(2026, 7, 22, 20, 5),
+                "acceptance_verified", true,
+                "acceptance_reason", "verified_plan_usage",
+                "accepted_at", LocalDateTime.of(2026, 7, 22, 20, 30)
+        ));
+        when(orderService.findPaidValueEvidenceSince(any(), eq(1000), eq(0)))
+                .thenReturn(List.of(order));
+        when(orderService.countPaidValueEvidenceSince(any())).thenReturn(1L);
+
+        Map<String, Object> result = controller.valueEvidence(
+                "test-internal-key",
+                90,
+                1000,
+                0
+        );
+        Map<String, Object> row = ((List<Map<String, Object>>) result.get("orders")).get(0);
+
+        assertEquals("plan", row.get("order_kind"));
+        assertEquals("pro", row.get("plan_id"));
+        assertEquals("service_plan_activation", row.get("fulfillment_artifact_kind"));
+        assertEquals(true, row.get("acceptance_verified"));
+        assertEquals("verified_plan_usage", row.get("acceptance_reason"));
+        assertEquals("2026-07-22T12:30:00Z", row.get("accepted_at"));
+        assertEquals(0L, row.get("user_id"));
+        assertEquals("", row.get("enterprise_subject_id"));
+        assertTrue(row.keySet().stream().noneMatch(key -> key.contains("buyer")));
+    }
+
+    @Test
+    void creditWalletWritesTheJavaLedgerForThatUser() {
+        User user = new User();
+        user.setId(33L);
+        when(userRepository.findById(33L)).thenReturn(java.util.Optional.of(user));
+        Transaction txn = new Transaction();
+        txn.setBalanceAfter(new BigDecimal("100.83"));
+        when(walletService.credit(
+                eq(user), eq(new BigDecimal("100.00")), eq("admin_credit"), eq("端到端测试加款"),
+                eq(null), eq(null), eq(null), eq("admin_credit:33:abc")
+        )).thenReturn(txn);
+
+        Map<String, Object> result = controller.creditWallet(
+                "test-internal-key",
+                Map.of(
+                        "user_id", 33,
+                        "amount", "100.00",
+                        "description", "端到端测试加款",
+                        "idempotency_key", "admin_credit:33:abc"
+                )
+        );
+
+        assertEquals(true, result.get("ok"));
+        assertEquals("java_postgresql", result.get("source"));
+        assertEquals(33L, result.get("user_id"));
+        assertEquals("100.00", result.get("amount"));
+        assertEquals("100.83", result.get("balance"));
+        verify(walletService).credit(
+                eq(user), eq(new BigDecimal("100.00")), eq("admin_credit"), eq("端到端测试加款"),
+                eq(null), eq(null), eq(null), eq("admin_credit:33:abc")
+        );
+    }
+
+    @Test
+    void creditWalletRejectsAMissingUserAndABadKey() {
+        when(userRepository.findById(33L)).thenReturn(java.util.Optional.empty());
+        ResponseStatusException missing = assertThrows(
+                ResponseStatusException.class,
+                () -> controller.creditWallet("test-internal-key", Map.of("user_id", 33, "amount", "1.00"))
+        );
+        assertEquals(404, missing.getStatusCode().value());
+
+        ResponseStatusException forbidden = assertThrows(
+                ResponseStatusException.class,
+                () -> controller.creditWallet("wrong", Map.of("user_id", 33, "amount", "1.00"))
+        );
+        assertEquals(403, forbidden.getStatusCode().value());
+    }
+}

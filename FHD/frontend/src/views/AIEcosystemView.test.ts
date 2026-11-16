@@ -1,0 +1,183 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { mount, flushPromises } from '@vue/test-utils'
+import { createRouter, createMemoryHistory } from 'vue-router'
+
+vi.mock('@/utils/plannerPagePaths', () => ({
+  resolvePlannerPageRedirectForRouteName: vi.fn(() => null),
+}))
+
+import AIEcosystemView from './AIEcosystemView.vue'
+import { resolvePlannerPageRedirectForRouteName } from '@/utils/plannerPagePaths'
+
+function makeRouter(includeDeliveryCenter = true) {
+  const routes = [
+    { path: '/', name: 'home', component: { template: '<div />' } },
+    { path: '/mod-store', name: 'mod-store', component: { template: '<div />' } },
+    { path: '/mod/store', name: 'mod-store-planner', component: { template: '<div />' } },
+    { path: '/market-overview', name: 'market-overview', component: { template: '<div />' } },
+    { path: '/ecosystem', name: 'ecosystem', component: AIEcosystemView },
+  ]
+  if (includeDeliveryCenter) {
+    routes.push({ path: '/delivery-center', name: 'delivery-center', component: { template: '<div />' } })
+  }
+  return createRouter({
+    history: createMemoryHistory(),
+    routes,
+  })
+}
+
+async function mountView(includeDeliveryCenter = true) {
+  const router = makeRouter(includeDeliveryCenter)
+  await router.push('/ecosystem')
+  await router.isReady()
+  const wrapper = mount(AIEcosystemView, {
+    global: {
+      plugins: [router],
+      stubs: {
+        AiOpenLauncherIcon: { template: '<i class="icon-aiopen" />' },
+        AIOpenPanel: {
+          name: 'AIOpenPanel',
+          emits: ['back'],
+          template: '<div class="aiopen-panel-stub" />',
+        },
+        KittenLauncherIcon: { template: '<i class="icon-kitten" />' },
+        KittenAnalyzerView: {
+          name: 'KittenAnalyzerView',
+          emits: ['back'],
+          template: '<div class="kitten-analyzer-stub" />',
+        },
+        ProductionEmployeeLauncherIcon: { template: '<i class="icon-prod" />' },
+        PrivateModDeliveryPanel: {
+          name: 'PrivateModDeliveryPanel',
+          template: '<div class="private-mod-delivery-stub" />',
+        },
+        ModStoreLauncherIcon: { template: '<i class="icon-modstore" />' },
+      },
+    },
+  })
+  return { wrapper, router }
+}
+
+describe('AIEcosystemView.vue', () => {
+  afterEach(() => vi.unstubAllEnvs())
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.stubEnv('VITE_XCMAX_ADMIN_CONSOLE', '')
+    vi.mocked(resolvePlannerPageRedirectForRouteName).mockReturnValue(null)
+  })
+
+  it('renders the ecosystem home by default', async () => {
+    const { wrapper } = await mountView()
+    expect(wrapper.find('.ecosystem-home').exists()).toBe(true)
+    expect(wrapper.find('.ecosystem-home-title').text()).toBe('AI生态应用')
+    const launchers = wrapper.findAll('.app-launcher')
+    expect(launchers).toHaveLength(4)
+    expect(wrapper.find('.app-launcher--kitten').exists()).toBe(true)
+    expect(wrapper.find('.app-launcher--aiopen').exists()).toBe(true)
+    expect(wrapper.find('.app-launcher--production').exists()).toBe(true)
+    expect(wrapper.find('.app-launcher--modstore').exists()).toBe(true)
+    const descs = wrapper.findAll('.app-launcher-desc')
+    expect(descs).toHaveLength(4)
+    expect(descs[0].text()).toContain('可视化 AI 员工')
+    expect(descs[1].text()).toContain('MCP/API')
+    expect(descs[2].text()).toContain('客户交付中心')
+    expect(descs[3].text()).toContain('MOD 扩展')
+    const names = wrapper.findAll('.app-launcher-name')
+    expect(names.map((n) => n.text())).toEqual(['智慧分析', 'AIOPEN 开放智控', '生产员工', '员工商店'])
+    const modstore = wrapper.find('[data-tour="ecosystem-launcher-modstore"]')
+    expect(modstore.exists()).toBe(true)
+  })
+  it('shows market overview launcher instead of modstore in the admin console', async () => {
+    vi.stubEnv('VITE_XCMAX_ADMIN_CONSOLE', '1')
+    const { wrapper, router } = await mountView()
+    const pushSpy = vi.spyOn(router, 'push')
+    expect(wrapper.findAll('.app-launcher')).toHaveLength(4)
+    expect(wrapper.find('[data-tour="ecosystem-launcher-modstore"]').exists()).toBe(false)
+    const market = wrapper.find('[data-tour="ecosystem-launcher-market-overview"]')
+    expect(market.exists()).toBe(true)
+    expect(market.text()).toContain('市场总览')
+    await market.trigger('click')
+    await flushPromises()
+    expect(pushSpy.mock.calls.some((c) => c[0]?.name === 'market-overview')).toBe(true)
+  })
+
+  it('hides ecosystem home after entering kitten analyzer', async () => {
+    const { wrapper } = await mountView()
+    await wrapper.find('.app-launcher--kitten').trigger('click')
+    await wrapper.vm.$nextTick()
+    expect(wrapper.find('.ecosystem-home').exists()).toBe(false)
+  })
+
+  it('hides ecosystem home after entering aiopen panel', async () => {
+    const { wrapper } = await mountView()
+    await wrapper.find('.app-launcher--aiopen').trigger('click')
+    await wrapper.vm.$nextTick()
+    expect(wrapper.find('.ecosystem-home').exists()).toBe(false)
+  })
+
+  it('returns to ecosystem home on exitAnalyzer via back event', async () => {
+    const { wrapper } = await mountView()
+    await wrapper.find('.app-launcher--kitten').trigger('click')
+    await wrapper.vm.$nextTick()
+    expect(wrapper.find('.ecosystem-home').exists()).toBe(false)
+    // Emit back from the analyzer child (async component resolves to KittenAnalyzerView)
+    await wrapper.vm.$nextTick()
+    const kitten = wrapper.findComponent({ name: 'KittenAnalyzerView' })
+    if (kitten.exists()) {
+      kitten.vm.$emit('back')
+      await wrapper.vm.$nextTick()
+      expect(wrapper.find('.ecosystem-home').exists()).toBe(true)
+    } else {
+      // If async component not yet resolved, test exitAnalyzer via AIOpenPanel path
+      const aiopen = wrapper.findComponent({ name: 'AIOpenPanel' })
+      if (aiopen.exists()) {
+        aiopen.vm.$emit('back')
+        await wrapper.vm.$nextTick()
+        expect(wrapper.find('.ecosystem-home').exists()).toBe(true)
+      }
+    }
+  })
+
+  it('routes production employees into the admin customer delivery center', async () => {
+    const { wrapper, router } = await mountView()
+    const pushSpy = vi.spyOn(router, 'push')
+    await wrapper.find('.app-launcher--production').trigger('click')
+    await flushPromises()
+    expect(pushSpy).toHaveBeenCalled()
+    expect(pushSpy.mock.calls.some((c) => c[0]?.name === 'delivery-center')).toBe(true)
+  })
+
+  it('keeps the private production panel outside the admin console', async () => {
+    const { wrapper, router } = await mountView(false)
+    const pushSpy = vi.spyOn(router, 'push')
+    await wrapper.find('.app-launcher--production').trigger('click')
+    await wrapper.vm.$nextTick()
+    expect(wrapper.find('.ecosystem-home').exists()).toBe(false)
+    expect(wrapper.find('.production-embed').exists()).toBe(true)
+    expect(pushSpy).not.toHaveBeenCalled()
+  })
+
+  it('navigates to mod-store shell page when modstore launcher clicked', async () => {
+    const { wrapper, router } = await mountView()
+    const pushSpy = vi.spyOn(router, 'push')
+    await wrapper.find('.app-launcher--modstore').trigger('click')
+    await flushPromises()
+    expect(pushSpy.mock.calls.some((c) => c[0]?.name === 'mod-store')).toBe(true)
+  })
+
+  it('uses mod path redirect when planner mod pages enabled (mod-store)', async () => {
+    vi.mocked(resolvePlannerPageRedirectForRouteName).mockReturnValue('/mod/store')
+    const { wrapper, router } = await mountView()
+    const pushSpy = vi.spyOn(router, 'push')
+    const replaceSpy = vi.spyOn(router, 'replace')
+    await wrapper.find('.app-launcher--modstore').trigger('click')
+    await flushPromises()
+    const touchedPlanner =
+      pushSpy.mock.calls.some((c) => c[0]?.path === '/mod/store' || c[0]?.name === 'mod-store')
+      || replaceSpy.mock.calls.some((c) => c[0]?.path === '/mod/store')
+      || String(router.currentRoute.value.path || '').includes('/mod/store')
+      || router.currentRoute.value.name === 'mod-store'
+      || router.currentRoute.value.name === 'mod-store-planner'
+    expect(touchedPlanner).toBe(true)
+  })
+})

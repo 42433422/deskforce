@@ -1,0 +1,272 @@
+"""按员工能力派生「作用域工具子集」。
+
+此前所有员工的 agent handler 共享同一份全量工具表 —— 差异只在 prompt。
+本模块让差异真实生效：根据 manifest 的 capabilities / expertise / read_only，
+从 ``get_workflow_tool_registry()`` 的基础工具里挑选适配子集（剔除员工包工具本身，避免递归）。
+
+优先级：
+1. 显式声明（``employee_config_v2.tools`` / ``actions.tools`` / ``actions.agent.tools``）—— 为 P4 迁移预留。
+2. 能力关键词派生（excel / 图表 / 文档 / 导入 …）。
+3. 兜底：只读员工给只读分析工具，其它给分析 + 文档生成。
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from app.utils.operational_errors import RECOVERABLE_ERRORS
+
+logger = logging.getLogger(__name__)
+
+READ_TOOLS = ("excel_analysis", "excel_schema_understand", "excel_join_compare")
+CHART_TOOLS = ("excel_chart_recommend",)
+DOC_TOOLS = ("generate_office_document",)
+
+
+def __getattr__(name: str):
+    if name == "WRITE_TOOLS":
+        from resources.config.risk_actions_loader import list_write_tools
+
+        return list_write_tools()
+    if name == "CODE_WRITE_TOOLS":
+        from resources.config.risk_actions_loader import list_code_write_tools
+
+        return list_code_write_tools()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+_EXCEL_KW = (
+    "excel",
+    "表格",
+    "spreadsheet",
+    "数据",
+    "data",
+    "sheet",
+    "csv",
+    "汇总",
+    "统计",
+    "analy",
+    "分析",
+    "报表",
+)
+_CHART_KW = ("chart", "图表", "可视", "viz", "plot", "看板", "dashboard")
+_DOC_KW = (
+    "文档",
+    "报告",
+    "报表",
+    "document",
+    "word",
+    "报价",
+    "单据",
+    "receipt",
+    "deliver",
+    "交付",
+    "generate",
+    "合同",
+    "contract",
+    "letter",
+    "函",
+    "ppt",
+    "幻灯",
+    "pdf",
+)
+_IMPORT_KW = ("导入", "入库", "import", "批量", "bulk", "录入", "ingest", "写库")
+
+
+def _base_tool_specs() -> dict[str, dict[str, Any]]:
+    """基础（非员工包）工具：name -> spec。"""
+    try:
+        from app.application.tools.workflow import get_workflow_tool_registry
+        from app.mod_sdk.employee_tool_registry import is_employee_tool
+
+        out: dict[str, dict[str, Any]] = {}
+        for spec in get_workflow_tool_registry() or []:
+            if not isinstance(spec, dict):
+                continue
+            name = str((spec.get("function") or {}).get("name") or "")
+            if name and not is_employee_tool(name):
+                out[name] = spec
+        return out
+    except RECOVERABLE_ERRORS:
+        logger.debug("base tool specs unavailable", exc_info=True)
+        return {}
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _explicit_allowlist(config: dict[str, Any], manifest: dict[str, Any]) -> list[str] | None:
+    actions = _as_dict(config.get("actions"))
+    agent = _as_dict(actions.get("agent"))
+    v2 = _as_dict(manifest.get("employee_config_v2"))
+    for candidate in (
+        config.get("tools"),
+        actions.get("tools"),
+        agent.get("tools"),
+        v2.get("tools"),
+        manifest.get("tools"),
+    ):
+        if isinstance(candidate, list):
+            return [x.strip() for x in candidate if isinstance(x, str) and x.strip()]
+    return None
+
+
+def _capability_text(manifest: dict[str, Any], config: dict[str, Any]) -> str:
+    parts: list[str] = []
+    emp = _as_dict(manifest.get("employee"))
+    for cap in emp.get("capabilities") or []:
+        if isinstance(cap, dict):
+            parts.append(str(cap.get("label") or ""))
+            parts.append(str(cap.get("description") or ""))
+        else:
+            parts.append(str(cap))
+    cog = _as_dict(config.get("cognition"))
+    agent = _as_dict(cog.get("agent"))
+    role = _as_dict(agent.get("role"))
+    for exp in role.get("expertise") or []:
+        parts.append(str(exp))
+    for skill in cog.get("skills") or []:
+        if isinstance(skill, dict):
+            parts.append(str(skill.get("name") or ""))
+            parts.append(str(skill.get("brief") or ""))
+        else:
+            parts.append(str(skill))
+    identity = _as_dict(config.get("identity"))
+    for key in ("domain", "area", "description", "name"):
+        if not isinstance(identity, dict):
+            identity = {}
+        parts.append(str(identity.get(key) or ""))
+    parts.append(str(manifest.get("description") or ""))
+    return " ".join(p for p in parts if p).lower()
+
+
+def is_read_only(manifest: dict[str, Any], config: dict[str, Any]) -> bool:
+    actions = _as_dict(config.get("actions"))
+    agent = _as_dict(actions.get("agent"))
+    ws = _as_dict(agent.get("workspace"))
+    if bool(ws.get("read_only")):
+        return True
+    v2 = _as_dict(manifest.get("employee_config_v2"))
+    wp = _as_dict(v2.get("workspace_policy"))
+    return bool(wp.get("read_only"))
+
+
+def _merge_lifecycle_tools(
+    employee_id: str,
+    manifest: dict[str, Any],
+    config: dict[str, Any],
+    specs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Append published lifecycle tools the employee runtime is allowed to call."""
+    try:
+        from app.application.agent_tool_lifecycle import discovery_for_runtime
+
+        extra = discovery_for_runtime(employee_id)
+    except RECOVERABLE_ERRORS:
+        return specs
+    allow = _explicit_allowlist(config, manifest)
+    merged = list(specs)
+    seen = {str((item.get("function") or {}).get("name") or "") for item in merged}
+    for spec in extra:
+        if not isinstance(spec, dict):
+            continue
+        name = str((spec.get("function") or {}).get("name") or "")
+        if not name or name in seen:
+            continue
+        if allow is not None and name not in allow:
+            continue
+        merged.append(spec)
+        seen.add(name)
+    return merged
+
+
+def resolve_employee_tools(
+    employee_id: str, manifest: dict[str, Any], config: dict[str, Any]
+) -> list[dict[str, Any]]:
+    base = _base_tool_specs()
+    allow = _explicit_allowlist(config, manifest)
+    if not base:
+        return _merge_lifecycle_tools(employee_id, manifest, config, [])
+    if allow is not None:
+        allowlisted = [base[name] for name in allow if name in base]
+        return _merge_lifecycle_tools(employee_id, manifest, config, allowlisted)
+
+    text = _capability_text(manifest, config)
+    read_only = is_read_only(manifest, config)
+    selected: list[str] = []
+
+    def add(name: str) -> None:
+        if name in base and name not in selected:
+            selected.append(name)
+
+    if any(k in text for k in _EXCEL_KW):
+        for n in READ_TOOLS:
+            add(n)
+    if any(k in text for k in _CHART_KW):
+        for n in CHART_TOOLS:
+            add(n)
+    if any(k in text for k in _DOC_KW):
+        for n in DOC_TOOLS:
+            add(n)
+    if not read_only and any(k in text for k in _IMPORT_KW):
+        for n in ("import_excel_to_database", "products_bulk_import"):
+            add(n)
+
+    if not selected:
+        for n in (
+            "excel_analysis",
+            "excel_schema_understand",
+            "generate_office_document",
+        ):
+            add(n)
+
+    if read_only:
+        from resources.config.risk_actions_loader import list_write_tools
+
+        blocked = set(list_write_tools())
+        selected = [n for n in selected if n not in blocked]
+
+    return _merge_lifecycle_tools(employee_id, manifest, config, [base[n] for n in selected])
+
+
+def employee_tool_names(
+    employee_id: str, manifest: dict[str, Any], config: dict[str, Any]
+) -> list[str]:
+    """供可观测/测试使用：返回作用域工具名列表。"""
+    specs = resolve_employee_tools(employee_id, manifest, config) or []
+    return [str((s.get("function") or {}).get("name") or "") for s in specs]
+
+
+__all__ = ["employee_tool_names", "is_read_only", "resolve_employee_tools"]
+
+
+def host_employee_denial(
+    employee_ids: list[str], payload: dict[str, Any], context: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Customer execution grants do not grant host-side management tools."""
+    if "_actor_authorization" not in context:
+        return None
+    from app.infrastructure.auth.agent_mod_scope import AgentModAuthorizationError, _bound_actor
+    from app.mod_sdk.employee_specialized_tools_employee_map import EMPLOYEE_TOOLS
+
+    try:
+        actor = _bound_actor(context)
+        if actor.role == "admin" and actor.tier == "admin" and actor.tenant_id is None:
+            return None
+    except AgentModAuthorizationError:
+        return {
+            "success": False,
+            "error_code": "tool_identity_required",
+            "error": "员工身份授权无效",
+        }
+    if str(payload.get("handler") or "").strip() == "specialized" or any(
+        EMPLOYEE_TOOLS.get(name) for name in employee_ids
+    ):
+        return {
+            "success": False,
+            "error_code": "employee_host_admin_required",
+            "error": "宿主管理员工和专用工具需要平台管理员权限",
+        }
+    return None

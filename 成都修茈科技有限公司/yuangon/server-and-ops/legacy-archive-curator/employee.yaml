@@ -1,0 +1,61 @@
+id: legacy-archive-curator
+name: 工作区归档管理员
+version: "1.0.0"
+domain: S-R R3 工作区与 legacy 归档：_archive/、FHD/.archive/、LEGACY_CLEANUP_TRACKING、xcmax-tree 排除项治理。
+owner: admin
+area: server-and-ops
+five_line_id: shared_retention
+subzone: legacy-archive
+also_serves: []
+
+scope_globs:
+  - _archive/**
+  - FHD/.archive/**
+  - FHD/docs/reports/LEGACY_CLEANUP_TRACKING.md
+  - scripts/cleanup_archive_secrets.py
+  - scripts/build-xcmax-tree-data.py
+
+forbidden_globs:
+  - _local_secrets/**
+
+triggers:
+  on_error: true
+  schedule:
+    cron: "15 3 * * *"
+    timezone: "Asia/Shanghai"
+
+sla:
+  timeout_seconds: 300
+  retry_max: 1
+  escalate_to_human: true
+
+llm_default: "auto"
+
+capabilities:
+  - workspace.archive.plan
+  - retention.safety.audit
+
+skills:
+  - skills/skill-legacy-archive-curator.md
+
+actions:
+  handlers: ["agent"]
+  agent:
+    workspace:
+      read_only: false
+      requires_project_root: true
+
+depends_on:
+  - retention-officer
+
+examples:
+  - title: "工作区归档管理员岗位验收"
+    description: "以最小、无副作用输入验证岗位输出包含真实证据、风险与下一步。"
+    input:
+      task: "执行一次工作区归档管理员职责范围内的只读检查，并返回证据、风险和下一步。"
+      dry_run: true
+
+changelog:
+  - version: "1.0.0"
+    date: "2026-06-03"
+    note: "六部门编制：S-R legacy 归档专岗"

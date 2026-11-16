@@ -1,0 +1,568 @@
+"""ERP 域工作流路由：客户/产品/物料/库存/采购/销售/报表/资金。"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, cast
+
+logger = logging.getLogger(__name__)
+from app.domain.shared_services.tools_workflow_common import (
+    _business_db_target_candidates,
+)
+
+# Module-load-time default so a globals patch cannot skew facade-override detection.
+_DEFAULT_TARGET_CANDIDATES = _business_db_target_candidates
+
+
+def _resolve_target_candidates():
+    """目标解析晚绑定：facade 属性 patch 与本模块全局 patch 两个接缝等价生效。"""
+    from app.services import tools_workflow_registered as facade
+
+    resolved = getattr(facade, "_business_db_target_candidates", None)
+    if resolved is not None and resolved is not _DEFAULT_TARGET_CANDIDATES:
+        return resolved
+    return _business_db_target_candidates
+
+
+def _registered_router_customers(
+    action: str, params: dict, runtime_context: dict, profile: str, user_message: str
+) -> dict:
+    if str(runtime_context.get("service_source") or "") == "fastapi_customer_route":
+        from app.fastapi_routes.domains.customer import routes as customer_routes
+
+        return customer_routes._execute_customers_route_action(
+            action, dict(params or {}), runtime_context=runtime_context
+        )
+    from app.application import get_customer_app_service
+
+    svc = get_customer_app_service()
+    unit_name = str(
+        params.get("unit_name") or params.get("customer_name") or params.get("name") or ""
+    ).strip()
+    if action in {"create", "ensure_exists", "upsert"}:
+        from app.domain.shared_services.business_db_customer_mutations import (
+            execute_customer_create_like,
+        )
+
+        return execute_customer_create_like(
+            action, params, svc=svc, resolve_targets=_resolve_target_candidates()
+        )
+    if action == "export":
+        keyword = str(params.get("keyword") or unit_name or "").strip() or None
+        return dict(
+            svc.export_to_excel(keyword=keyword, template_id=params.get("template_id")) or {}
+        )
+    if action == "query":
+        if "id" in params or "customer_id" in params:
+            raw_id = params.get("id") if params.get("id") is not None else params.get("customer_id")
+            text_id = str(raw_id).strip()
+            if not text_id.isdecimal() or int(text_id) <= 0:
+                return {
+                    "success": False,
+                    "message": "客户 id 须为正整数",
+                    "error_code": "invalid_id",
+                }
+            result = svc.get_by_id(int(text_id))
+            return {
+                "success": bool(result.get("success")),
+                "data": result.get("data"),
+                "raw": result,
+            }
+        keyword = str(params.get("keyword") or unit_name or "").strip()
+        result = svc.get_all(keyword=keyword, page=1, per_page=20)
+        return {
+            "success": bool(result.get("success")),
+            "data": result.get("data", []),
+            "total": result.get("total"),
+            "raw": result,
+        }
+    if action == "update":
+        customer_id = int(params.get("id") or params.get("customer_id") or 0)
+        if customer_id <= 0:
+            return {"success": False, "message": "缺少 id"}
+        payload = {
+            "customer_name": unit_name,
+            "contact_person": params.get("contact_person", ""),
+            "contact_phone": params.get("contact_phone", ""),
+            "contact_address": params.get("contact_address", params.get("address", "")),
+        }
+        payload = {k: v for k, v in payload.items() if v not in (None, "")}
+        if "expected_version" in params:
+            payload["expected_version"] = params.get("expected_version")
+        update_result = svc.update(customer_id, payload)
+        if update_result.get("success"):
+            return {"success": True, "data": update_result.get("data", {})}
+        rejected = {"success": False, "message": update_result.get("message") or "更新失败"}
+        if update_result.get("error_code"):
+            rejected["error_code"] = update_result.get("error_code")
+        return rejected
+    if action == "delete":
+        customer_id = int(params.get("id") or params.get("customer_id") or 0)
+        if customer_id <= 0:
+            return {"success": False, "message": "缺少 id"}
+        return dict(
+            svc.delete(
+                customer_id,
+                force=bool(params.get("force", False)),
+                runtime_context=runtime_context,
+            )
+            or {}
+        )
+    if action == "batch_delete":
+        raw_ids = params.get("ids") or params.get("customer_ids") or []
+        if not isinstance(raw_ids, list) or not raw_ids:
+            return {"success": False, "message": "ids 须为非空数组"}
+        result = dict(
+            svc.batch_delete(
+                raw_ids,
+                force=bool(params.get("force", False)),
+                runtime_context=runtime_context,
+            )
+            or {}
+        )
+        return result
+    if action == "clear":
+        collected: list[int] = []
+        page = 1
+        while True:
+            listed = svc.get_all(keyword=None, page=page, per_page=500) or {}
+            rows = listed.get("data") if isinstance(listed, dict) else None
+            if not isinstance(rows, list) or not rows:
+                break
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    collected.append(int(row.get("id") or row.get("customer_id") or 0))
+                except (TypeError, ValueError):
+                    continue
+            total = listed.get("total")
+            if isinstance(total, int) and len(collected) >= total:
+                break
+            if len(rows) < 500:
+                break
+            page += 1
+        collected = [item for item in collected if item > 0]
+        if not collected:
+            return {"success": True, "message": "客户列表为空，无需清理", "deleted_count": 0}
+        result = dict(
+            svc.batch_delete(collected, force=True, runtime_context=runtime_context) or {}
+        )
+        result.setdefault("deleted_count", len(collected))
+        return result
+    if action == "add_address":
+        payload = dict(params or {})
+        return dict(svc.add_address(payload) or {})
+    if action == "set_credit_limit":
+        customer_id = int(params.get("customer_id") or params.get("id") or 0)
+        if customer_id <= 0:
+            return {"success": False, "message": "缺少 customer_id"}
+        return dict(
+            svc.set_credit_limit(
+                customer_id, params.get("credit_limit") or params.get("limit") or 0
+            )
+            or {}
+        )
+    if action == "get_addresses":
+        customer_id = int(params.get("customer_id") or params.get("id") or 0)
+        if customer_id <= 0:
+            return {"success": False, "message": "缺少 customer_id"}
+        return dict(svc.get_addresses(customer_id) or {})
+    return {"success": False, "message": f"未注册的 customers 动作: {action}"}
+
+
+def _registered_router_inventory(
+    action: str, params: dict, runtime_context: dict, profile: str, user_message: str
+) -> dict:
+    if str(runtime_context.get("service_source") or "") == "fastapi_inventory_route":
+        from app.fastapi_routes import inventory as inventory_route
+
+        svc = inventory_route._svc()
+    else:
+        from app.application.inventory_app_service import InventoryAppService
+
+        svc = InventoryAppService()
+
+    def _float_or_none(value: object) -> float | None:
+        if value is None:
+            return None
+        return float(str(value))
+
+    if action == "create_storage_location":
+        return cast("dict[Any, Any]", svc.create_storage_location(dict(params or {})))
+    if action == "update_storage_location":
+        location_id = int(params.get("location_id") or 0)
+        payload = {k: v for k, v in params.items() if k != "location_id"}
+        return cast("dict[Any, Any]", svc.update_storage_location(location_id, payload))
+    if action == "create_warehouse":
+        return cast("dict[Any, Any]", svc.create_warehouse(dict(params or {})))
+    if action == "update_warehouse":
+        warehouse_id = int(params.get("warehouse_id") or 0)
+        payload = {k: v for k, v in params.items() if k != "warehouse_id"}
+        return cast("dict[Any, Any]", svc.update_warehouse(warehouse_id, payload))
+    if action == "delete_warehouse":
+        return cast("dict[Any, Any]", svc.delete_warehouse(int(params.get("warehouse_id") or 0)))
+    if action == "stock_in":
+        return cast(
+            "dict[Any, Any]",
+            svc.inventory_in(
+                product_id=params.get("product_id"),
+                warehouse_id=params.get("warehouse_id"),
+                quantity=params.get("quantity"),
+                **({"model_number": params["model_number"]} if "model_number" in params else {}),
+                **(
+                    {"warehouse_name": params["warehouse_name"]}
+                    if "warehouse_name" in params
+                    else {}
+                ),
+                batch_no=params.get("batch_no"),
+                location_id=params.get("location_id"),
+                unit_price=_float_or_none(params.get("unit_price")),
+                reference_type=params.get("reference_type"),
+                reference_id=params.get("reference_id"),
+                operator=params.get("operator"),
+                remark=params.get("remark"),
+            ),
+        )
+    if action == "stock_out":
+        return cast(
+            "dict[Any, Any]",
+            svc.inventory_out(
+                product_id=params.get("product_id"),
+                warehouse_id=params.get("warehouse_id"),
+                quantity=float(params.get("quantity", 0)),
+                batch_no=params.get("batch_no"),
+                location_id=params.get("location_id"),
+                reference_type=params.get("reference_type"),
+                reference_id=params.get("reference_id"),
+                operator=params.get("operator"),
+                remark=params.get("remark"),
+            ),
+        )
+    if action == "transfer":
+        return cast(
+            "dict[Any, Any]",
+            svc.inventory_transfer(
+                product_id=params.get("product_id"),
+                from_warehouse_id=params.get("from_warehouse_id"),
+                to_warehouse_id=params.get("to_warehouse_id"),
+                quantity=float(params.get("quantity", 0)),
+                batch_no=params.get("batch_no"),
+                from_location_id=params.get("from_location_id"),
+                to_location_id=params.get("to_location_id"),
+                operator=params.get("operator"),
+                remark=params.get("remark"),
+            ),
+        )
+    if action == "low_stock_alert":
+        from app.application.material_app_service import get_material_app_service
+
+        threshold = params.get("threshold")
+        return get_material_app_service().get_low_stock_materials(
+            float(threshold) if threshold is not None else None
+        )
+    if action == "replenishment_suggest":
+        from app.domain.shared_services.replenishment_service import suggest_replenishment
+
+        return suggest_replenishment(
+            threshold=params.get("threshold"), per_page=int(params.get("per_page") or 50)
+        )
+    if action == "inventory_count":
+        from app.domain.shared_services.inventory_service import InventoryService
+
+        inv_svc = InventoryService()
+        return inv_svc.inventory_count(
+            product_id=int(params.get("product_id") or 0),
+            warehouse_id=int(params.get("warehouse_id") or 0),
+            actual_quantity=float(params.get("actual_quantity", 0)),
+            batch_no=params.get("batch_no"),
+            location_id=params.get("location_id"),
+            operator=params.get("operator"),
+            remark=params.get("remark"),
+            confirmed=bool(params.get("confirmed", False)),
+        )
+    if action == "query_transactions":
+        from app.domain.shared_services.inventory_service import InventoryService
+
+        inv_svc = InventoryService()
+        return inv_svc.query_transactions(
+            product_id=params.get("product_id"),
+            warehouse_id=params.get("warehouse_id"),
+            start_date=params.get("start_date"),
+            end_date=params.get("end_date"),
+            page=int(params.get("page") or 1),
+            per_page=int(params.get("per_page") or 20),
+        )
+    return {"success": False, "message": f"未注册的 inventory 动作: {action}"}
+
+
+def _registered_router_purchase(
+    action: str, params: dict, runtime_context: dict, profile: str, user_message: str
+) -> dict:
+    if str(runtime_context.get("service_source") or "") == "fastapi_purchase_route":
+        from app.fastapi_routes import purchase as purchase_route
+
+        svc = purchase_route._svc()
+    else:
+        from app.application.facades.inventory_facade import PurchaseService
+
+        svc = PurchaseService()
+    if action in ("list_suppliers", "get_suppliers", "query_suppliers"):
+        return cast(
+            "dict[Any, Any]",
+            svc.get_suppliers(
+                status=params.get("status"),
+                keyword=str(params.get("keyword") or params.get("search") or "").strip() or None,
+            ),
+        )
+    if action in ("list_orders", "get_orders", "list_purchase_orders", "query_orders"):
+        return cast(
+            "dict[Any, Any]",
+            svc.get_purchase_orders(
+                supplier_id=params.get("supplier_id"),
+                status=params.get("status"),
+                page=int(params.get("page") or 1),
+                per_page=int(params.get("per_page") or 20),
+            ),
+        )
+    if action in ("list_inbounds", "get_inbounds", "list_purchase_inbounds", "query_inbounds"):
+        return cast(
+            "dict[Any, Any]",
+            svc.get_purchase_inbounds(
+                supplier_id=params.get("supplier_id"),
+                order_id=params.get("order_id"),
+                page=int(params.get("page") or 1),
+                per_page=int(params.get("per_page") or 20),
+            ),
+        )
+    if action == "create_supplier":
+        return cast("dict[Any, Any]", svc.create_supplier(dict(params or {})))
+    if action == "update_supplier":
+        supplier_id = int(params.get("supplier_id") or 0)
+        payload = {k: v for k, v in params.items() if k != "supplier_id"}
+        return cast("dict[Any, Any]", svc.update_supplier(supplier_id, payload))
+    if action == "delete_supplier":
+        return cast("dict[Any, Any]", svc.delete_supplier(int(params.get("supplier_id") or 0)))
+    if action == "create_order":
+        return cast("dict[Any, Any]", svc.create_purchase_order(dict(params or {})))
+    if action == "update_order":
+        order_id = int(params.get("order_id") or 0)
+        payload = {k: v for k, v in params.items() if k != "order_id"}
+        return cast("dict[Any, Any]", svc.update_purchase_order(order_id, payload))
+    if action == "approve_order":
+        return cast(
+            "dict[Any, Any]",
+            svc.approve_purchase_order(
+                int(params.get("order_id") or 0), str(params.get("approver") or "system")
+            ),
+        )
+    if action == "cancel_order":
+        return cast("dict[Any, Any]", svc.cancel_purchase_order(int(params.get("order_id") or 0)))
+    if action == "create_inbound":
+        return cast("dict[Any, Any]", svc.create_purchase_inbound(dict(params or {})))
+    return {"success": False, "message": f"未注册的 purchase 动作: {action}"}
+
+
+def _registered_router_sales(
+    action: str, params: dict, runtime_context: dict, profile: str, user_message: str
+) -> dict:
+    from app.application.sales_app_service import SalesAppService
+
+    svc = SalesAppService()
+    if action == "create_order":
+        from app.application.sales_order_creation import create_confirmed_order
+
+        return create_confirmed_order(dict(params or {}))
+    if action in ("query", "list", "get_orders"):
+        return svc.query(
+            status=params.get("status"),
+            customer_id=params.get("customer_id"),
+            customer_name=params.get("customer_name"),
+            keyword=str(params.get("keyword") or params.get("search") or "").strip() or None,
+            page=int(params.get("page") or 1),
+            per_page=int(params.get("per_page") or 20),
+            start_date=params.get("start_date"),
+            end_date=params.get("end_date"),
+            payment_state=params.get("payment_state"),
+            min_amount_exclusive=params.get("min_amount_exclusive"),
+            region=params.get("region"),
+        )
+    if action == "quote":
+        return svc.quote(dict(params or {}))
+    if action == "confirm":
+        return svc.confirm(int(params.get("order_id") or 0))
+    if action == "deliver":
+        return svc.deliver(
+            int(params.get("order_id") or 0),
+            int(params.get("item_id") or 0),
+            float(params.get("quantity") or 0.0),
+            warehouse_id=int(params.get("warehouse_id") or 0),
+            idempotency_key=params.get("idempotency_key"),
+        )
+    if action == "invoice":
+        return svc.invoice(int(params.get("order_id") or 0))
+    if action == "credit_note":
+        return svc.credit_note(int(params.get("order_id") or 0))
+    if action == "payment":
+        amount = params.get("amount")
+        return svc.payment(
+            int(params.get("order_id") or 0),
+            float(amount) if amount is not None else None,
+            idempotency_key=params.get("idempotency_key"),
+        )
+    if action == "refund":
+        return svc.refund(int(params.get("allocation_id") or 0))
+    if action == "cancel":
+        return svc.cancel(int(params.get("order_id") or 0))
+    if action == "execute_closed_loop":
+        return svc.execute_closed_loop(dict(params["payload"]))
+    if action == "verify_closed_loop":
+        from app.application.sales.verification import verify_closed_loop
+
+        return verify_closed_loop(dict(params.get("payload") or {}))
+    return {"success": False, "message": f"未注册的 sales 动作: {action}"}
+
+
+def _registered_router_reports(
+    action: str, params: dict, runtime_context: dict, profile: str, user_message: str
+) -> dict:
+    from app.domain.shared_services.report_service import ReportService
+
+    svc = ReportService()
+    date_filters = ("start_date", "end_date", "group_by")
+    filters = {
+        "sales": (
+            *date_filters,
+            "customer_id",
+            "customer_name",
+            "order_no",
+            "status",
+            "payment_state",
+            "min_amount_exclusive",
+            "region",
+        ),
+        "inventory": ("warehouse_id", "category", "model_number"),
+        "purchase": date_filters,
+    }
+
+    def query(kind: str) -> dict[str, Any]:
+        return cast(
+            dict[str, Any],
+            getattr(svc, f"get_{kind}_report")(
+                **{key: params[key] for key in filters[kind] if params.get(key) is not None}
+            ),
+        )
+
+    if action.endswith("_summary") and action.removesuffix("_summary") in filters:
+        return query(action.removesuffix("_summary"))
+    if action == "dashboard":
+        return svc.get_dashboard_summary()
+    if action != "export":
+        return {"success": False, "message": f"未注册的 reports 动作: {action}"}
+    requested = [
+        kind
+        for kind, word in zip(filters, ("销售", "库存", "采购"))
+        if kind in user_message.casefold() or word in user_message
+    ]
+    report_type = str(params.get("report_type") or "").removesuffix("_summary")
+    if not report_type or report_type == "report":
+        report_type = requested[0] if len(requested) == 1 else "report"
+    rows = params.get("data")
+    if rows is None:
+        if report_type not in filters:
+            return {
+                "success": False,
+                "message": "请指定销售、库存或采购报表类型",
+                "error_code": "missing_report_type",
+            }
+        report = query(report_type)
+        if not report.get("success"):
+            return report
+        rows = report.get("data") or []
+    exported = svc.export_to_excel(
+        report_type=report_type, data=rows, filename=str(params.get("filename") or report_type)
+    )
+    run_id = str(runtime_context.get("run_id") or "")
+    if not run_id or not exported.get("success"):
+        return exported
+    from app.application.agent_orchestrator.artifact_files import store_spreadsheet
+
+    artifact = store_spreadsheet(run_id, exported["data"], name=exported["filename"])
+    from app.application.agent_orchestrator.artifact_files import verified_spreadsheet_path
+
+    return {
+        "success": True,
+        "message": "报表文件已生成",
+        "row_count": len(rows),
+        "data": {"file_path": str(verified_spreadsheet_path(run_id, artifact))},
+        "artifacts": [artifact],
+    }
+
+
+def _registered_router_finance(
+    action: str, params: dict, runtime_context: dict, profile: str, user_message: str
+) -> dict:
+    if str(runtime_context.get("service_source") or "") == "fastapi_finance_route":
+        from app.fastapi_routes import finance as finance_route
+
+        svc = finance_route._svc()
+    else:
+        from app.application.finance_app_service import FinanceAppService
+
+        svc = FinanceAppService()
+    if action in ("list_transactions", "list", "query", "get_transactions"):
+        return cast(
+            "dict[Any, Any]",
+            svc.list_transactions(
+                transaction_type=params.get("transaction_type"),
+                status=params.get("status"),
+                page=int(params.get("page") or 1),
+                per_page=int(params.get("per_page") or 20),
+            ),
+        )
+    if action == "create_transaction":
+        payload = dict(params or {})
+        reference_id = payload.get("reference_id")
+        if isinstance(reference_id, int) and not isinstance(reference_id, bool):
+            payload["reference_id"] = str(reference_id)
+        return cast("dict[Any, Any]", svc.create_transaction(payload))
+    if action == "update_transaction":
+        transaction_id = int(params.get("transaction_id") or 0)
+        payload = {k: v for k, v in params.items() if k != "transaction_id"}
+        return cast("dict[Any, Any]", svc.update_transaction(transaction_id, payload))
+    if action == "delete_transaction":
+        return cast(
+            "dict[Any, Any]", svc.delete_transaction(int(params.get("transaction_id") or 0))
+        )
+    if action in ("ledger_query", "query_ledger"):
+        from app.domain.shared_services.accounting_services import query_financial_ledger
+
+        return query_financial_ledger(**dict(params or {}))
+    if action == "journal_entry_create":
+        from app.domain.shared_services.accounting_services import create_journal_entry
+
+        return create_journal_entry(dict(params or {}))
+    if action == "journal_entry_reverse":
+        from app.domain.shared_services.accounting_services import journal_entry_reverse
+
+        entry_id = int(params.get("entry_id") or params.get("id") or 0)
+        if entry_id <= 0:
+            return {"success": False, "message": "缺少 entry_id"}
+        return journal_entry_reverse(entry_id, description=params.get("description"))
+    if action == "aging_report":
+        from app.domain.shared_services.accounting_services import aging_report
+
+        raw_type = str(params.get("account_type") or params.get("party_type") or "应收").strip()
+        if raw_type in ("应收", "receivable", "客户"):
+            party_type = "receivable"
+        elif raw_type in ("应付", "payable", "供应商"):
+            party_type = "payable"
+        else:
+            party_type = raw_type
+        party_id = int(params.get("party_id") or params.get("customer_id") or 0)
+        return aging_report(party_type=party_type, party_id=party_id)
+    if action == "chart_seed":
+        from app.domain.shared_services.accounting_services import seed_default_chart_of_accounts
+
+        return seed_default_chart_of_accounts()
+    return {"success": False, "message": f"未注册的 finance 动作: {action}"}

@@ -1,0 +1,250 @@
+"""
+Mod Manifest Definition and Parsing
+"""
+
+import json
+import logging
+import os
+from dataclasses import dataclass, field
+from typing import Any
+
+from app.utils.operational_errors import RECOVERABLE_ERRORS
+
+from .artifact_constants import ARTIFACT_MOD, normalize_artifact
+
+logger = logging.getLogger(__name__)
+
+
+def _normalize_dependencies(raw: Any) -> dict[str, str]:
+    """Coerce a manifest ``dependencies`` field into ``{dep_id: version_spec}``.
+
+    The canonical schema is a mapping of dependency id -> version spec, e.g.
+    ``{"xcagi": ">=1.0.0.0"}``. For backward compatibility some manifests declare
+    dependencies as a bare list of ids (``["other_mod"]``); those are treated as
+    ``{id: "*"}`` (any version). Any other shape is ignored (empty dict) so that
+    ``validate_dependencies`` never raises ``AttributeError`` at load time and
+    masks the real cause as a generic backend failure.
+    """
+    if isinstance(raw, dict):
+        return {str(k): str(v) for k, v in raw.items() if str(k).strip()}
+    if isinstance(raw, list):
+        return {str(x).strip(): "*" for x in raw if str(x).strip()}
+    if raw not in (None, ""):
+        logger.warning(
+            "Mod dependencies field ignored: expected dict or list, got %r",
+            type(raw).__name__,
+        )
+    return {}
+
+
+@dataclass
+class ModMetadata:
+    id: str
+    name: str
+    version: str
+    author: str = ""
+    description: str = ""
+    artifact: str = ARTIFACT_MOD
+    bundle: dict[str, Any] = field(default_factory=dict)
+    dependencies: dict[str, str] = field(default_factory=dict)
+    backend_entry: str = ""
+    backend_init: str = ""
+    frontend_routes: str = ""
+    frontend_pro_entry_path: str = ""
+    frontend_menu: list[dict[str, str]] = field(default_factory=list)
+    frontend_menu_overrides: list[dict[str, Any]] = field(default_factory=list)
+    config_overrides: str = ""
+    hooks: dict[str, str] = field(default_factory=dict)
+    comms_exports: list[str] = field(default_factory=list)
+    mod_path: str = ""
+    primary: bool = False
+    # id / label 及 Mod 自定义字段（panel_summary、phone_agent_* 等）一并保留
+    workflow_employees: list[dict[str, Any]] = field(default_factory=list)
+    # Mod 声明其所属/提供的行业。结构与 resources/config/industry_config.yaml 中
+    # industries[<id>] 条目对齐（name/description/units/quantity_fields/product_fields/
+    # order_types/intent_keywords/print_config），额外要求顶层提供 id。
+    # 行业下拉列表优先由已加载 Mod 的此字段驱动；YAML 仅作为无 Mod 环境下的回退。
+    industry: dict[str, Any] = field(default_factory=dict)
+    # Mod 可选 UI 文案覆盖。用于让扩展包直接决定宿主通用界面的业务词汇，
+    # 例如 entity/query_title/starter_pack 等，未声明时由 industry 字段推导。
+    ui_labels: dict[str, Any] = field(default_factory=dict)
+    ui_starter_pack: list[dict[str, Any]] = field(default_factory=list)
+    scope: str = "global"
+    frontend_runtime: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any], mod_path: str = "") -> "ModMetadata":
+        backend = data.get("backend", {})
+        frontend = data.get("frontend", {})
+        config = data.get("config", {})
+        hooks = data.get("hooks", {})
+        comms = data.get("comms", {}) or {}
+        comms_exports_raw = comms.get("exports", [])
+        menu_overrides_raw = frontend.get("menu_overrides", [])
+        menu_overrides: list[dict[str, Any]] = []
+        if isinstance(menu_overrides_raw, dict):
+            for k, v in menu_overrides_raw.items():
+                key = str(k or "").strip()
+                if not key:
+                    continue
+                row = dict(v) if isinstance(v, dict) else {"label": v}
+                row["key"] = key
+                menu_overrides.append(row)
+        elif isinstance(menu_overrides_raw, list):
+            menu_overrides = [x for x in menu_overrides_raw if isinstance(x, dict)]
+        comms_exports = (
+            [str(x).strip() for x in comms_exports_raw if str(x).strip()]
+            if isinstance(comms_exports_raw, list)
+            else []
+        )
+
+        bundle_raw = data.get("bundle")
+        bundle: dict[str, Any] = bundle_raw if isinstance(bundle_raw, dict) else {}
+
+        industry_raw = data.get("industry")
+        industry_block: dict[str, Any]
+        if isinstance(industry_raw, dict) and industry_raw.get("id"):
+            industry_block = dict(industry_raw)
+        else:
+            if industry_raw not in (None, {}):
+                logger.warning(
+                    "Mod %r industry field ignored: expected object with 'id', got %r",
+                    data.get("id"),
+                    type(industry_raw).__name__,
+                )
+            industry_block = {}
+
+        ui_labels_raw = data.get("ui_labels")
+        ui_labels = dict(ui_labels_raw) if isinstance(ui_labels_raw, dict) else {}
+        ui_starter_pack_raw = data.get("ui_starter_pack")
+        ui_starter_pack = (
+            [x for x in ui_starter_pack_raw if isinstance(x, dict)]
+            if isinstance(ui_starter_pack_raw, list)
+            else []
+        )
+
+        return cls(
+            id=data.get("id", ""),
+            name=data.get("name", ""),
+            version=data.get("version", "1.0.0"),
+            author=data.get("author", ""),
+            description=data.get("description", ""),
+            artifact=normalize_artifact(data),
+            bundle=bundle,
+            dependencies=_normalize_dependencies(data.get("dependencies")),
+            scope=str(data.get("scope") or "global"),
+            frontend_runtime=(
+                dict(frontend.get("runtime")) if isinstance(frontend.get("runtime"), dict) else {}
+            ),
+            backend_entry=backend.get("entry", ""),
+            backend_init=backend.get("init", ""),
+            frontend_routes=frontend.get("routes", ""),
+            frontend_pro_entry_path=str(frontend.get("pro_entry_path", "") or "").strip(),
+            frontend_menu=frontend.get("menu", []),
+            frontend_menu_overrides=menu_overrides,
+            config_overrides=config.get("industry_overrides", ""),
+            hooks=hooks,
+            comms_exports=comms_exports,
+            mod_path=mod_path,
+            primary=data.get("primary", False),
+            workflow_employees=data.get("workflow_employees", []),
+            industry=industry_block,
+            ui_labels=ui_labels,
+            ui_starter_pack=ui_starter_pack,
+        )
+
+
+def parse_manifest(mod_path: str) -> ModMetadata | None:
+    try:
+        with os.scandir(mod_path) as entries:
+            manifest_entry = next(
+                (
+                    entry
+                    for entry in entries
+                    if entry.name == "manifest.json"
+                    and not entry.is_symlink()
+                    and entry.is_file(follow_symlinks=False)
+                ),
+                None,
+            )
+    except OSError:
+        manifest_entry = None
+    if manifest_entry is None:
+        logger.warning("[parse_manifest] Mod manifest not found")
+        return None
+    manifest_path = manifest_entry.path
+    logger.info("[parse_manifest] Checking manifest")
+
+    try:
+        with open(manifest_path, encoding="utf-8") as f:
+            data = json.load(f)
+
+        if not data.get("id"):
+            logger.error("[parse_manifest] Mod manifest missing 'id' field: %s", manifest_path)
+            return None
+
+        metadata = ModMetadata.from_dict(data, mod_path)
+        logger.info(
+            "[parse_manifest] Successfully parsed manifest for mod: %s, name: %s",
+            metadata.id,
+            metadata.name,
+        )
+        return metadata
+    except json.JSONDecodeError as e:
+        logger.error("[parse_manifest] Failed to parse manifest JSON: %s", e)
+        return None
+    except RECOVERABLE_ERRORS as e:
+        logger.error("[parse_manifest] Failed to read manifest: %s", e)
+        return None
+
+
+def validate_dependencies(metadata: ModMetadata, loaded_mods: list[str]) -> bool:
+    # Normalize defensively: most metadata flows through ``from_dict`` (already a
+    # dict), but a ``ModMetadata`` constructed directly may still carry a list.
+    for dep_id, version_spec in _normalize_dependencies(metadata.dependencies).items():
+        if dep_id == "xcagi":
+            if not _check_xcagi_version(version_spec):
+                logger.warning(
+                    "Mod %s requires xcagi %s but host version is %s",
+                    metadata.id,
+                    version_spec,
+                    host_xcagi_version(),
+                )
+                return False
+        elif dep_id not in loaded_mods:
+            logger.warning(
+                "Mod %s depends on %s which is not loaded. Required version: %s",
+                metadata.id,
+                dep_id,
+                version_spec,
+            )
+            return False
+    return True
+
+
+def host_xcagi_version() -> str:
+    """宿主产品版本（版本锚点，由 scripts/dev/version_sync.py 按 VERSION.md 同步）。"""
+    current_version = "1.0.0.7"
+    return current_version
+
+
+def _check_xcagi_version(version_spec: str) -> bool:
+    import re
+
+    match = re.match(r">=([\d.]+)", version_spec)
+    if match:
+        required = match.group(1)
+        return _compare_versions(host_xcagi_version(), required) >= 0
+
+    return True
+
+
+def _compare_versions(v1: str, v2: str) -> int:
+    parts1 = [int(x) for x in v1.split(".")]
+    parts2 = [int(x) for x in v2.split(".")]
+    for p1, p2 in zip(parts1, parts2):
+        if p1 > p2:
+            return 1
+        elif p1 < p2:
+            return -1
+    return 0

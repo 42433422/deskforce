@@ -1,0 +1,469 @@
+from __future__ import annotations
+
+import logging
+import re
+from typing import Any
+
+from app.services.tools_execution.order_parser_helpers import (
+    build_missing_prompt,
+    cleanup_unit_name,
+    extract_explicit_unit_name,
+    loose_order_fallback,
+    normalize_chinese_digits,
+    normalize_model_number_token,
+    normalize_quantity_token,
+    normalize_trailing_unit_name,
+    parse_cn_number,
+    retail_quantity_price_order,
+    strip_bill_keywords,
+    structured_order_result,
+)
+from app.utils.operational_errors import RECOVERABLE_ERRORS
+
+logger = logging.getLogger(__name__)
+
+_ORDER_SCHEMA = {
+    "type": "object",
+    "required": [],
+    "properties": {
+        "unit_name": {"type": "string"},
+        "model_number": {"type": "string"},
+        "tin_spec": {"type": "string"},
+        "quantity_tins": {"type": "string"},
+        "quantity_kg": {"type": "string"},
+        "quantity": {"type": "string"},
+        "unit": {"type": "string"},
+    },
+}
+
+
+def _parse_order_text(order_text: str) -> dict:
+    try:
+        # The parser handles short, human-entered order sentences. Bounding the
+        # input and every regex repetition keeps malformed payloads from turning
+        # the fallback parser into a CPU denial-of-service vector.
+        original_text = (order_text or "").strip()[:4096]
+        retail = retail_quantity_price_order(original_text)
+        if retail is not None:
+            return retail
+
+        # 先剥完整动词再剥单据名（见 strip_bill_keywords：避免「开发货单」残留「开」被当成客户名）。
+        text = strip_bill_keywords(original_text)
+
+        text = (
+            text.replace("。", " ")
+            .replace("，", " ")
+            .replace(",", " ")
+            .replace("、", " ")
+            .replace("：", " ")
+            .replace(":", " ")
+        )
+
+        text = text.replace("的规格", "规格")
+        slot_text = text
+
+        # 倒装写法「20L规格」「28的规格」：数字（可带 L/升）在「规格」前，统一改写成
+        # 「规格+数字」正序，避免数字被当成编号、「规格」二字残留进单位名。
+        # 前瞻排除正序写法（如「XY-20 规格：20」「9803 规格二十八」）防止误吞编号；
+        # 重复全部加界，无界 \d+/\s* 会在长串「0」上触发多项式回溯（CodeQL redos）。
+        _spec_inverted = re.compile(
+            r"(?<![\dA-Za-z.-])(\d{1,12}(?:\.\d{1,4})?)(?:[Ll升])?[ \t]{0,4}的?[ \t]{0,4}规格"
+            r"(?![ \t:：]{0,4}(?:[\d.一二两三四五六七八九十]))"
+        )
+        text = _spec_inverted.sub(r"规格\1", text)
+        slot_text = _spec_inverted.sub(r"规格\1", slot_text)
+
+        # 独立容量记法「20L」「20升」即规格（如「给太阳鸟开单 20L 5桶」），统一改写成
+        # 「规格20」，避免被当成编号或落入兜底产生 name=「20L 5桶」的垃圾槽位。
+        _spec_capacity = re.compile(
+            r"(?<![\dA-Za-z.-])(\d{1,12}(?:\.\d{1,4})?)[Ll升](?![\dA-Za-z])"
+        )
+        text = _spec_capacity.sub(r"规格\1", text)
+        slot_text = _spec_capacity.sub(r"规格\1", slot_text)
+
+        if not text:
+            return {"success": False, "message": "订单文本格式不正确，缺少内容"}
+
+        slot_model = None
+        slot_spec = None
+        slot_qty_tins = None
+
+        model_token_pattern = r"[0-9A-Za-z-]{3,16}"
+        m_model = re.search(
+            rf"(?:编号|型号)\s{{0,16}}(?:是)?\s{{0,16}}[:：]?\s{{0,16}}({model_token_pattern})",
+            slot_text,
+        )
+        if m_model:
+            slot_model = (m_model.group(1) or "").strip().upper()
+        else:
+            m_model2 = re.search(
+                rf"({model_token_pattern})\s{{0,16}}(?:的)?\s{{0,16}}规格", slot_text
+            )
+            if m_model2:
+                slot_model = (m_model2.group(1) or "").strip().upper()
+
+        if "规格" in slot_text:
+            after_spec = slot_text.split("规格", 1)[1]
+            number_token_pattern = r"(?:\d{1,12}(?:\.\d{1,6})?|[一二两三四五六七八九]?十[一二三四五六七八九]?|[一二两三四五六七八九零〇])"
+            qty_token_pattern = r"(?:\d{1,12}|[一二两三四五六七八九十零〇两]{1,16})"
+
+            m_spec_qty = re.search(
+                rf"^\s{{0,16}}[:：]?\s{{0,16}}({number_token_pattern})(?:\s{{0,16}}(?:要|来|拿|共|一共|总共)?\s{{0,16}}({qty_token_pattern})\s{{0,16}}桶)?",
+                after_spec,
+            )
+            if m_spec_qty:
+                spec_num = parse_cn_number(m_spec_qty.group(1))
+                if spec_num is not None:
+                    slot_spec = float(spec_num)
+                if m_spec_qty.group(2):
+                    qty_num = parse_cn_number(m_spec_qty.group(2))
+                    if qty_num is not None:
+                        slot_qty_tins = int(qty_num)
+            else:
+                m_spec = re.search(
+                    r"^\s{0,16}[:：]?\s{0,16}(\d{1,12}(?:\.\d{1,6})?)",
+                    after_spec,
+                )
+                if m_spec:
+                    spec_num = parse_cn_number(m_spec.group(1))
+                    if spec_num is not None:
+                        slot_spec = float(spec_num)
+                else:
+                    m_spec_cn = re.search(
+                        r"^\s{0,16}[:：]?\s{0,16}([一二两三四五六七八九]?十[一二三四五六七八九]?|[一二两三四五六七八九零〇])",
+                        after_spec,
+                    )
+                    if m_spec_cn:
+                        spec_num = parse_cn_number(m_spec_cn.group(1))
+                        if spec_num is not None:
+                            slot_spec = float(spec_num)
+
+        if slot_qty_tins is None:
+            m_qty = re.search(
+                r"(?:一共|总共|共|要|来|拿)?\s{0,16}(\d{1,12}|[一二两三四五六七八九十零〇两]{1,16})\s{0,16}桶",
+                slot_text,
+            )
+            if m_qty:
+                qty_num = parse_cn_number(m_qty.group(1))
+                if qty_num is not None:
+                    slot_qty_tins = int(qty_num)
+
+        unit_candidate = slot_text
+        unit_candidate = re.sub(r"(发货单|送货单|出货单)", " ", unit_candidate)
+        unit_candidate = re.sub(
+            rf"(?:编号|型号)\s{{0,16}}(?:是)?\s{{0,16}}[:：]?\s{{0,16}}{model_token_pattern}",
+            " ",
+            unit_candidate,
+        )
+        unit_candidate = re.sub(
+            r"规格\s{0,16}[:：]?\s{0,16}(?:\d{1,12}(?:\.\d{1,6})?|[一二两三四五六七八九十零〇两]{1,16})(?:\s{0,16}(?:\d{1,12}|[一二两三四五六七八九十零〇两]{1,16})\s{0,16}桶)?",
+            " ",
+            unit_candidate,
+        )
+        unit_candidate = re.sub(
+            r"(?:一共|总共|共|要|来|拿)?\s{0,16}(?:\d{1,12}|[一二两三四五六七八九十零〇两]{1,16})\s{0,16}桶",
+            " ",
+            unit_candidate,
+        )
+        unit_candidate = re.sub(r"[0-9A-Za-z-]{3,16}", " ", unit_candidate)
+        unit_candidate = re.sub(r"[，,\s]+", " ", unit_candidate).strip()
+        slot_unit = cleanup_unit_name(unit_candidate)
+        # 显式引号/键值写法给出的客户名优先级最高，覆盖正则抽取结果（#2067）。
+        explicit_unit = extract_explicit_unit_name(original_text)
+        if explicit_unit:
+            slot_unit = explicit_unit
+        if not slot_unit:
+            m_unit = re.search(
+                r"(?:打印(?:一下)?)\s{0,16}([^，,。]{1,120}?)\s{0,16}的?\s{0,16}(?:发货单|送货单|出货单)",
+                slot_text,
+            )
+            if not m_unit:
+                m_unit = re.search(
+                    r"([^，,。]{1,120}?)\s{0,16}的?\s{0,16}(?:发货单|送货单|出货单)",
+                    slot_text,
+                )
+            if m_unit:
+                slot_unit = cleanup_unit_name(m_unit.group(1))
+        if not slot_unit:
+            m_unit3 = re.search(r"([^，,。0-9]{1,120}?)的(?:发货单|送货单|出货单)", slot_text)
+            if m_unit3:
+                slot_unit = cleanup_unit_name(m_unit3.group(1))
+        if not slot_unit:
+            for bill_kw in ["发货单", "送货单", "出货单"]:
+                if bill_kw in slot_text:
+                    slot_unit = cleanup_unit_name(slot_text.split(bill_kw)[0])
+                    if slot_unit:
+                        break
+        if not slot_unit:
+            m_unit4 = re.search(
+                r"打印(?:一下)?\s{0,16}([^，,。]{1,120}?)\s{0,16}(?:发货单|送货单|出货单)",
+                slot_text,
+            )
+            if m_unit4:
+                slot_unit = cleanup_unit_name(m_unit4.group(1))
+
+        if slot_unit and slot_qty_tins is not None:
+            try:
+                qt = int(slot_qty_tins)
+            except (TypeError, ValueError):
+                qt = None
+            if qt is not None and qt > 0:
+                tu = str(slot_unit).strip()
+                tail = str(qt)
+                if tu.endswith(tail) and len(tu) > len(tail):
+                    pref = tu[: -len(tail)].strip()
+                    if pref and re.search(r"[\u4e00-\u9fa5A-Za-z]", pref):
+                        slot_unit = pref
+
+        slot_mode_trigger = (
+            (
+                "编号" in slot_text
+                or "型号" in slot_text
+                or "一共" in slot_text
+                or "总共" in slot_text
+                or "共" in slot_text
+                or (
+                    "规格" in slot_text
+                    # 「N桶 <产品token> 规格S」属 pattern-loop/多品项口径（含 ASR 中文
+                    # 编号如「一桶酒吧零三 规格28」），不在此触发槽位模式。
+                    and not re.search(r"桶\s*[^\s，,。]{1,32}\s*规格", slot_text)
+                )
+            )
+            or re.search(rf"{model_token_pattern}\s{{0,16}}(?:的)?\s{{0,16}}规格", slot_text)
+            or re.search(
+                r"(?:要|来|拿)\s{0,16}(?:\d{1,12}|[一二两三四五六七八九十零〇两]{1,16})\s{0,16}桶",
+                slot_text,
+            )
+        )
+        multi_product_hint = (
+            len(
+                re.findall(
+                    r"(?:\d{1,12}|[一二两三四五六七八九十零〇]{1,16})\s{0,16}桶\s{0,16}[0-9A-Za-z-]{1,32}\s{0,16}规格\s{0,16}\d{1,12}(?:\.\d{1,6})?",
+                    slot_text,
+                )
+            )
+            >= 2
+        )
+        if (
+            slot_mode_trigger
+            and (slot_model or slot_spec or slot_qty_tins)
+            and not multi_product_hint
+        ):
+            missing_prompt = build_missing_prompt(
+                unit_name=slot_unit,
+                model_number=slot_model,
+                tin_spec=(
+                    int(slot_spec)
+                    if isinstance(slot_spec, float) and slot_spec.is_integer()
+                    else slot_spec
+                ),
+                quantity_tins=slot_qty_tins,
+            )
+            if missing_prompt:
+                return {"success": False, "message": missing_prompt}
+
+            return {
+                "success": True,
+                "unit_name": slot_unit,
+                "products": [
+                    {
+                        "name": "",
+                        "model_number": str(slot_model),
+                        "quantity_tins": int(slot_qty_tins or 0),
+                        "tin_spec": float(slot_spec or 0.0),
+                    }
+                ],
+            }
+
+        multi_pattern = r"(\d{1,12}|[一二两三四五六七八九十零〇]{1,16})\s{0,16}桶\s{0,16}([0-9A-Za-z-]{1,32})\s{0,16}规格\s{0,16}(\d{1,12}(?:\.\d{1,6})?)"
+        multi_matches = list(re.finditer(multi_pattern, slot_text))
+        if multi_matches:
+            products = []
+            for m in multi_matches:
+                qty = parse_cn_number(m.group(1))
+                model = (m.group(2) or "").strip().upper()
+                spec = float(m.group(3))
+                if model:
+                    products.append(
+                        {
+                            "name": "",
+                            "model_number": model,
+                            "quantity_tins": int(qty) if qty else 1,
+                            "tin_spec": spec,
+                        }
+                    )
+
+            if products:
+                prefix_text = slot_text[: multi_matches[0].start()]
+                for kw in [
+                    "发货单",
+                    "送货单",
+                    "出货单",
+                    "货单",
+                    "打印",
+                    "打单",
+                    "开单",
+                    "帮我",
+                    "给我",
+                    "请",
+                    "一下",
+                ]:
+                    prefix_text = prefix_text.replace(kw, " ")
+                unit_candidate = cleanup_unit_name(prefix_text)
+                if not unit_candidate:
+                    unit_candidate = cleanup_unit_name(text.split()[0] if text.split() else "")
+                explicit_unit = extract_explicit_unit_name(original_text)
+                unit_candidate = explicit_unit or unit_candidate  # 显式客户名优先
+
+                if unit_candidate:
+                    return {"success": True, "unit_name": unit_candidate, "products": products}
+
+        patterns = [
+            r"^([^\d]{1,120}?)(\d{1,12}|[一二三四五六七八九十零〇两]{1,16})\s{0,16}桶\s{0,16}(.{1,80}?)\s{0,16}规格\s{0,16}(\d{1,12}(?:\.\d{1,6})?)",
+            r"^([^\d]{1,120}?)(\d{1,12}|[一二三四五六七八九十零〇两]{1,16})\s{0,16}桶\s{0,16}(.{1,80})$",
+            r"^([^\d]{1,120}?)(\d{1,12}|[一二三四五六七八九十零〇两]{1,16})\s{0,16}(箱|件)\s{0,16}(.{1,80})",
+            r"^([^\d]{1,120}?)(\d{1,12}(?:\.\d{1,6})?|[一二三四五六七八九十零〇两]{1,16})\s{0,16}(公斤|kg)\s{0,16}(.{1,80})",
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                groups = match.groups()
+                if len(groups) >= 3:
+                    unit_name = normalize_trailing_unit_name(groups[0])
+
+                    unit_or_measure = (groups[2] or "").strip()
+                    if unit_or_measure in ["箱", "件", "公斤", "kg"]:
+                        try:
+                            if unit_or_measure in ["箱", "件"]:
+                                quantity = float(normalize_quantity_token(groups[1]) or 0)
+                            else:
+                                token = (groups[1] or "").strip()
+                                if re.fullmatch(r"\d{1,12}(?:\.\d{1,6})?", token):
+                                    quantity = float(token)
+                                else:
+                                    digits = normalize_chinese_digits(token)
+                                    quantity = float(digits) if digits else float(token)
+                        except RECOVERABLE_ERRORS:
+                            quantity = 1
+
+                        product_name = groups[3].strip() if len(groups) > 3 else "产品"
+
+                        result: dict[str, Any] = {
+                            "success": True,
+                            "unit_name": unit_name,
+                            "products": [
+                                {
+                                    "name": product_name,
+                                    "unit": unit_or_measure,
+                                }
+                            ],
+                        }
+
+                        if "公斤" in unit_or_measure or "kg" in unit_or_measure:
+                            result["products"][0]["quantity_kg"] = quantity
+                        else:
+                            result["products"][0]["quantity_tins"] = (
+                                int(quantity) if unit_or_measure in ["箱", "件"] else quantity
+                            )
+
+                        return result
+                    else:
+                        try:
+                            quantity = normalize_quantity_token(groups[1])
+                            if quantity is None:
+                                return {"success": False, "message": "解析数字失败（数量无法识别）"}
+
+                            model_number = normalize_model_number_token(groups[2])
+                            if not model_number:
+                                return {"success": False, "message": "解析数字失败（型号无法识别）"}
+
+                            parsed_spec = float(groups[3]) if len(groups) > 3 else None
+                        except RECOVERABLE_ERRORS:
+                            return {"success": False, "message": "解析数字失败"}
+
+                        return {
+                            "success": True,
+                            "unit_name": unit_name,
+                            "products": [
+                                {
+                                    "name": "",
+                                    "model_number": model_number,
+                                    "quantity_tins": quantity,
+                                    "tin_spec": parsed_spec,
+                                }
+                            ],
+                        }
+
+        has_container_qty = any(k in text for k in ["桶", "箱", "件", "公斤", "kg"])
+        if not has_container_qty:
+            spec_match = re.search(
+                rf"([^\d]{{1,120}}?)\s{{0,16}}({model_token_pattern})\s{{0,16}}规格\s{{0,16}}(\d{{1,12}}(?:\.\d{{1,6}})?)",
+                text,
+            )
+            if spec_match:
+                unit_part = spec_match.group(1)
+                model_token = spec_match.group(2)
+                spec_token = spec_match.group(3)
+
+                unit_name = normalize_trailing_unit_name(unit_part)
+                unit_name = re.sub(r"^(帮我|给我)?打印(一下)?|^打单|^开单", "", unit_name).strip()
+                model_number = normalize_model_number_token(model_token)
+                tin_spec = float(spec_token)
+
+                if unit_name and model_number and tin_spec is not None:
+                    spec_display = int(tin_spec) if tin_spec.is_integer() else tin_spec
+                    return {
+                        "success": False,
+                        "message": f"还缺少桶数（数量）。已识别：{unit_name} / {model_number} / 规格 {spec_display}。请告诉我需要多少桶？",
+                    }
+
+        try:
+            import os
+
+            if os.environ.get("DEEPSEEK_API_KEY", "").strip():
+                from app.infrastructure.llm.structured_output import (
+                    StructuredOutputError,
+                    complete_structured_sync,
+                )
+
+                prompt = (
+                    "请从下面中文订单口语中抽取 JSON 字段："
+                    "unit_name, model_number, tin_spec, quantity_tins, quantity_kg, quantity, unit。"
+                    "仅提取原文明示的值；件数不能当公斤，缺规格不得补成10或1。"
+                    "仅返回 JSON，不要解释，不要 markdown。\n"
+                    f"文本：{text}"
+                )
+                try:
+                    structured = complete_structured_sync(
+                        [
+                            {"role": "system", "content": "你是结构化信息抽取助手，只输出 JSON。"},
+                            {"role": "user", "content": prompt},
+                        ],
+                        schema=_ORDER_SCHEMA,
+                        max_repairs=1,
+                        profile="order_parse",
+                        temperature=0.0,
+                        max_tokens=500,
+                    )
+                except StructuredOutputError:
+                    structured = None
+                except RECOVERABLE_ERRORS:
+                    structured = None
+                if structured is not None:
+                    return structured_order_result(structured.data)
+        except RECOVERABLE_ERRORS as ai_err:
+            logger.warning("AI 结构化抽取兜底失败，回退规则流程: %s", ai_err)
+
+        loose = loose_order_fallback(text)
+        if loose:
+            return loose
+
+        return {
+            "success": False,
+            "message": f"无法解析订单文本：{order_text}，请使用格式：发货单 + 单位名 + 数量 + 桶 + 型号 + 规格",
+        }
+
+    except RECOVERABLE_ERRORS:
+        logger.exception("解析订单文本失败")
+        return {"success": False, "message": "解析失败"}

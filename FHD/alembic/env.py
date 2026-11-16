@@ -1,0 +1,132 @@
+import os
+import sys
+from logging.config import fileConfig
+
+from sqlalchemy import engine_from_config, pool
+
+from alembic import context
+
+# Add project root to path
+_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+sys.path.insert(0, _ROOT)
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(os.path.join(_ROOT, ".env"))
+except ImportError:
+    pass
+
+from app.db.db_base import Base
+
+# this is the Alembic Config object, which provides
+# access to the values within the .ini file in use.
+config = context.config
+
+# Interpret the config file for Python logging.
+# This line sets up loggers basically.
+# ``disable_existing_loggers=False``：桌面端启动迁移在 frozen 进程内以 API 方式
+# 调用 ``command.upgrade``，旧行为会把已存在的 ``app.*`` logger 全部置为 disabled，
+# 迁移之后应用静默丢日志；同 pytest 会话内的后续用例也会因此收不到告警。
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
+
+# add your model's MetaData object here
+# for 'autogenerate' support
+target_metadata = Base.metadata
+
+# Import all models to ensure they're registered with Base.metadata
+from app.db.models import *  # noqa: F403 - Alembic needs every model registered
+
+# Tables intentionally NOT modeled in the ORM (created via raw SQL in the squashed
+# baseline migration, versions/2026_06_22_baseline_squashed_schema.py). Excluded
+# from autogenerate so `alembic check` does not try to DROP them. Keep this set in
+# sync with _NON_ORM_PG_DDL in that migration.
+_NON_ORM_TABLES = {
+    "templates",
+    "template_usage_log",
+    "distillation_log",
+    "training_stats",
+    "excel_vector_chunks",
+    "excel_vector_indexes",
+}
+
+
+# Explicitly managed, retention-only schema; NOT created by the baseline.
+_RETAINED_OPT_IN_TABLES = {"agent_business_actions"}
+
+
+def _include_name(name, type_, parent_names):
+    if type_ == "table":
+        return name not in _NON_ORM_TABLES | _RETAINED_OPT_IN_TABLES
+    return True
+
+
+# other values from the config, defined by the needs of env.py,
+# can be acquired:
+# my_important_option = config.get_main_option("my_important_option")
+# ... etc.
+
+
+def _database_url() -> str:
+    return os.environ.get(
+        "DATABASE_URL",
+        "postgresql+psycopg://xcagi:xcagi@localhost:5432/xcagi",
+    )
+
+
+def run_migrations_offline() -> None:
+    """Run migrations in 'offline' mode.
+
+    This configures the context with just a URL
+    and not an Engine, though an Engine is acceptable
+    here as well.  By skipping the Engine creation
+    we don't even need a DBAPI to be available.
+
+    Calls to context.execute() here emit the given string to the
+    script output.
+
+    """
+    url = _database_url()
+    context.configure(
+        url=url,
+        target_metadata=target_metadata,
+        literal_binds=True,
+        dialect_opts={"paramstyle": "named"},
+        include_name=_include_name,
+    )
+
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+def run_migrations_online() -> None:
+    """Run migrations in 'online' mode.
+
+    In this scenario we need to create an Engine
+    and associate a connection with the context.
+
+    """
+    config.set_main_option("sqlalchemy.url", _database_url().replace("%", "%%"))
+
+    connectable = engine_from_config(
+        config.get_section(config.config_ini_section, {}),
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+    )
+
+    with connectable.connect() as connection:
+        context.configure(
+            connection=connection,
+            target_metadata=target_metadata,
+            include_name=_include_name,
+        )
+
+        with context.begin_transaction():
+            context.run_migrations()
+
+
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()

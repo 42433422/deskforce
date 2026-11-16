@@ -1,0 +1,277 @@
+"""
+文件分析应用服务
+
+提供统一文件分析能力：
+- 文件类型识别（扩展名 + SQLite 文件头）
+- SQLite .db 数据库分析
+- 返回分析结果和建议用途
+"""
+
+import logging
+import os
+import sqlite3
+import uuid
+from typing import Any, cast
+from zipfile import BadZipFile
+
+from openpyxl.utils.exceptions import InvalidFileException
+
+from app.di.registry import get_service_registry
+from app.infrastructure.db.sql_identifiers import (
+    quote_sqlite_identifier,
+    resolve_products_table,
+)
+from app.utils.operational_errors import RECOVERABLE_ERRORS
+from app.utils.path_io.external_sqlite import sqlite_conn
+from app.utils.path_io.path_utils import get_upload_dir
+from app.utils.security.secure_filename import secure_filename
+
+logger = logging.getLogger(__name__)
+
+
+class FileAnalysisService:
+    """
+    文件分析服务类
+
+    负责分析上传文件，识别类型并提取元数据。
+    """
+
+    def __init__(self):
+        self.upload_dir = get_upload_dir()
+
+    def analyze_file(self, upload_file, purpose: str = "general") -> dict[str, Any]:
+        """
+        分析上传文件
+
+        Args:
+            upload_file: 上传的文件对象
+            purpose: 预期用途提示
+
+        Returns:
+            分析结果字典
+        """
+        if not upload_file or not upload_file.filename:
+            return {"success": False, "message": "未选择文件"}
+
+        raw_filename = upload_file.filename
+        ext = self._get_extension(raw_filename, upload_file.filename)
+        filename = secure_filename(raw_filename)
+
+        saved_name = f"{uuid.uuid4().hex}_{filename}"
+        saved_path = os.path.join(self.upload_dir, saved_name)
+        upload_file.save(saved_path)
+
+        ext = self._detect_sqlite_by_header(saved_path, ext)
+
+        if ext == ".db":
+            return self._analyze_sqlite_db(saved_path, saved_name, raw_filename, filename)
+
+        if ext in (".xlsx", ".xls"):
+            return cast(
+                "dict[str, Any]",
+                self._analyze_excel_file(saved_path, saved_name, raw_filename, filename),
+            )
+
+        return {
+            "success": False,
+            "message": f"暂不支持通过本接口解析 {ext}；当前版本支持 .db（SQLite）和 .xlsx/.xls（Excel）。",
+            "parser_used": "unsupported",
+            "extension": ext,
+        }
+
+    def _get_extension(self, raw_filename: str, fallback_filename: str) -> str:
+        """获取文件扩展名"""
+        ext = os.path.splitext(raw_filename)[1].lower()
+        if not ext and raw_filename.lower().endswith(".db"):
+            ext = ".db"
+        if not ext:
+            filename = secure_filename(fallback_filename)
+            ext = os.path.splitext(filename)[1].lower()
+            if not ext and filename.lower().endswith(".db"):
+                ext = ".db"
+        return ext
+
+    def _detect_sqlite_by_header(self, file_path: str, ext: str) -> str:
+        """通过文件头检测是否为 SQLite 数据库"""
+        try:
+            with open(file_path, "rb") as f:
+                header = f.read(16)
+            if header.startswith(b"SQLite format 3"):
+                return ".db"
+        except RECOVERABLE_ERRORS:
+            pass
+        return ext
+
+    def _analyze_sqlite_db(
+        self, saved_path: str, saved_name: str, raw_filename: str, filename: str
+    ) -> dict[str, Any]:
+        """分析 SQLite 数据库文件"""
+        try:
+            with sqlite_conn(saved_path) as conn:
+                cur = conn.cursor()
+
+                tables = cur.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                ).fetchall()
+                table_names = [t[0] for t in tables if t and t[0]]
+
+                focus_tables = table_names[:10]
+                table_columns = {}
+                for t in focus_tables:
+                    try:
+                        quoted = quote_sqlite_identifier(t)
+                        cols = cur.execute(f"PRAGMA table_info({quoted})").fetchall()
+                        table_columns[t] = [c[1] for c in cols if c and len(c) >= 2]
+                    except ValueError:
+                        table_columns[t] = []
+                    except RECOVERABLE_ERRORS:
+                        table_columns[t] = []
+
+                suggested_use = self._determine_suggested_use(table_names, table_columns)
+                main_tables = focus_tables[:6] if focus_tables else []
+                main_tables_text = "、".join(main_tables) if main_tables else "-"
+
+                unit_name_guess = self._extract_unit_name_guess(raw_filename, filename)
+
+                unit_candidates = []
+                if suggested_use == "unit_products_db":
+                    unit_candidates = self._extract_unit_candidates(cur, table_names)
+
+                ai_summary = (
+                    f"已识别 SQLite 数据库（.db）。库内表数：{len(table_names)}；"
+                    f"主要表：{main_tables_text}。\n"
+                    f"建议下一步用途：{suggested_use}。"
+                )
+
+                return {
+                    "success": True,
+                    "parser_used": "sqlite_db",
+                    "extension": ".db",
+                    "text_preview": "",
+                    "ai_summary": ai_summary,
+                    "analyzed": True,
+                    "suggested_use": suggested_use,
+                    "saved_name": saved_name,
+                    "unit_name_guess": unit_name_guess,
+                    "unit_candidates": unit_candidates,
+                    "db_meta": {
+                        "table_count": len(table_names),
+                        "tables": focus_tables,
+                        "table_columns": table_columns,
+                    },
+                }
+        except RECOVERABLE_ERRORS:
+            logger.exception("SQLite 数据库分析失败")
+            return {"success": False, "message": "文件分析失败，服务暂时不可用，请稍后重试"}
+
+    def _analyze_excel_file(
+        self, saved_path: str, saved_name: str, raw_filename: str, filename: str
+    ) -> dict[str, Any]:
+        """Extract a bounded workbook preview without evaluating formulas."""
+        try:
+            from openpyxl import load_workbook
+
+            workbook = load_workbook(saved_path, read_only=True, data_only=True)
+            sheets: list[dict[str, Any]] = []
+            for worksheet in workbook.worksheets[:20]:
+                preview = [
+                    [cell for cell in row]
+                    for row in worksheet.iter_rows(
+                        min_row=1,
+                        max_row=min(int(worksheet.max_row or 1), 20),
+                        values_only=True,
+                    )
+                ]
+                sheets.append(
+                    {
+                        "name": worksheet.title,
+                        "max_row": int(worksheet.max_row or 0),
+                        "max_column": int(worksheet.max_column or 0),
+                        "preview": preview,
+                    }
+                )
+            workbook.close()
+            return {
+                "success": True,
+                "parser_used": "openpyxl",
+                "extension": os.path.splitext(filename)[1].lower(),
+                "analyzed": True,
+                "saved_name": saved_name,
+                "original_name": raw_filename,
+                "suggested_use": "excel_import",
+                "excel_meta": {"sheet_count": len(sheets), "sheets": sheets},
+            }
+        except RECOVERABLE_ERRORS + (BadZipFile, InvalidFileException):
+            logger.exception("Excel 文件分析失败")
+            return {"success": False, "message": "Excel 文件分析失败，请确认文件格式后重试"}
+
+    def _determine_suggested_use(self, table_names: list, table_columns: dict[str, list]) -> str:
+        """根据表结构确定建议用途"""
+        lower_tables = {x.lower() for x in table_names}
+
+        if "msg" in lower_tables or "contact" in lower_tables:
+            return "wechat_db_search"
+        if "purchase_units" in lower_tables:
+            return "purchase_units_db"
+        if "customers" in lower_tables:
+            return "customers_db"
+
+        products_table = next((t for t in table_names if t and t.lower() == "products"), None)
+        if products_table:
+            products_cols_lower = [c.lower() for c in (table_columns.get(products_table) or [])]
+            has_required_cols = (
+                "model_number" in products_cols_lower and "name" in products_cols_lower
+            )
+            has_unit_col = "unit" in products_cols_lower
+            is_unit_products_lib = (
+                products_table is not None
+                and has_required_cols
+                and (
+                    len(table_names) <= 2
+                    or ("customers" not in lower_tables and "purchase_units" not in lower_tables)
+                )
+                and has_unit_col
+            )
+            if is_unit_products_lib:
+                return "unit_products_db"
+
+        return "sqlite_db"
+
+    def _extract_unit_name_guess(self, raw_filename: str, filename: str) -> str:
+        """从文件名提取购买单位名称猜测"""
+        try:
+            base = os.path.splitext(raw_filename or "")[0] or os.path.splitext(filename or "")[0]
+            return (base or "").strip()
+        except RECOVERABLE_ERRORS:
+            return ""
+
+    def _extract_unit_candidates(self, cur: sqlite3.Cursor, table_names: list) -> list:
+        """从 unit_products_db 提取购买单位候选列表"""
+        products_table = resolve_products_table(table_names)
+        if not products_table:
+            return []
+
+        quoted_table = quote_sqlite_identifier(products_table)
+        try:
+            candidates = [
+                r[0]
+                for r in cur.execute(
+                    "SELECT DISTINCT unit FROM "
+                    + quoted_table
+                    + ' WHERE unit IS NOT NULL AND TRIM(unit) != "" LIMIT 10'
+                ).fetchall()
+                if r and r[0]
+            ]
+            return candidates
+        except RECOVERABLE_ERRORS:
+            return []
+
+
+from app.neuro_bus.neuro_application_instrumentation import instrument_application_service_class
+
+instrument_application_service_class(FileAnalysisService)
+
+
+def get_file_analysis_app_service() -> FileAnalysisService:
+    """获取文件分析服务单例"""
+    return get_service_registry().file_analysis_application_service

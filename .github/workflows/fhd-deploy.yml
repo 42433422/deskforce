@@ -1,0 +1,524 @@
+# CI SSOT: root-only workflow — single-CVM rolling restart (tarball/compose).
+# Production is 119.27.178.147; there is no K8s/Helm/blue-green/canary path.
+# Automatic CD is fhd-ci-cd.yml → cvm-push-release → server cron fhd-auto-update.sh.
+# This workflow is the manual break-glass: force apply latest manifest or restart compose.
+name: fhd-deploy
+run-name: fhd-deploy ${{ inputs.environment }} ${{ inputs.action }} autonomy:${{ inputs.action_id || 'none' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target channel on the single CVM
+        required: true
+        type: choice
+        default: production
+        options:
+          - production
+          - staging
+      action:
+        description: rolling apply (consume latest manifest) or compose restart only
+        required: true
+        type: choice
+        default: apply-latest
+        options:
+          - apply-latest
+          - restart-only
+          - freeze-manifest
+          - unfreeze-manifest
+      action_id:
+        description: Required for production apply-latest; exact release:<40-char git sha>
+        required: false
+        type: string
+        default: ""
+      release_sha:
+        description: Required for production apply-latest; exact 40-character release commit
+        required: false
+        type: string
+        default: ""
+      security_scan_run_id:
+        description: Required for production apply-latest; current successful full security scan
+        required: false
+        type: string
+        default: ""
+      previous_security_scan_run_id:
+        description: Required for production apply-latest; compatibility input, use the current scan run ID
+        required: false
+        type: string
+        default: ""
+      preserve_release_history:
+        description: Keep all FHD and DR release history for this apply
+        required: false
+        type: boolean
+        default: false
+      retry_failed_release:
+        description: Request a fresh approval for a failed exact release (new workflow run required)
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: fhd-deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: read
+  deployments: read
+
+jobs:
+  cvm-rolling:
+    name: CVM rolling (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment }}
+    steps:
+      - name: Validate explicit retry scope
+        if: ${{ inputs.retry_failed_release && (inputs.environment != 'production' || inputs.action != 'apply-latest') }}
+        run: exit 64
+
+      - name: Checkout exact production release for gate verification
+        if: ${{ inputs.environment == 'production' && inputs.action == 'apply-latest' }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_sha }}
+
+      - name: Verify exact production release input
+        if: ${{ inputs.environment == 'production' && inputs.action == 'apply-latest' }}
+        env:
+          ACTION_ID: ${{ inputs.action_id }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${RELEASE_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::production apply-latest requires release_sha=<40-char git sha>."
+            exit 1
+          fi
+          if [ "${ACTION_ID}" != "release:${RELEASE_SHA}" ]; then
+            echo "::error::action_id must identify the same exact release_sha."
+            exit 1
+          fi
+          test "$(git rev-parse HEAD)" = "${RELEASE_SHA}"
+
+      - name: Download normalized security evidence
+        if: ${{ inputs.environment == 'production' && inputs.action == 'apply-latest' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: xcagi-security-release-reports
+          path: ${{ runner.temp }}/security-reports/current
+          run-id: ${{ inputs.security_scan_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download compatibility security evidence
+        if: ${{ inputs.environment == 'production' && inputs.action == 'apply-latest' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: xcagi-security-release-reports
+          path: ${{ runner.temp }}/security-reports/previous
+          run-id: ${{ inputs.previous_security_scan_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Enforce fresh exact-SHA security clearance
+        if: ${{ inputs.environment == 'production' && inputs.action == 'apply-latest' }}
+        run: |
+          python FHD/scripts/security/verify_security_scan_pair.py \
+            --previous-dir "${{ runner.temp }}/security-reports/previous" \
+            --current-dir "${{ runner.temp }}/security-reports/current" \
+            --release-sha "${{ inputs.release_sha }}"
+
+      - name: Require CVM SSH secrets
+        env:
+          FHD_PUSH_HOST: ${{ secrets.FHD_PUSH_HOST }}
+          FHD_PUSH_SSH_KEY: ${{ secrets.FHD_PUSH_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${FHD_PUSH_HOST:-}" ] || [ -z "${FHD_PUSH_SSH_KEY:-}" ]; then
+            echo "::error::FHD_PUSH_HOST and FHD_PUSH_SSH_KEY are required for single-CVM deploy."
+            echo "::error::Configure repo Secrets (default host 119.27.178.147)."
+            exit 1
+          fi
+
+      - name: Validate existing autonomy runtime configuration
+        if: ${{ inputs.environment == 'production' && inputs.action == 'apply-latest' }}
+        env:
+          FHD_PUSH_HOST: ${{ secrets.FHD_PUSH_HOST }}
+          FHD_PUSH_USER: ${{ secrets.FHD_PUSH_USER }}
+          FHD_PUSH_SSH_KEY_RAW: ${{ secrets.FHD_PUSH_SSH_KEY }}
+          AUTONOMY_WEBHOOK_TOKEN: ${{ secrets.MODSTORE_OPS_INGEST_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${AUTONOMY_WEBHOOK_TOKEN:-}" ]; then
+            echo "::error::MODSTORE_OPS_INGEST_TOKEN is required for production autonomy callbacks."
+            exit 1
+          fi
+          host="${FHD_PUSH_HOST:-119.27.178.147}"
+          user="${FHD_PUSH_USER:-root}"
+          key_file="${RUNNER_TEMP}/fhd_autonomy_config_key"
+          printf '%s\n' "$FHD_PUSH_SSH_KEY_RAW" > "$key_file"
+          chmod 600 "$key_file"
+          # Keep server-owned credentials, approval policy and data paths unchanged.
+          # The next authenticated ledger request checks callback credentials before apply.
+          ssh -i "$key_file" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 \
+            "${user}@${host}" \
+            'set -euo pipefail
+             test -r /root/fhd-full.env
+             systemctl is-active --quiet fhd-full.service
+             curl --noproxy "*" -sf --max-time 5 http://127.0.0.1:5100/api/health >/dev/null'
+
+      - name: Authorize exact production release in autonomy ledger
+        if: ${{ inputs.environment == 'production' && inputs.action == 'apply-latest' }}
+        env:
+          ACTION_ID: ${{ inputs.action_id }}
+          FHD_PUSH_HOST: ${{ secrets.FHD_PUSH_HOST }}
+          FHD_PUSH_USER: ${{ secrets.FHD_PUSH_USER }}
+          FHD_PUSH_SSH_KEY_RAW: ${{ secrets.FHD_PUSH_SSH_KEY }}
+          AUTONOMY_CALLBACK_URL: ${{ vars.AUTONOMY_CALLBACK_URL }}
+          AUTONOMY_WEBHOOK_TOKEN: ${{ secrets.MODSTORE_OPS_INGEST_TOKEN }}
+          RETRY_FAILED_RELEASE: ${{ inputs.retry_failed_release && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$ACTION_ID" =~ ^release:[0-9a-f]{40}$ ]]; then
+            echo "::error::production apply-latest requires action_id=release:<40-char git sha>."
+            exit 1
+          fi
+          if [[ "$AUTONOMY_CALLBACK_URL" != */github-approval ]]; then
+            echo "::error::AUTONOMY_CALLBACK_URL must end with /github-approval."
+            exit 1
+          fi
+          test -n "${AUTONOMY_WEBHOOK_TOKEN:-}"
+          host="${FHD_PUSH_HOST:-119.27.178.147}"
+          user="${FHD_PUSH_USER:-root}"
+          key_file="${RUNNER_TEMP}/fhd_release_approval_key"
+          printf '%s\n' "$FHD_PUSH_SSH_KEY_RAW" > "$key_file"
+          chmod 600 "$key_file"
+          release_sha="$(ssh -i "$key_file" \
+            -o StrictHostKeyChecking=accept-new \
+            -o ConnectTimeout=30 \
+            "${user}@${host}" \
+            "python3 -c 'import json; print(json.load(open(\"/var/www/update/releases/stable/server/fhd-manifest.json\", encoding=\"utf-8\"))[\"git_sha\"])'")"
+          if [ "$ACTION_ID" != "release:${release_sha}" ]; then
+            echo "::error::action_id does not match the exact stable manifest SHA."
+            exit 1
+          fi
+          request_url="${AUTONOMY_CALLBACK_URL%/github-approval}/actions/request"
+          request_payload="$(jq -nc \
+            --arg action_id "$ACTION_ID" \
+            --arg actor "$GITHUB_ACTOR" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --argjson retry "$RETRY_FAILED_RELEASE" \
+            '{action:"apply_release_to_cvm",action_id:$action_id,source:"github.workflow_dispatch",retry_failed:$retry,retry_approval_id:(if $retry then $run_id else "" end),payload:{requested_by:$actor,workflow_run_id:$run_id,workflow_action:"apply-latest"}}')"
+          request_response="$(curl --fail-with-body --silent --show-error \
+            -X POST "$request_url" \
+            -H "Authorization: Bearer $AUTONOMY_WEBHOOK_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "$request_payload")"
+          echo "$request_response" | jq -e '.ok == true and (.state == "pending_approval" or .state == "approval_requested")' >/dev/null
+
+          approval_payload="$(jq -nc \
+            --arg action_id "$ACTION_ID" \
+            --arg approval_id "$GITHUB_RUN_ID" \
+            --arg approver "$GITHUB_ACTOR" \
+            '{action_id:$action_id,approval_id:$approval_id,approver:$approver,workflow_action:"apply-latest",decision:"approved",defer_execution:true}')"
+          approval_response="$(curl --fail-with-body --silent --show-error \
+            -X POST "$AUTONOMY_CALLBACK_URL" \
+            -H "Authorization: Bearer $AUTONOMY_WEBHOOK_TOKEN" \
+            -H "Content-Type: application/json" \
+            -H "X-GitHub-Actor: $GITHUB_ACTOR" \
+            --data "$approval_payload")"
+          echo "$approval_response" | jq -e '.ok == true and .action.state == "approved"' >/dev/null
+          echo "Exact release action approved by authenticated GitHub actor ${GITHUB_ACTOR}."
+
+      - name: SSH rolling restart / apply
+        env:
+          FHD_PUSH_HOST: ${{ secrets.FHD_PUSH_HOST }}
+          FHD_PUSH_USER: ${{ secrets.FHD_PUSH_USER }}
+          FHD_PUSH_SSH_KEY_RAW: ${{ secrets.FHD_PUSH_SSH_KEY }}
+          TARGET_ENV: ${{ inputs.environment }}
+          ACTION: ${{ inputs.action }}
+          ACTION_ID: ${{ inputs.action_id }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          PRESERVE_RELEASE_HISTORY: ${{ inputs.preserve_release_history && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          if [ "$PRESERVE_RELEASE_HISTORY" = "1" ] \
+            && { [ "$TARGET_ENV" != "production" ] || [ "$ACTION" != "apply-latest" ]; }; then
+            echo "::error::preserve_release_history is only valid for production apply-latest"
+            exit 64
+          fi
+          HOST="${FHD_PUSH_HOST:-119.27.178.147}"
+          USER="${FHD_PUSH_USER:-root}"
+          KEY_FILE="${RUNNER_TEMP}/fhd_deploy_key"
+          printf '%s\n' "$FHD_PUSH_SSH_KEY_RAW" > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+
+          if [ "$TARGET_ENV" = "staging" ]; then
+            DEPLOY_ROOT="/opt/fhd-staging"
+            MANIFEST="/var/www/update/releases/staging/server/fhd-manifest.json"
+            # Path-based health works without staging.xiu-ci.com DNS/cert SAN.
+            # Host-based URL kept as secondary once DNS A -> CVM is configured.
+            HEALTH_URL="https://xiu-ci.com/fhd-staging-api/api/health"
+            HEALTH_URL_ALT="https://staging.xiu-ci.com/fhd-api/api/health"
+            ENV_FILE="/root/fhd-staging.env"
+            SERVICE_NAME="fhd-staging.service"
+            HEALTH_PORT="5101"
+            AUTO_LOCK="/tmp/fhd-staging-auto-update.lock"
+          else
+            DEPLOY_ROOT="/opt/fhd-full"
+            MANIFEST="/var/www/update/releases/stable/server/fhd-manifest.json"
+            HEALTH_URL="https://xiu-ci.com/fhd-api/api/health"
+            HEALTH_URL_ALT=""
+            ENV_FILE="/root/fhd-full.env"
+            SERVICE_NAME="fhd-full.service"
+            HEALTH_PORT="5100"
+            AUTO_LOCK="/tmp/fhd-auto-update.lock"
+          fi
+
+          # Neuro Bus 7 开关生产校验（cicd-e2e-prompt.md 关键约束 10）
+          # 任一开关缺失/为空 → 阻断部署，防止静默降级运行
+          echo "Verifying Neuro Bus production switches in ${ENV_FILE}..."
+          ssh -i "$KEY_FILE" \
+            -o StrictHostKeyChecking=accept-new \
+            -o ConnectTimeout=30 \
+            "${USER}@${HOST}" \
+            "bash -s" <<NEURO_EOF
+          set -euo pipefail
+          ENV_FILE="${ENV_FILE}"
+          VARS="XCAGI_NEURO_BUS_DEDUP XCAGI_NEURO_BUS_CIRCUIT XCAGI_NEURO_BUS_RATE_LIMIT XCAGI_NEURO_BUS_TRACE XCAGI_NEURO_BUS_LIFELINE XCAGI_NEURO_BUS_DLQ_AUTO XCAGI_NEURO_BUS_SLA_LOG"
+          if [ ! -f "\$ENV_FILE" ]; then
+            echo "::error::env file \$ENV_FILE not found on remote host"
+            exit 1
+          fi
+          MISSING=""
+          for v in \$VARS; do
+            val=\$(grep -E "^\s*\$v\s*=" "\$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '[:space:]' || echo "")
+            if [ "\$val" != "1" ]; then
+              echo "::error::\$v expected=1 got='\$val' (in \$ENV_FILE)"
+              MISSING="\$MISSING \$v"
+            fi
+          done
+          if [ -n "\$MISSING" ]; then
+            echo "::error::Neuro Bus 生产开关未启用:\$MISSING — 部署被阻断"
+            exit 1
+          fi
+          echo "✅ Neuro Bus 7 switches verified (all =1) in \$ENV_FILE"
+          NEURO_EOF
+
+          TRUSTED_VERIFIER_B64=""
+          if [ "${TARGET_ENV}" = "production" ]; then
+            TRUSTED_VERIFIER_B64="$(base64 < "$GITHUB_WORKSPACE/FHD/scripts/deploy/lib/verify_release_archive.py" | tr -d '\n')"
+          fi
+          ssh -i "$KEY_FILE" \
+            -o StrictHostKeyChecking=accept-new \
+            -o ConnectTimeout=30 \
+            "${USER}@${HOST}" \
+            "bash -s" <<EOF
+          set -euo pipefail
+          export FHD_DEPLOY_ROOT="${DEPLOY_ROOT}"
+          export FHD_MANIFEST_PATH="${MANIFEST}"
+          export FHD_SERVICE_NAME="${SERVICE_NAME}"
+          export FHD_HEALTH_PORT="${HEALTH_PORT}"
+          export FHD_ENV_FILE="${ENV_FILE}"
+          export FHD_AUTO_UPDATE_LOCK="${AUTO_LOCK}"
+          export FHD_AUTO_UPDATE_LOCK_WAIT_SECONDS="360"
+          case "${PRESERVE_RELEASE_HISTORY}" in 0|1) export XCMAX_PRESERVE_RELEASE_HISTORY="${PRESERVE_RELEASE_HISTORY}" ;; *) exit 64 ;; esac
+          if [ "${ACTION}" = "freeze-manifest" ]; then
+            touch "${MANIFEST}.frozen"
+          elif [ "${ACTION}" = "unfreeze-manifest" ]; then
+            rm -f "${MANIFEST}.frozen"
+          elif [ "${ACTION}" = "restart-only" ]; then
+            if systemctl cat "${SERVICE_NAME}" >/dev/null 2>&1; then
+              systemctl restart "${SERVICE_NAME}"
+              systemctl is-active --quiet "${SERVICE_NAME}"
+            elif [ -f "${DEPLOY_ROOT}/docker-compose.yml" ]; then
+              cd "${DEPLOY_ROOT}" && docker compose restart
+            elif [ -f "${DEPLOY_ROOT}/compose.yml" ]; then
+              cd "${DEPLOY_ROOT}" && docker compose -f compose.yml restart
+            else
+              echo "No compose file under ${DEPLOY_ROOT}; nothing to restart" >&2
+              exit 1
+            fi
+          else
+            RELEASE_FIELDS="\$(python3 - "${MANIFEST}" "${RELEASE_SHA}" "${TARGET_ENV}" "${ACTION}" <<'PY'
+          import json, re, sys
+          manifest_path, authorized_sha, environment, action = sys.argv[1:]
+          with open(manifest_path, encoding="utf-8") as stream:
+              doc = json.load(stream)
+          git_sha = str(doc.get("git_sha") or "")
+          artifact = str(doc.get("artifact") or "")
+          digest = str(doc.get("sha256") or "")
+          verifier_sha = str(doc.get("archive_verifier_sha256") or "")
+          if not re.fullmatch(r"[0-9a-f]{40}", git_sha):
+              raise SystemExit("manifest git_sha is not an exact lowercase SHA")
+          if not re.fullmatch(r"[0-9a-f]{64}", digest):
+              raise SystemExit("manifest sha256 is invalid")
+          if not re.fullmatch(r"[0-9a-f]{64}", verifier_sha):
+              raise SystemExit("manifest archive verifier SHA256 is invalid")
+          if not re.fullmatch(r"fhd-full-[A-Za-z0-9._-]+\.tar\.gz", artifact):
+              raise SystemExit("manifest artifact is not a safe FHD tarball basename")
+          if environment == "production" and action == "apply-latest" and git_sha != authorized_sha:
+              raise SystemExit("manifest git_sha differs from authorized release_sha")
+          print("|".join((git_sha, artifact, digest, verifier_sha)))
+          PY
+          )"
+            IFS='|' read -r MANIFEST_GIT_SHA ARTIFACT EXPECTED_ARCHIVE_SHA EXPECTED_VERIFIER_SHA <<<"\$RELEASE_FIELDS"
+            EXPECTED_SHA="\$MANIFEST_GIT_SHA"
+            TARBALL="\$(dirname "${MANIFEST}")/\$ARTIFACT"
+            test -f "\$TARBALL"
+            ACTUAL_ARCHIVE_SHA="\$(sha256sum -- "\$TARBALL" | awk '{print \$1}')"
+            if [ "\$ACTUAL_ARCHIVE_SHA" != "\$EXPECTED_ARCHIVE_SHA" ]; then
+              echo "Artifact SHA256 does not match manifest" >&2
+              exit 1
+            fi
+            TRUSTED_VERIFIER=""
+            if [ "${TARGET_ENV}" = "production" ]; then
+              TRUSTED_VERIFIER="\$(mktemp /tmp/fhd-trusted-archive-verifier.XXXXXX.py)"
+              printf '%s' "${TRUSTED_VERIFIER_B64}" | base64 --decode >"\$TRUSTED_VERIFIER"
+              chmod 600 "\$TRUSTED_VERIFIER"
+            else
+              TRUSTED_VERIFIER="${DEPLOY_ROOT}/scripts/deploy/lib/verify_release_archive.py"
+            fi
+            ACTUAL_VERIFIER_SHA="\$(sha256sum -- "\$TRUSTED_VERIFIER" | awk '{print \$1}')"
+            if [ "\$ACTUAL_VERIFIER_SHA" != "\$EXPECTED_VERIFIER_SHA" ]; then
+              echo "Checked-out verifier differs from exact release source" >&2
+              exit 1
+            fi
+            python3 "\$TRUSTED_VERIFIER" --archive "\$TARBALL"
+            if [ "${TARGET_ENV}" = "production" ]; then
+              rm -f -- "\$TRUSTED_VERIFIER"
+            fi
+            BOOTSTRAP="\$(mktemp -d /tmp/fhd-deploy-bootstrap.XXXXXX)"
+            trap 'rm -rf -- "\$BOOTSTRAP"' EXIT
+            tar -xzf "\$TARBALL" -C "\$BOOTSTRAP" ./scripts/deploy
+            AUTO="\$BOOTSTRAP/scripts/deploy/fhd-auto-update.sh"
+            test -x "\$AUTO"
+            # Keep old identity stamps intact for archive ownership checks and rollback.
+            FHD_FORCE_APPLY=1 bash "\$AUTO"
+            DEPLOYED_SHA="\$(cat "${DEPLOY_ROOT}/.deploy-git-sha" 2>/dev/null || true)"
+            if [ "\$DEPLOYED_SHA" != "\$EXPECTED_SHA" ]; then
+              echo "Deployed SHA mismatch: expected=\$EXPECTED_SHA actual=\${DEPLOYED_SHA:-missing}" >&2
+              exit 1
+            fi
+          fi
+          EOF
+
+          echo "Remote action done. Checking ${HEALTH_URL}${HEALTH_URL_ALT:+ (alt ${HEALTH_URL_ALT})}"
+          EXPECTED_SHA=""
+          if [[ "$ACTION" = "apply-latest" && "$ACTION_ID" =~ ^release:([0-9a-f]{40})$ ]]; then
+            EXPECTED_SHA="${BASH_REMATCH[1]}"
+          fi
+          health_matches_target() {
+            if [ -z "$EXPECTED_SHA" ]; then
+              return 0
+            fi
+            local actual_sha
+            actual_sha="$(jq -r '.git_sha // .data.git_sha // empty' /tmp/health.json)"
+            if [ "$actual_sha" = "$EXPECTED_SHA" ]; then
+              return 0
+            fi
+            echo "Health SHA not converged: expected=$EXPECTED_SHA actual=${actual_sha:-missing}"
+            return 1
+          }
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -sf "${HEALTH_URL}" > /tmp/health.json 2>/dev/null; then
+              if health_matches_target; then
+                echo "Health check passed on attempt ${i} via ${HEALTH_URL}"
+                cat /tmp/health.json
+                exit 0
+              fi
+            fi
+            if [ -n "${HEALTH_URL_ALT}" ] && curl -sf "${HEALTH_URL_ALT}" > /tmp/health.json 2>/dev/null; then
+              if health_matches_target; then
+                echo "Health check passed on attempt ${i} via ${HEALTH_URL_ALT}"
+                cat /tmp/health.json
+                exit 0
+              fi
+            fi
+            # Break-glass fallback: SSH local port (covers DNS/cert lag).
+            if ssh -i "$KEY_FILE" \
+              -o StrictHostKeyChecking=accept-new \
+              -o ConnectTimeout=15 \
+              "${USER}@${HOST}" \
+              "curl -sf --noproxy '*' --max-time 5 http://127.0.0.1:${HEALTH_PORT}/api/health" \
+              > /tmp/health.json 2>/dev/null; then
+              if health_matches_target; then
+                echo "Health check passed on attempt ${i} via SSH localhost:${HEALTH_PORT}"
+                cat /tmp/health.json
+                exit 0
+              fi
+            fi
+            echo "Attempt ${i} failed, retrying in 15s..."
+            sleep 15
+          done
+          echo "::error::Health check failed after 10 attempts"
+          exit 1
+
+      - name: Record completed autonomy action
+        if: ${{ inputs.environment == 'production' && inputs.action_id != '' && success() }}
+        env:
+          ACTION_ID: ${{ inputs.action_id }}
+          APPROVAL_ID: ${{ github.run_id }}
+          APPROVER: ${{ github.actor }}
+          AUTONOMY_CALLBACK_URL: ${{ vars.AUTONOMY_CALLBACK_URL }}
+          AUTONOMY_WEBHOOK_TOKEN: ${{ secrets.MODSTORE_OPS_INGEST_TOKEN }}
+        run: |
+          set -euo pipefail
+          payload="$(jq -nc \
+            --arg action_id "$ACTION_ID" \
+            --arg approval_id "$APPROVAL_ID" \
+            --arg approver "$APPROVER" \
+            --arg workflow_action "${{ inputs.action }}" \
+            '{action_id:$action_id,approval_id:$approval_id,approver:$approver,workflow_action:$workflow_action,decision:"executed",outcome:{workflow_action:$workflow_action}}')"
+          curl --fail-with-body --silent --show-error \
+            -X POST "$AUTONOMY_CALLBACK_URL" \
+            -H "Authorization: Bearer $AUTONOMY_WEBHOOK_TOKEN" \
+            -H "Content-Type: application/json" \
+            -H "X-GitHub-Actor: $APPROVER" \
+            --data "$payload"
+
+  report-autonomy-failure:
+    name: Report autonomy execution failure
+    needs: cvm-rolling
+    if: ${{ always() && inputs.environment == 'production' && inputs.action_id != '' && needs['cvm-rolling'].result != 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mark pending action terminal
+        env:
+          ACTION_ID: ${{ inputs.action_id }}
+          APPROVAL_ID: ${{ github.run_id }}
+          WORKFLOW_ACTION: ${{ inputs.action }}
+          AUTONOMY_CALLBACK_URL: ${{ vars.AUTONOMY_CALLBACK_URL }}
+          AUTONOMY_WEBHOOK_TOKEN: ${{ secrets.MODSTORE_OPS_INGEST_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${AUTONOMY_CALLBACK_URL:-}" ] || [ -z "${AUTONOMY_WEBHOOK_TOKEN:-}" ]; then
+            echo "::error::Autonomy callback configuration is missing."
+            exit 1
+          fi
+          decision="execution_failed"
+          approver="$GITHUB_ACTOR"
+          reason="Autonomous workflow execution failed"
+          payload="$(jq -nc \
+            --arg action_id "$ACTION_ID" \
+            --arg approval_id "$APPROVAL_ID" \
+            --arg approver "$approver" \
+            --arg decision "$decision" \
+            --arg workflow_action "$WORKFLOW_ACTION" \
+            --arg reason "$reason" \
+            '{action_id:$action_id,approval_id:$approval_id,approver:$approver,decision:$decision,workflow_action:$workflow_action,reason:$reason,outcome:{reason:$reason}}')"
+          response_body="${RUNNER_TEMP}/autonomy-failure-callback.json"
+          status="$(curl --silent --show-error --output "$response_body" --write-out '%{http_code}' \
+            -X POST "$AUTONOMY_CALLBACK_URL" \
+            -H "Authorization: Bearer $AUTONOMY_WEBHOOK_TOKEN" \
+            -H "Content-Type: application/json" \
+            -H "X-GitHub-Actor: $approver" \
+            --data "$payload")"
+          cat "$response_body"
+          if [[ "$status" == 2* ]]; then
+            exit 0
+          fi
+          if [ "$status" = "409" ] && grep -qE 'already terminal|was rejected' "$response_body"; then
+            echo "Autonomy action was already terminal; callback is idempotently complete."
+            exit 0
+          fi
+          echo "::error::Autonomy failure callback returned HTTP $status"
+          exit 1

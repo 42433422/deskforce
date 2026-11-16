@@ -1,0 +1,51 @@
+id: self-checker
+name: 自检员工
+version: 1.0.0
+domain: 执行员工包独立可执行自检，验证 .xcemp 包在隔离环境下可正常加载与运行
+owner: admin
+area: craft-workshop
+scope_globs:
+- workbench/sessions/*
+- workbench/selfcheck/*
+forbidden_globs:
+- '*.py'
+- '*.vue'
+- '*.ts'
+triggers:
+  on_error: true
+  on_quality_fail: true
+  on_coverage_miss: false
+  max_patch_budget_tokens: 3000
+  max_patch_steps: 4
+sla:
+  timeout_seconds: 120
+  retry_max: 2
+  escalate_to_human: true
+llm_default: auto
+llm_reasoning: auto
+actions:
+  handlers:
+  - llm_md
+  - echo
+capabilities:
+  - self.check
+
+skills:
+- skills/skill-self-check.md
+depends_on:
+- code-validator
+examples:
+  - title: "自检员工岗位验收"
+    description: "以最小、无副作用输入验证岗位输出包含真实证据、风险与下一步。"
+    input:
+      task: "执行一次自检员工职责范围内的只读检查，并返回证据、风险和下一步。"
+      dry_run: true
+
+changelog:
+- version: 1.0.0
+  date: '2026-05-18'
+  note: 初始创建
+all_hands:
+  standby: true
+  runbook: 制作车间流水线岗位：无上游员工包/workflow/产物路径时仅汇报职责边界与待机条件；收到 intent-analyst 或 pack-registrar
+    输入后再描述可执行步骤。

@@ -1,0 +1,399 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { ref } from 'vue'
+import { mount, flushPromises } from '@vue/test-utils'
+import ImMessengerView from './ImMessengerView.vue'
+import SharedIssueAcceptancePanel from '@/components/SharedIssueAcceptancePanel.vue'
+
+vi.mock('@/components/im/KellaiCustomerInbox.vue', () => ({
+  __isTeleport: false,
+  default: { template: '<section class="kellai-inbox-stub">客来来客户会话（只读）</section>' },
+}))
+
+const enterpriseCsContact = vi.hoisted(() => ({
+  id: 99,
+  display_name: '企业专属客服',
+  username: 'enterprise-cs',
+  is_enterprise_dedicated_cs: true,
+}))
+
+vi.mock('@/api/im', () => ({
+  fetchImConversations: vi.fn().mockResolvedValue([
+    {
+      id: 1,
+      title: '企业专属客服',
+      is_direct: true,
+      last_message_at: null,
+      last_message_preview: '',
+      unread_count: 0,
+      is_enterprise_dedicated_cs: true,
+    },
+  ]),
+  fetchImMessages: vi.fn().mockResolvedValue([]),
+  fetchEnterpriseCsThread: vi.fn().mockResolvedValue({
+    conversation: {
+      id: 12,
+      title: '企业专属客服',
+      is_direct: true,
+      last_message_at: null,
+      last_message_preview: '',
+      unread_count: 0,
+      is_enterprise_dedicated_cs: true,
+      cs_mode: 'ai',
+      cs_status: 'ai_active',
+    },
+    messages: [],
+  }),
+  fetchCsInbox: vi.fn().mockResolvedValue([]),
+  fetchCsInboxMessages: vi.fn().mockResolvedValue([]),
+  replyCsInbox: vi.fn().mockResolvedValue({ success: true }),
+  updateCsInboxMode: vi.fn().mockResolvedValue({ cs_mode: 'human', cs_status: 'human_active' }),
+  sendImMessage: vi.fn().mockResolvedValue({ success: true }),
+  sendEnterpriseCsMessage: vi.fn().mockResolvedValue({
+    conversation_id: 12,
+    message: {
+      id: 101,
+      conversation_id: 12,
+      sender_user_id: 39,
+      body: '测试消息',
+      is_self: true,
+      created_at: '2026-09-01T00:00:00Z',
+    },
+    state: { cs_mode: 'ai', cs_status: 'ai_active' },
+  }),
+  createDirectConversation: vi.fn().mockResolvedValue({ id: 1 }),
+  fetchImContacts: vi.fn().mockResolvedValue([enterpriseCsContact]),
+  imWebSocketUrl: vi.fn(() => 'ws://localhost/ws'),
+  markImRead: vi.fn().mockResolvedValue({}),
+}))
+vi.mock('@/api/codexSuperEmployee', () => ({
+  fetchCodexSuperEmployeeMessages: vi.fn().mockResolvedValue([]),
+  sendCodexSuperEmployeeMessage: vi.fn().mockResolvedValue({
+    dispatch: { request_id: 'req-1', status: 'queued', queued: true },
+    messages: [
+      {
+        id: 'm-user',
+        role: 'user',
+        body: '修复登录问题',
+        created_at: '2026-06-19T00:00:00Z',
+        status: 'sent',
+        dispatch_request_id: 'req-1',
+      },
+      {
+        id: 'm-codex',
+        role: 'system',
+        body: '已进入软件内 Codex 调用队列，等待跨设备调度器接走。',
+        created_at: '2026-06-19T00:00:01Z',
+        status: 'queued',
+        kind: 'dispatcher',
+        dispatch_request_id: 'req-1',
+      },
+    ],
+  }),
+}))
+vi.mock('@/api/claudeSuperEmployee', () => ({
+  fetchClaudeSuperEmployeeMessages: vi.fn().mockResolvedValue([]),
+  sendClaudeSuperEmployeeMessage: vi.fn().mockResolvedValue({ messages: [] }),
+}))
+vi.mock('@/api/cursorSuperEmployee', () => ({
+  fetchCursorSuperEmployeeMessages: vi.fn().mockResolvedValue([]),
+  sendCursorSuperEmployeeMessage: vi.fn().mockResolvedValue({ messages: [] }),
+}))
+vi.mock('vue-router', () => ({
+  useRoute: () => ({ query: {} }),
+}))
+vi.mock('pinia', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('pinia')>()
+  return {
+    ...actual,
+    storeToRefs: () => ({ isAdminAccount: ref(false) }),
+  }
+})
+vi.mock('@/stores/accountProfile', () => ({
+  useAccountProfileStore: () => ({ marketUserId: null }),
+}))
+vi.mock('@/api/auth', () => ({
+  authApi: {
+    getCurrentUser: vi.fn().mockResolvedValue({ data: { user: { id: 1 } } }),
+  },
+}))
+vi.mock('@/composables/useImSounds', () => ({
+  useImSounds: () => ({ playIncoming: vi.fn(), playOutgoing: vi.fn() }),
+}))
+vi.mock('@/composables/useAppToast', () => ({
+  showAppToast: vi.fn(),
+}))
+vi.mock('@/composables/useXcmaxSync', () => ({
+  useXcmaxSync: () => ({
+    onImMessage: vi.fn(() => () => {}),
+    onImReadState: vi.fn(() => () => {}),
+  }),
+}))
+
+class MockWebSocket {
+  static instances: MockWebSocket[] = []
+  onopen: (() => void) | null = null
+  onclose: (() => void) | null = null
+  onmessage: ((ev: { data: string }) => void) | null = null
+  constructor(_url: string) {
+    MockWebSocket.instances.push(this)
+    queueMicrotask(() => this.onopen?.())
+  }
+  close() {
+    this.onclose?.()
+  }
+  send() {}
+}
+
+describe('ImMessengerView.vue', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.stubGlobal('WebSocket', MockWebSocket as unknown as typeof WebSocket)
+    MockWebSocket.instances = []
+    ;(window as unknown as { xcagiDesktop?: unknown }).xcagiDesktop = undefined
+  })
+
+  afterEach(() => {
+    ;(window as unknown as { xcagiDesktop?: unknown }).xcagiDesktop = undefined
+    vi.unstubAllGlobals()
+    vi.unstubAllEnvs()
+  })
+
+  it('uses the authenticated production CS bridge inside the installed desktop client', async () => {
+    const { fetchEnterpriseCsThread, fetchImMessages, sendEnterpriseCsMessage } = await import('@/api/im')
+    ;(window as unknown as { xcagiDesktop?: unknown }).xcagiDesktop = {}
+    const wrapper = mount(ImMessengerView, {
+      global: { stubs: { RouterLink: true } },
+    })
+    await flushPromises()
+
+    const enterpriseCs = wrapper.findAll('.im-conv-item--pinned').find((item) => item.text().includes('企业专属客服'))
+    expect(enterpriseCs).toBeTruthy()
+    await enterpriseCs!.trigger('click')
+    await flushPromises()
+    expect(fetchEnterpriseCsThread).toHaveBeenCalled()
+    expect(wrapper.get('.im-chat-head').findComponent(SharedIssueAcceptancePanel).exists()).toBe(true)
+    expect(fetchImMessages).not.toHaveBeenCalled()
+
+    await wrapper.find('.im-compose-input').setValue('测试消息')
+    vi.mocked(sendEnterpriseCsMessage).mockRejectedValueOnce(Object.assign(new Error('请重新登录企业账号'), { reconciliationRequired: false }))
+    await wrapper.find('.im-compose').trigger('submit')
+    await flushPromises()
+    expect(wrapper.get('[role="alert"]').text()).toContain('重新登录企业账号')
+    expect((wrapper.get('.im-compose-input').element as HTMLInputElement).value).toBe('测试消息')
+    await wrapper.find('.im-compose').trigger('submit')
+    await flushPromises()
+    expect(sendEnterpriseCsMessage).toHaveBeenCalledWith('测试消息')
+    wrapper.unmount()
+  })
+
+  it('shows reconciliation controls while a CS send receipt is pending', async () => {
+    const { sendEnterpriseCsMessage } = await import('@/api/im')
+    ;(window as unknown as { xcagiDesktop?: unknown }).xcagiDesktop = {}
+    let reject!: (error: Error) => void
+    vi.mocked(sendEnterpriseCsMessage).mockImplementationOnce(() => new Promise((_resolve, fail) => { reject = fail }))
+    const wrapper = mount(ImMessengerView, { global: { stubs: { RouterLink: true } } })
+    await flushPromises()
+    await wrapper.findAll('.im-conv-item--pinned').find(item => item.text().includes('企业专属客服'))!.trigger('click')
+    await flushPromises()
+    await wrapper.find('.im-compose-input').setValue('synthetic pending report')
+    await wrapper.find('.im-compose').trigger('submit')
+    await flushPromises()
+    expect(wrapper.get('[role="alert"]').text()).toContain('发送结果待核对')
+    expect(wrapper.get('[role="alert"] button').text()).toContain('解除重复发送保护')
+    reject(Object.assign(new Error('unknown receipt'), { reconciliationRequired: true }))
+    await flushPromises()
+    expect(wrapper.get('[role="alert"]').text()).toContain('unknown receipt')
+    wrapper.unmount()
+  })
+
+  it('shows enterprise dedicated cs as pinned fixed contact', async () => {
+    const wrapper = mount(ImMessengerView, {
+      global: { stubs: { RouterLink: true } },
+    })
+    await flushPromises()
+    expect(wrapper.find('.im-messenger').exists()).toBe(true)
+    expect(wrapper.findComponent(SharedIssueAcceptancePanel).exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('固定联系人')
+    expect(wrapper.text()).toContain('企业专属客服')
+    expect(wrapper.text()).not.toContain('还没有会话')
+    expect(wrapper.findAll('.im-conv-list')).toHaveLength(1)
+    expect(wrapper.find('.im-conv-item--pinned').exists()).toBe(true)
+    expect(wrapper.find('.im-channel-entry').exists()).toBe(true)
+    expect(wrapper.text()).toContain('客户消息 · 客来来')
+    await wrapper.findAll('.im-conv-item--pinned').find(item => item.text().includes('企业专属客服'))!.trigger('click')
+    await flushPromises()
+    expect(wrapper.get('.im-chat-head').findComponent(SharedIssueAcceptancePanel).exists()).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('opens Kellai customer conversations inside the client IM', async () => {
+    const wrapper = mount(ImMessengerView, {
+      global: { stubs: { RouterLink: true } },
+    })
+    await flushPromises()
+
+    await wrapper.find('.im-channel-entry').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('.kellai-inbox-stub').exists()).toBe(true)
+    expect(wrapper.text()).toContain('客来来客户会话（只读）')
+  })
+
+  it('shows pinned contact when conversations list is empty', async () => {
+    const { fetchImConversations } = await import('@/api/im')
+    vi.mocked(fetchImConversations).mockResolvedValueOnce([])
+    const wrapper = mount(ImMessengerView, {
+      global: { stubs: { RouterLink: true } },
+    })
+    await flushPromises()
+    expect(wrapper.text()).toContain('企业专属客服')
+    expect(wrapper.text()).not.toContain('还没有会话')
+  })
+
+  it('shows Codex super employee in admin information console without xiao c or enterprise cs', async () => {
+    const { authApi } = await import('@/api/auth')
+    const { createDirectConversation } = await import('@/api/im')
+    const { fetchCodexSuperEmployeeMessages, sendCodexSuperEmployeeMessage } = await import('@/api/codexSuperEmployee')
+    vi.stubEnv('VITE_XCMAX_ADMIN_CONSOLE', '1')
+    vi.mocked(authApi.getCurrentUser).mockResolvedValueOnce({
+      data: {
+        user: { id: 1 },
+        account_kind: 'admin',
+        market_is_admin: true,
+      },
+    } as Awaited<ReturnType<typeof authApi.getCurrentUser>>)
+
+    const wrapper = mount(ImMessengerView, {
+      global: { stubs: { RouterLink: true } },
+    })
+    await flushPromises()
+
+    expect(wrapper.text()).not.toContain('企业专属客服')
+    expect(wrapper.text()).toContain('客户消息 · 客来来')
+    expect(wrapper.find('.im-channel-entry').exists()).toBe(true)
+    expect(wrapper.text()).not.toContain('小C助理')
+    expect(wrapper.text()).not.toContain('固定员工')
+    expect(wrapper.text()).toContain('超级员工-Codex')
+    expect(wrapper.text()).toContain('全设备协同调度')
+    expect(wrapper.text()).toContain('Codex')
+    expect(wrapper.findAll('.im-conv-list')).toHaveLength(1)
+    expect(wrapper.find('.im-conv-item--pinned').exists()).toBe(true)
+    expect(wrapper.find('.im-pin').exists()).toBe(false)
+    expect(fetchCodexSuperEmployeeMessages).toHaveBeenCalledWith({ scope: 'admin' })
+
+    await wrapper
+      .findAll('.im-conv-item--pinned')
+      .find((el) => el.text().includes('超级员工-Codex'))!
+      .trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('跨设备协作开发员工')
+    expect(wrapper.text()).toContain('全设备 Codex')
+    expect(createDirectConversation).not.toHaveBeenCalled()
+
+    const input = wrapper.find('.im-compose--codex input')
+    await input.setValue('修复登录问题')
+    await wrapper.find('.im-compose--codex button').trigger('click')
+    await flushPromises()
+
+    expect(sendCodexSuperEmployeeMessage).toHaveBeenCalledWith(
+      '修复登录问题',
+      {
+        source: 'admin_im',
+        client_surface: 'admin_console',
+        target_devices: ['all'],
+      },
+      { scope: 'admin' },
+    )
+    expect(wrapper.text()).toContain('Codex 已收到')
+    expect(wrapper.text()).not.toContain('调度器')
+    expect(wrapper.text()).not.toContain('调用队列')
+    expect(wrapper.find('.im-system-call-row.is-streaming').exists()).toBe(true)
+
+    await input.setValue('继续验证回车调用')
+    await input.trigger('keydown', { key: 'Enter' })
+    await flushPromises()
+    expect(sendCodexSuperEmployeeMessage).toHaveBeenCalledWith(
+      '继续验证回车调用',
+      {
+        source: 'admin_im',
+        client_surface: 'admin_console',
+        target_devices: ['all'],
+      },
+      { scope: 'admin' },
+    )
+  })
+
+  it('shows Codex super employee for mobile admin information and uses mobile API scope', async () => {
+    const { authApi } = await import('@/api/auth')
+    const { fetchCodexSuperEmployeeMessages, sendCodexSuperEmployeeMessage } = await import('@/api/codexSuperEmployee')
+    vi.mocked(authApi.getCurrentUser).mockResolvedValueOnce({
+      data: {
+        user: { id: 1 },
+        account_kind: 'admin',
+        market_is_admin: true,
+      },
+    } as Awaited<ReturnType<typeof authApi.getCurrentUser>>)
+
+    const wrapper = mount(ImMessengerView, {
+      global: { stubs: { RouterLink: true } },
+    })
+    await flushPromises()
+
+    expect(wrapper.text()).not.toContain('固定员工')
+    expect(wrapper.text()).toContain('超级员工-Codex')
+    expect(wrapper.findAll('.im-conv-list')).toHaveLength(1)
+    expect(wrapper.find('.im-pin').exists()).toBe(false)
+    expect(fetchCodexSuperEmployeeMessages).toHaveBeenCalledWith({ scope: 'mobile' })
+
+    const input = wrapper.find('.im-compose--codex input')
+    await input.setValue('手机上调用 Codex')
+    await wrapper.find('.im-compose--codex button').trigger('click')
+    await flushPromises()
+
+    expect(sendCodexSuperEmployeeMessage).toHaveBeenCalledWith(
+      '手机上调用 Codex',
+      {
+        source: 'mobile_im',
+        client_surface: 'mobile',
+        target_devices: ['all'],
+      },
+      { scope: 'mobile' },
+    )
+  })
+
+  it('shows super development CLI switch card and My Groups entry in admin console', async () => {
+    const { authApi } = await import('@/api/auth')
+    const { fetchCursorSuperEmployeeMessages } = await import('@/api/cursorSuperEmployee')
+    vi.stubEnv('VITE_XCMAX_ADMIN_CONSOLE', '1')
+    vi.mocked(authApi.getCurrentUser).mockResolvedValueOnce({
+      data: {
+        user: { id: 1 },
+        account_kind: 'admin',
+        market_is_admin: true,
+      },
+    } as Awaited<ReturnType<typeof authApi.getCurrentUser>>)
+
+    const wrapper = mount(ImMessengerView, {
+      global: { stubs: { RouterLink: { template: '<a><slot /></a>' } } },
+    })
+    await flushPromises()
+
+    // 激活超级员工（Codex）后，SystemEmployeeChat 渲染 CLI 切换卡片
+    const codexItem = wrapper.findAll('.im-conv-item--pinned').find((li) => li.text().includes('Codex'))
+    expect(codexItem).toBeTruthy()
+    await codexItem!.trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('超级开发组 · CLI')
+    expect(wrapper.find('.im-cli-model-switch__btn.active').text()).toContain('Codex')
+
+    const cursorBtn = wrapper.findAll('.im-cli-model-switch__btn').find((btn) => btn.text().includes('Cursor'))
+    expect(cursorBtn).toBeTruthy()
+    await cursorBtn!.trigger('click')
+    await flushPromises()
+
+    expect(fetchCursorSuperEmployeeMessages).toHaveBeenCalledWith({ scope: 'admin' })
+    expect(wrapper.find('.im-cli-model-switch__btn.active').text()).toContain('Cursor')
+  })
+})

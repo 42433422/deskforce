@@ -1,0 +1,466 @@
+"""MODstore HTTP API 集成测试（TestClient）。"""
+
+from __future__ import annotations
+
+import io
+import json
+import shutil
+import uuid
+import zipfile
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+
+@pytest.mark.parametrize("scheduler_state", [True, False, None])
+def test_health(client, monkeypatch, scheduler_state):
+    # Schema smoke must not contact a live scheduler; its probe has dedicated tests.
+    monkeypatch.setattr("modstore_server.api.health._scheduler_status", lambda: scheduler_state)
+    r = client.get("/api/health")
+    assert r.status_code == 200
+    j = r.json()
+    assert j.get("ok") is True
+    assert j["scheduler_running"] is scheduler_state
+    assert "deploy_tier" in j and j["deploy_tier"]
+    assert "git_sha" in j
+    assert "hostname" in j
+    assert "tavily_configured" in j and isinstance(j["tavily_configured"], bool)
+
+
+def test_openapi_schema(client):
+    r = client.get("/openapi.json")
+    assert r.status_code == 200
+    spec = r.json()
+    assert spec["info"]["title"] == "XC AGI"
+    paths = spec.get("paths", {})
+    # Retiring the unused registry must preserve its public HTTP contracts.
+    expected = {
+        "/api/health": {"get"},
+        "/api/mods": {"get"},
+        "/api/mods/shell-ui": {"get"},
+        "/api/mods/{mod_id}": {"get", "delete"},
+        "/api/authoring/extension-surface": {"get"},
+        "/api/mods/{mod_id}/blueprint-routes": {"get"},
+        "/api/mods/{mod_id}/authoring-summary": {"get"},
+        "/api/mods/{mod_id}/workflow-employees/scaffold": {"post"},
+        "/api/mods/{mod_id}/export-employee-pack": {"get"},
+        "/api/mods/{mod_id}/register-workflow-employee-catalog": {"post"},
+        "/api/mods/{mod_id}/patch-workflow-employee-nodes": {"post"},
+        "/api/mods/{mod_id}/manifest": {"put"},
+        "/api/mods/{mod_id}/file": {"get", "put"},
+        "/api/mods/create": {"post"},
+        "/api/mods/ai-scaffold": {"post"},
+        "/api/mods/{mod_id}/frontend/regenerate": {"post"},
+        "/api/mods/import": {"post"},
+        "/api/mods/{mod_id}/export": {"get"},
+        "/api/sync/push": {"post"},
+        "/api/sync/pull": {"post"},
+        "/api/debug/sandbox": {"post"},
+        "/api/debug/focus-primary": {"post"},
+        "/api/fhd/db-tokens/status": {"get"},
+        "/api/xcagi/loading-status": {"get"},
+        "/api/xcagi/installed-mods": {"get"},
+    }
+    for path, methods in expected.items():
+        assert methods <= paths.get(path, {}).keys(), (path, methods)
+
+
+def test_register_email_is_optional_but_verified_when_present(client):
+    username = f"no_email_{uuid.uuid4().hex[:12]}"
+    password = "no-email-pass-12"
+
+    registered = client.post(
+        "/api/auth/register",
+        json={"username": username, "password": password},
+    )
+    assert registered.status_code == 200, registered.text
+    registration = registered.json()
+    assert registration["user"]["email"] is None
+    assert registration["account_state"] == "pending_plan"
+    assert registration["next_action"] == "select_plan"
+    assert registration["desktop_access"] is False
+
+    login = client.post(
+        "/api/auth/login",
+        json={"username": username, "password": password},
+    )
+    assert login.status_code == 200, login.text
+
+    missing_code = client.post(
+        "/api/auth/register",
+        json={
+            "username": f"needs_code_{uuid.uuid4().hex[:12]}",
+            "password": password,
+            "email": f"needs-code-{uuid.uuid4().hex[:8]}@pytest.local",
+        },
+    )
+    assert missing_code.status_code == 400, missing_code.text
+    assert "验证码" in missing_code.json()["detail"]
+
+    code_without_email = client.post(
+        "/api/auth/register",
+        json={
+            "username": f"code_only_{uuid.uuid4().hex[:12]}",
+            "password": password,
+            "verification_code": "999999",
+        },
+    )
+    assert code_without_email.status_code == 400, code_without_email.text
+    assert "邮箱" in code_without_email.json()["detail"]
+
+
+def test_create_list_get_mod(client, library: Path, auth_headers: dict):
+    r = client.post(
+        "/api/mods/create",
+        json={"mod_id": "api-test-mod", "display_name": "API Test"},
+        headers=auth_headers,
+    )
+    assert r.status_code == 200, r.text
+    assert (library / "api-test-mod" / "manifest.json").is_file()
+
+    r = client.get("/api/mods", headers=auth_headers)
+    assert r.status_code == 200
+    ids = [row["id"] for row in r.json()["data"]]
+    assert "api-test-mod" in ids
+
+    r = client.get("/api/mods/api-test-mod", headers=auth_headers)
+    assert r.status_code == 200
+    assert r.json()["id"] == "api-test-mod"
+
+
+def _set_test_admin(headers: dict, administrator: bool) -> None:
+    from modstore_server.application.auth import AuthApplicationService
+    from modstore_server.models import User, get_session_factory
+
+    actor = AuthApplicationService().current_user_from_authorization(headers["Authorization"])
+    with get_session_factory()() as db:
+        db.get(User, actor.id).is_admin = administrator
+        db.commit()
+
+
+@pytest.mark.parametrize("administrator", [False, True])
+def test_mod_file_get_put(client, library: Path, auth_headers: dict, administrator):
+    _set_test_admin(auth_headers, administrator)
+    client.post(
+        "/api/mods/create",
+        json={"mod_id": "file-mod", "display_name": "F"},
+        headers=auth_headers,
+    )
+    r = client.put(
+        "/api/mods/file-mod/file",
+        json={"path": "notes.md", "content": "# hi\n"},
+        headers=auth_headers,
+    )
+    if not administrator:
+        assert r.status_code == 403, r.text
+        assert not (library / "file-mod" / "notes.md").exists()
+        return
+    assert r.status_code == 200, r.text
+    assert (library / "file-mod" / "notes.md").read_text(encoding="utf-8") == "# hi\n"
+
+    r = client.get("/api/mods/file-mod/file", params={"path": "notes.md"}, headers=auth_headers)
+    assert r.status_code == 200
+    assert r.json()["content"] == "# hi\n"
+
+
+def test_debug_sandbox_copy(client, library: Path, project_home: Path, auth_headers: dict):
+    client.post(
+        "/api/mods/create",
+        json={"mod_id": "sand-mod", "display_name": "S"},
+        headers=auth_headers,
+    )
+    r = client.post(
+        "/api/debug/sandbox",
+        json={"mod_id": "sand-mod", "mode": "copy"},
+        headers=auth_headers,
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    root = Path(data["mods_root"])
+    assert root.is_dir()
+    assert root.parent.parent.parent == project_home
+    assert (root / "sand-mod" / "manifest.json").is_file()
+
+
+def test_debug_sandbox_rejects_library_symlink_escape(
+    client, library: Path, project_home: Path, auth_headers: dict
+):
+    client.post(
+        "/api/mods/create",
+        json={"mod_id": "sand-link", "display_name": "S"},
+        headers=auth_headers,
+    )
+    outside = project_home.parent / f"{project_home.name}-outside-mod"
+    outside.mkdir()
+    (outside / "manifest.json").write_text('{"id":"sand-link"}', encoding="utf-8")
+    shutil.rmtree(library / "sand-link")
+    (library / "sand-link").symlink_to(outside, target_is_directory=True)
+
+    response = client.post(
+        "/api/debug/sandbox",
+        json={"mod_id": "sand-link", "mode": "copy"},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 400
+
+
+def test_focus_primary(client, library: Path, auth_headers: dict):
+    client.post(
+        "/api/mods/create",
+        json={"mod_id": "p-a", "display_name": "A"},
+        headers=auth_headers,
+    )
+    client.post(
+        "/api/mods/create",
+        json={"mod_id": "p-b", "display_name": "B"},
+        headers=auth_headers,
+    )
+    r = client.post("/api/debug/focus-primary", json={"mod_id": "p-b"}, headers=auth_headers)
+    assert r.status_code == 200, r.text
+    ma = json.loads((library / "p-a" / "manifest.json").read_text(encoding="utf-8"))
+    mb = json.loads((library / "p-b" / "manifest.json").read_text(encoding="utf-8"))
+    assert ma.get("primary") is False
+    assert mb.get("primary") is True
+
+
+@pytest.mark.parametrize("administrator", [False, True])
+def test_import_zip(client, library: Path, auth_headers: dict, administrator):
+    # Shared executable-library publication is an administrator operation.
+    from modstore_server.application.auth import AuthApplicationService
+    from modstore_server.models import User, get_session_factory
+
+    actor = AuthApplicationService().current_user_from_authorization(auth_headers["Authorization"])
+    with get_session_factory()() as db:
+        db.get(User, actor.id).is_admin = administrator
+        db.commit()
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        manifest = {
+            "id": "zip-mod",
+            "name": "Z",
+            "version": "1.0.0",
+            "backend": {"entry": "blueprints", "init": "mod_init"},
+            "frontend": {"routes": "frontend/routes.js"},
+        }
+        zf.writestr(
+            "zip-mod/manifest.json",
+            json.dumps(manifest, ensure_ascii=False),
+        )
+        zf.writestr("zip-mod/readme.md", "x")
+    buf.seek(0)
+    r = client.post(
+        "/api/mods/import",
+        files={"file": ("z.zip", buf.getvalue(), "application/zip")},
+        headers=auth_headers,
+    )
+    if not administrator:
+        assert r.status_code == 403, r.text
+        assert not (library / "zip-mod").exists()
+        return
+    assert r.status_code == 200, r.text
+    assert (library / "zip-mod" / "manifest.json").is_file()
+
+
+@pytest.mark.parametrize("administrator", [False, True])
+def test_sync_push_pull(tmp_path, monkeypatch, administrator):
+    """使用真实目录结构验证 deploy / pull。"""
+    import uuid
+
+    library = tmp_path / "lib"
+    library.mkdir()
+    xcagi = tmp_path / "xcagi"
+    (xcagi / "mods").mkdir(parents=True)
+
+    from fastapi.testclient import TestClient
+
+    from modman.repo_config import RepoConfig
+    from modstore_server.app import app
+
+    cfg = RepoConfig(library_root=str(library), xcagi_root=str(xcagi))
+
+    monkeypatch.setattr("modstore_server.app.load_config", lambda: cfg)
+    monkeypatch.setattr("modstore_server.app.save_config", lambda c: None)
+    monkeypatch.setattr("modstore_server.app.project_root", lambda: tmp_path / "ph")
+
+    monkeypatch.setattr(
+        "modstore_server.api.market_routes.assert_email_outbound_configured",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "modstore_server.api.market_routes.generate_verification_code", lambda: "999999"
+    )
+    monkeypatch.setattr(
+        "modstore_server.api.market_routes.send_verification_email",
+        lambda *args, **kwargs: None,
+    )
+
+    c = TestClient(app)
+    u = f"sync_user_{uuid.uuid4().hex[:10]}"
+    em = f"sync_{uuid.uuid4().hex[:8]}@pytest.local"
+    r = c.post("/api/auth/send-register-code", json={"email": em})
+    assert r.status_code == 202, r.text
+    r = c.post(
+        "/api/auth/register",
+        json={
+            "username": u,
+            "password": "sync-pass-12",
+            "email": em,
+            "verification_code": "999999",
+        },
+    )
+    assert r.status_code == 200, r.text
+    reg = r.json()
+    tok = reg.get("access_token") or reg.get("token")
+    assert tok, reg
+    h = {"Authorization": f"Bearer {tok}"}
+    _set_test_admin(h, administrator)
+
+    r = c.post("/api/mods/create", json={"mod_id": "sync-m", "display_name": "S"}, headers=h)
+    assert r.status_code == 200
+
+    r = c.post("/api/sync/push", json={"mod_ids": ["sync-m"]}, headers=h)
+    if not administrator:
+        assert r.status_code == 403, r.text
+        assert not (xcagi / "mods" / "sync-m").exists()
+        denied_pull = c.post("/api/sync/pull", json={"mod_ids": ["sync-m"]}, headers=h)
+        assert denied_pull.status_code == 403, denied_pull.text
+        assert (library / "sync-m" / "manifest.json").is_file()
+        return
+    assert r.status_code == 200
+    assert (xcagi / "mods" / "sync-m" / "manifest.json").is_file()
+
+    shutil.rmtree(library / "sync-m", ignore_errors=True)
+    r = c.post("/api/sync/pull", json={"mod_ids": ["sync-m"]}, headers=h)
+    assert r.status_code == 200
+    assert (library / "sync-m" / "manifest.json").is_file()
+
+
+@patch("modstore_server.api.debug.httpx.Client")
+def test_xcagi_loading_status_mocked(mock_client_cls, client):
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {"success": True, "data": {"mods_loaded": 0}}
+    inst = MagicMock()
+    inst.__enter__.return_value.get.return_value = mock_resp
+    mock_client_cls.return_value = inst
+
+    r = client.get("/api/xcagi/loading-status")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["data"]["success"] is True
+
+
+@pytest.mark.parametrize("administrator", [False, True])
+def test_delete_mod(client, auth_headers: dict, administrator):
+    _set_test_admin(auth_headers, administrator)
+    client.post(
+        "/api/mods/create",
+        json={"mod_id": "del-me", "display_name": "D"},
+        headers=auth_headers,
+    )
+    r = client.delete("/api/mods/del-me", headers=auth_headers)
+    if not administrator:
+        assert r.status_code == 403, r.text
+        assert client.get("/api/mods/del-me", headers=auth_headers).status_code == 200
+        return
+    assert r.status_code == 200
+    r = client.get("/api/mods/del-me", headers=auth_headers)
+    # 管理员仍有目录管理权限，但被删除的目录应当不存在。
+    assert r.status_code == 404
+
+
+def test_admin_reset_user_password_requires_token(client, monkeypatch):
+    monkeypatch.setenv("MODSTORE_ADMIN_RECHARGE_TOKEN", "")
+    r = client.post(
+        "/api/admin/reset-user-password",
+        json={"username": "nobody", "new_password": "new-pass-99"},
+        headers={"X-Modstore-Recharge-Token": "x"},
+    )
+    assert r.status_code == 503
+
+
+def test_admin_reset_user_password_wrong_token(client, monkeypatch):
+    monkeypatch.setenv("MODSTORE_ADMIN_RECHARGE_TOKEN", "secret-admin")
+    r = client.post(
+        "/api/admin/reset-user-password",
+        json={"username": "nobody", "new_password": "new-pass-99"},
+        headers={"X-Modstore-Recharge-Token": "wrong"},
+    )
+    assert r.status_code == 403
+
+
+def test_admin_reset_user_password_then_login(client, monkeypatch):
+    import uuid
+
+    monkeypatch.setattr(
+        "modstore_server.api.market_routes.assert_email_outbound_configured",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "modstore_server.api.market_routes.generate_verification_code", lambda: "999999"
+    )
+    monkeypatch.setattr(
+        "modstore_server.api.market_routes.send_verification_email",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setenv("MODSTORE_ADMIN_RECHARGE_TOKEN", "secret-admin")
+
+    username = f"rst_{uuid.uuid4().hex[:12]}"
+    email = f"rst{uuid.uuid4().hex[:8]}@pytest.local"
+    assert client.post("/api/auth/send-register-code", json={"email": email}).status_code == 202
+    reg = client.post(
+        "/api/auth/register",
+        json={
+            "username": username,
+            "password": "old-pass-12",
+            "email": email,
+            "verification_code": "999999",
+        },
+    )
+    assert reg.status_code == 200, reg.text
+
+    r = client.post(
+        "/api/admin/reset-user-password",
+        json={"username": username, "new_password": "fresh-pass-34"},
+        headers={"X-Modstore-Recharge-Token": "secret-admin"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json().get("ok") is True
+
+    login = client.post("/api/auth/login", json={"username": username, "password": "fresh-pass-34"})
+    assert login.status_code == 200, login.text
+    login_old = client.post(
+        "/api/auth/login", json={"username": username, "password": "old-pass-12"}
+    )
+    assert login_old.status_code == 401
+
+
+@pytest.mark.parametrize(
+    "path,payload",
+    [
+        ("/api/mods/shared/snapshots/synthetic/restore", None),
+        ("/api/mods/shared/manifest/bump-patch-version", None),
+        ("/api/mods/shared/frontend/regenerate", {}),
+        (
+            "/api/mods/shared/workflow-employees/scaffold",
+            {"id": "synthetic", "label": "Synthetic"},
+        ),
+        ("/api/mods/shared/snapshots", {}),
+        ("/api/mods/shared/attach-catalog-employee", {"pkg_id": "synthetic"}),
+        (
+            "/api/mods/ai-scaffold",
+            {"brief": "synthetic", "_manifest_override": {"id": "shared"}},
+        ),
+    ],
+)
+def test_real_member_jwt_cannot_enter_shared_authoring(
+    client, auth_headers, library, path, payload
+):
+    _set_test_admin(auth_headers, False)
+    before = sorted(str(p.relative_to(library)) for p in library.rglob("*"))
+    response = client.post(path + "?is_admin=true", json=payload, headers=auth_headers)
+    assert response.status_code == 403, response.text
+    assert sorted(str(p.relative_to(library)) for p in library.rglob("*")) == before

@@ -1,0 +1,679 @@
+#!/usr/bin/env python3
+"""
+发货单文档生成器
+使用尹玉华1.xlsx模板生成发货单
+
+DEPRECATED:
+- 该模块仅作为文档生成底层实现（由 XCAGI 基础设施适配层调用）。
+- 编号模式解析/编排已迁移至 XCAGI 内部服务，不应再从路由直接动态加载本模块。
+"""
+
+import logging
+import os
+import re
+import sqlite3
+import tempfile
+import xml.etree.ElementTree as ET
+import zipfile
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Dict, List
+
+import openpyxl
+from openpyxl.cell.cell import MergedCell
+from openpyxl.styles import Alignment, Border, Font, Side
+
+from app.utils.operational_errors import BOUNDARY_ERRORS
+
+# 配置日志编码
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    encoding="utf-8",
+)
+logger = logging.getLogger(__name__)
+
+
+def _load_workbook_with_repair(template_path: str):
+    """
+    尝试修复受损 xlsx 后再加载。
+    - 清洗所有 xl/*.xml 中的非法控制字符
+    - 修复裸 '&' 导致的 XML 非法实体
+    - 若仍失败，降级为空工作簿，避免流程直接中断
+    """
+
+    def _sanitize_xml_bytes(raw: bytes) -> bytes:
+        text = raw.decode("utf-8", errors="ignore")
+        # 去掉 XML 1.0 非法控制字符（保留 \t \n \r）
+        text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", text)
+        # 修复未转义的 '&'
+        text = re.sub(r"&(?!amp;|lt;|gt;|apos;|quot;|#\d+;|#x[0-9A-Fa-f]+;)", "&amp;", text)
+        return text.encode("utf-8")
+
+    def _is_numeric_token(value: str) -> bool:
+        return bool(re.fullmatch(r"[+-]?\d+(?:\.\d+)?", (value or "").strip()))
+
+    def _repair_worksheet_filters(xml_bytes: bytes, filename: str) -> tuple[bytes, int]:
+        """移除 openpyxl 无法解析的 customFilter 条件。"""
+        try:
+            root = ET.fromstring(xml_bytes)
+        except BOUNDARY_ERRORS:
+            return xml_bytes, 0
+
+        ns_uri = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+        ns = {"m": ns_uri}
+        removed = 0
+
+        # 查找所有 customFilters/customFilter
+        for custom_filters in root.findall(".//m:autoFilter/m:filterColumn/m:customFilters", ns):
+            to_remove = []
+            for cf in list(custom_filters):
+                if not cf.tag.endswith("customFilter"):
+                    continue
+                val = (cf.attrib.get("val") or "").strip()
+                if not val:
+                    continue
+                operator = (cf.attrib.get("operator") or "equal").strip().lower()
+                # openpyxl 对 equal 的字符串要求包含通配符；否则抛 ValueError
+                if (
+                    operator == "equal"
+                    and not _is_numeric_token(val)
+                    and "*" not in val
+                    and "?" not in val
+                ):
+                    to_remove.append(cf)
+            for cf in to_remove:
+                custom_filters.remove(cf)
+                removed += 1
+
+            # 如果 customFilters 被清空，则连同父节点 filterColumn 一并移除，避免空筛选结构
+            if len(list(custom_filters)) == 0:
+                for filter_column in root.findall(".//m:autoFilter/m:filterColumn", ns):
+                    if custom_filters in list(filter_column):
+                        filter_column.remove(custom_filters)
+                        break
+
+        if removed == 0:
+            return xml_bytes, 0
+
+        repaired = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        logger.warning(f"模板筛选修复: {filename} 移除非法 customFilter {removed} 条")
+        return repaired, removed
+
+    try:
+        # 先直接尝试一次，避免不必要的修复开销
+        return openpyxl.load_workbook(template_path, data_only=True, keep_vba=False)
+    except BOUNDARY_ERRORS as e:
+        logger.warning(f"直接加载模板失败，进入修复流程: {e}")
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        total_removed_filters = 0
+        with (
+            zipfile.ZipFile(template_path, "r") as zin,
+            zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED),
+        ):
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+                if item.filename.startswith("xl/") and item.filename.endswith(".xml"):
+                    if item.filename.startswith("xl/worksheets/"):
+                        data, removed = _repair_worksheet_filters(data, item.filename)
+                        total_removed_filters += removed
+
+        if total_removed_filters > 0:
+            logger.warning(f"模板筛选修复完成: 共移除非法 customFilter {total_removed_filters} 条")
+
+        try:
+            return openpyxl.load_workbook(tmp_path, data_only=True, keep_vba=False)
+        except BOUNDARY_ERRORS as e:
+            logger.error(f"修复后仍无法加载模板，降级为默认工作簿: {e}")
+            return openpyxl.Workbook()
+    except BOUNDARY_ERRORS as e:
+        logger.error(f"模板修复流程失败，降级为默认工作簿: {e}")
+        return openpyxl.Workbook()
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except BOUNDARY_ERRORS:
+                pass
+
+
+@dataclass
+class PurchaseUnitInfo:
+    """购买单位信息"""
+
+    name: str = ""
+    contact_person: str = ""
+    contact_phone: str = ""
+    address: str = ""
+    id: int = None
+
+
+@dataclass
+class ShipmentDocument:
+    """发货单文档"""
+
+    filename: str = ""
+    filepath: str = ""
+    order_number: str = ""
+    purchase_unit: PurchaseUnitInfo = None
+    products: List[Dict] = None
+    total_amount: float = 0.0
+    total_quantity: float = 0.0
+
+    def to_dict(self) -> dict:
+        return {
+            "filename": self.filename,
+            "filepath": self.filepath,
+            "order_number": self.order_number,
+            "purchase_unit": self.purchase_unit.__dict__ if self.purchase_unit else None,
+            "products": self.products,
+            "total_amount": self.total_amount,
+            "total_quantity": self.total_quantity,
+        }
+
+
+class ShipmentDocumentGenerator:
+    """发货单文档生成器"""
+
+    # 使用绝对路径，确保无论从哪个目录启动都能正确找到文件
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+    OUTPUT_FOLDER = os.path.join(SCRIPT_DIR, "outputs")
+    DEFAULT_TEMPLATE = "尹玉华1.xlsx"
+
+    def __init__(self, db_path: str = None, output_dir: str = None):
+        """初始化"""
+        # 获取脚本所在目录
+        self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        if output_dir is not None:
+            self.OUTPUT_FOLDER = os.path.abspath(output_dir)
+        logger.info(f"发货单生成器运行目录: {self.base_dir}")
+
+        # 使用当前目录中的数据库文件
+        if db_path:
+            self.db_path = db_path
+        else:
+            # 使用当前目录的products.db
+            self.db_path = os.path.join(self.base_dir, "products.db")
+
+        logger.info(f"数据库路径: {self.db_path}")
+        os.makedirs(self.OUTPUT_FOLDER, exist_ok=True)
+
+    def _find_template(self, template_name):
+        """查找模板文件"""
+        # 尝试多个可能的模板目录（使用绝对路径）
+        possible_dirs = [
+            # 相对于AI助手目录的templates目录
+            os.path.join(self.base_dir, "templates"),
+            # 当前目录
+            self.base_dir,
+            # 相对于根目录的路径
+            os.path.join(self.base_dir, "..", "AI助手", "templates"),
+        ]
+
+        for directory in possible_dirs:
+            template_path = os.path.join(directory, template_name)
+            if os.path.exists(template_path):
+                logger.info(f"找到模板文件: {template_path}")
+                return template_path
+
+        # 如果都找不到，尝试在多个位置查找
+        root_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(self.base_dir))))
+        all_dirs = [
+            os.path.join(root_dir, "AI助手", "templates"),
+            os.path.join(root_dir, "AI助手"),
+            os.path.join(root_dir, "uploads"),
+            self.base_dir,
+        ]
+
+        for directory in all_dirs:
+            template_path = os.path.join(directory, template_name)
+            if os.path.exists(template_path):
+                logger.info(f"在根目录查找找到模板文件: {template_path}")
+                return template_path
+
+        logger.warning(f"模板文件未找到: {template_name}")
+        return None
+
+    def generate_document(
+        self,
+        order_text: str,
+        parsed_data: Dict,
+        purchase_unit: PurchaseUnitInfo = None,
+        template_name: str = None,
+        custom_order_number: str = None,
+    ) -> ShipmentDocument:
+        """
+        生成发货单文档
+        """
+        try:
+            # 1. 如果没有指定购买单位信息，从数据库获取
+            if purchase_unit is None and parsed_data.get("purchase_unit"):
+                purchase_unit = self._get_purchase_unit_info(parsed_data["purchase_unit"])
+
+            from app.domain.shipment.shipment_quantities import validate_shipment_products
+
+            validate_shipment_products(parsed_data.get("products") or [parsed_data])
+            # 2. 生成订单编号
+            order_number = (custom_order_number or "").strip() or self._generate_order_number()
+
+            # 3. 准备产品数据
+            products = self._prepare_products(parsed_data, order_number)
+
+            # 4. 计算总计
+            total_amount = sum(p.get("amount", 0) for p in products)
+            total_quantity_kg = sum(p.get("quantity_kg", 0) for p in products)
+            total_quantity_tins = sum(p.get("quantity_tins", 0) for p in products)
+
+            # 5. 使用模板文件
+            template_file = template_name or self.DEFAULT_TEMPLATE
+            template_path = self._find_template(template_file)
+
+            if template_path:
+                logger.info(f"找到模板文件: {template_path}")
+                try:
+                    workbook = openpyxl.load_workbook(template_path)
+                except BOUNDARY_ERRORS as e:
+                    logger.warning(f"正常加载模板失败，尝试容错模式: {e}")
+                    try:
+                        workbook = openpyxl.load_workbook(
+                            template_path, data_only=True, keep_vba=False
+                        )
+                    except BOUNDARY_ERRORS as e2:
+                        logger.warning(f"容错模式也失败，尝试修复XML后加载: {e2}")
+                        workbook = _load_workbook_with_repair(template_path)
+                worksheet = workbook.active
+
+                self._clear_template_data(worksheet)
+
+                self._fill_from_template(
+                    worksheet,
+                    order_number=order_number,
+                    purchase_unit=purchase_unit,
+                    products=products,
+                    total_quantity_kg=total_quantity_kg,
+                    total_quantity_tins=total_quantity_tins,
+                    total_amount=total_amount,
+                    order_text=order_text,
+                    order_date=parsed_data.get("date"),
+                )
+            else:
+                logger.warning(f"模板文件不存在: {template_file}，创建新文档")
+                workbook = openpyxl.Workbook()
+                worksheet = workbook.active
+                worksheet.title = "发货单"
+                self._create_default_document(
+                    worksheet,
+                    order_number,
+                    purchase_unit,
+                    products,
+                    total_quantity_kg,
+                    total_quantity_tins,
+                    total_amount,
+                    order_text,
+                    order_date=parsed_data.get("date"),
+                )
+
+            for sheet in list(workbook.worksheets):
+                if sheet is not worksheet:
+                    workbook.remove(sheet)
+            # 6. 保存文档
+            output_filename = self._generate_output_filename(order_number)
+            output_path = os.path.join(self.OUTPUT_FOLDER, output_filename)
+            workbook.save(output_path)
+            workbook.close()
+
+            # 7. 创建文档对象
+            doc = ShipmentDocument(
+                filename=output_filename,
+                filepath=output_path,
+                order_number=order_number,
+                purchase_unit=purchase_unit,
+                products=products,
+                total_amount=total_amount,
+                total_quantity=total_quantity_kg,
+            )
+
+            logger.info(f"发货单生成成功: {output_filename}")
+            return doc
+
+        except BOUNDARY_ERRORS as e:
+            logger.error(f"生成发货单失败: {e}")
+            raise
+
+    def _clear_template_data(self, worksheet):
+        """清空模板中的示例数据"""
+        for row in range(4, 16):
+            for col in range(1, 11):
+                try:
+                    cell = worksheet.cell(row=row, column=col)
+                    cell.value = None
+                except BOUNDARY_ERRORS:
+                    pass
+
+    @staticmethod
+    def _write_cell(worksheet, row: int, column: int, value) -> bool:
+        """写入可写单元格；合并区域内非左上角单元格只读，跳过而不中断生成。
+
+        客户自带的送货单模板通常把「产品型号」列与「人民币大写」区域设为合并单元格，
+        openpyxl 对合并区内的 MergedCell 赋值会抛 AttributeError，进而让整单生成 500。
+        """
+        cell = worksheet.cell(row=row, column=column)
+        if isinstance(cell, MergedCell):
+            logger.warning("模板合并单元格只读，跳过写入 %s（值为 %s）", cell.coordinate, value)
+            return False
+        cell.value = value
+        return True
+
+    @staticmethod
+    def _find_column_by_label(worksheet, labels: tuple) -> int | None:
+        """按表头词条定位列号（用于合并版式下按列名写合计）。"""
+        for row in range(1, min(worksheet.max_row, 10) + 1):
+            for column in range(1, worksheet.max_column + 1):
+                raw = worksheet.cell(row=row, column=column).value
+                text = str(raw or "").replace(" ", "")
+                if text and any(label in text for label in labels):
+                    return column
+        return None
+
+    def _write_total_by_header(self, worksheet, labels: tuple, row: int, value) -> bool:
+        """合并版式下按表头列写合计；模板自带 SUM 公式时不覆盖。"""
+        column = self._find_column_by_label(worksheet, labels)
+        if not column:
+            return False
+        cell = worksheet.cell(row=row, column=column)
+        if isinstance(cell, MergedCell):
+            return False
+        existing = cell.value
+        if isinstance(existing, str) and existing.startswith("="):
+            return False
+        cell.value = value
+        return True
+
+    def _fill_from_template(
+        self,
+        worksheet,
+        order_number: str,
+        purchase_unit: PurchaseUnitInfo,
+        products: List[Dict],
+        total_quantity_kg: float,
+        total_quantity_tins: int,
+        total_amount: float,
+        order_text: str,
+        order_date: str = None,
+    ):
+        """使用模板填充数据 - 匹配尹玉华1.xlsx原模板格式"""
+        now = datetime.fromisoformat(order_date) if order_date else datetime.now()
+        today = f"{now.year}年{now.month}月{now.day}日"
+
+        # 第2行：购货单位、联系人、日期、订单编号（合并单元格A2:J2）
+        header_cell = worksheet.cell(row=2, column=1)
+        contact = (
+            purchase_unit.contact_person if purchase_unit and purchase_unit.contact_person else ""
+        )
+        unit_name = purchase_unit.name if purchase_unit and purchase_unit.name else "未指定单位"
+        header_info = f"购货单位：{unit_name}       联系人：{contact}              {today}      订单编号：{order_number}"
+        self._write_cell(worksheet, header_cell.row, header_cell.column, header_info)
+        logger.info(f"填写购买单位信息: {unit_name}, 联系人: {contact}")
+
+        # 填充产品数据（从第4行开始）
+        start_row = 4
+        for i, product in enumerate(products):
+            row = start_row + i
+
+            # 产品型号 (A列, A-C合并)
+            self._write_cell(worksheet, row, 1, product.get("model_number", ""))
+
+            # 产品名称 (D列)
+            self._write_cell(worksheet, row, 4, product.get("name", ""))
+
+            # 数量/件 (E列) - 桶数
+            self._write_cell(worksheet, row, 5, product.get("quantity_tins", 0))
+
+            # 规格/KG (F列) - 每桶的KG数
+            self._write_cell(worksheet, row, 6, product.get("tin_spec", 0))
+
+            # 数量/KG：没有重量时写 0，避免按件出单后仍留下上一次的公斤数
+            kg_value = float(product.get("quantity_kg", 0) or 0)
+            self._write_cell(worksheet, row, 7, kg_value)
+
+            # 单价/元 (H列)
+            unit_price = float(product.get("unit_price", 0))
+            if unit_price > 0:
+                self._write_cell(worksheet, row, 8, unit_price)
+
+            # 金额/元 (I列) - 直接填入数值
+            amount = float(product.get("amount", 0))
+            if amount > 0:
+                self._write_cell(worksheet, row, 9, amount)
+            elif kg_value > 0 and unit_price > 0:
+                self._write_cell(worksheet, row, 9, round(kg_value * unit_price, 2))
+
+        # 第15行：合计行的数量/件 (E15公式保持SUM(E4:E14))
+        if total_quantity_tins > 0 and not self._write_cell(worksheet, 15, 5, total_quantity_tins):
+            self._write_total_by_header(worksheet, ("数量/件", "数量"), 15, total_quantity_tins)
+
+        # 第15行：数量/KG 合计与「合计」标签——模板行被清空后按表头列补回，
+        # 保证客户拿到的单据既能看到总公斤数，也保留模板原有的合计行标识。
+        self._write_total_by_header(worksheet, ("数量/KG", "数量/kg"), 15, total_quantity_kg)
+        if not worksheet.cell(row=15, column=1).value:
+            self._write_cell(worksheet, 15, 1, "合计")
+
+        # 第16行：金额区域
+        # 大写人民币在A16，金额在I16（保持公式SUM(I4:I14)）
+        if total_amount > 0 and not self._write_cell(worksheet, 16, 4, total_amount):
+            self._write_total_by_header(worksheet, ("金额",), 16, total_amount)
+
+    def _create_default_document(
+        self,
+        worksheet,
+        order_number: str,
+        purchase_unit: PurchaseUnitInfo,
+        products: List[Dict],
+        total_quantity_kg: float,
+        total_quantity_tins: int,
+        total_amount: float,
+        order_text: str,
+        order_date: str = None,
+    ):
+        """创建默认文档格式"""
+        now = datetime.fromisoformat(order_date) if order_date else datetime.now()
+        today = f"{now.year}年{now.month}月{now.day}日"
+
+        # 设置列宽
+        worksheet.column_dimensions["A"].width = 15
+        worksheet.column_dimensions["B"].width = 15
+        worksheet.column_dimensions["C"].width = 15
+        worksheet.column_dimensions["D"].width = 25
+        worksheet.column_dimensions["E"].width = 12
+        worksheet.column_dimensions["F"].width = 12
+        worksheet.column_dimensions["G"].width = 12
+
+        # 标题
+        worksheet["A1"] = "成都国圣工业有限公司 送货单"
+        worksheet["A1"].font = Font(size=16, bold=True)
+        worksheet["A1"].alignment = Alignment(horizontal="center")
+        worksheet.merge_cells("A1:G1")
+
+        # 第2行
+        unit_name = purchase_unit.name if purchase_unit and purchase_unit.name else "未指定单位"
+        contact = (
+            purchase_unit.contact_person if purchase_unit and purchase_unit.contact_person else ""
+        )
+        header_info = f"购货单位：{unit_name}       联系人：{contact}              {today}      订单编号：{order_number}"
+        worksheet["A2"] = header_info
+        worksheet.merge_cells("A2:J2")
+
+        # 表头
+        headers = ["产品型号", "", "", "产品名称", "数量/件", "规格/KG", "数量/KG"]
+        for col, header in enumerate(headers, 1):
+            cell = worksheet.cell(row=4, column=col, value=header)
+            cell.font = Font(bold=True)
+            cell.alignment = Alignment(horizontal="center")
+
+        # 合并产品型号列
+        for i in range(10):
+            worksheet.merge_cells(f"A{4 + i}:C{4 + i}")
+
+        # 填充产品
+        for i, product in enumerate(products):
+            row = 5 + i
+            worksheet.cell(row=row, column=1, value=product.get("model_number", ""))
+            worksheet.merge_cells(f"A{row}:C{row}")
+            worksheet.cell(row=row, column=4, value=product.get("name", ""))
+            worksheet.cell(row=row, column=5, value=product.get("quantity_tins", 0))
+            worksheet.cell(row=row, column=6, value=product.get("tin_spec", 0))
+            worksheet.cell(row=row, column=7, value=product.get("quantity_kg", 0))
+
+        # 合计
+        total_row = 5 + len(products)
+        worksheet.cell(row=total_row, column=1, value="合计")
+        worksheet.merge_cells(f"A{total_row}:C{total_row}")
+        worksheet.cell(row=total_row, column=5, value=total_quantity_tins)
+        worksheet.cell(row=total_row, column=7, value=total_quantity_kg)
+
+        # 金额
+        worksheet.cell(row=total_row + 1, column=1, value="大写人民币：")
+        worksheet.cell(row=total_row + 1, column=4, value=total_amount)
+
+        # 备注
+        worksheet.cell(row=total_row + 3, column=1, value=f"备注：{order_text}")
+
+        # 添加边框
+        self._add_borders(worksheet, total_row + 5)
+
+    def _add_borders(self, worksheet, max_row: int):
+        """添加边框"""
+        thin_border = Border(
+            left=Side(style="thin"),
+            right=Side(style="thin"),
+            top=Side(style="thin"),
+            bottom=Side(style="thin"),
+        )
+
+        for row in range(1, max_row + 1):
+            for col in range(1, 8):
+                try:
+                    cell = worksheet.cell(row=row, column=col)
+                    cell.border = thin_border
+                except BOUNDARY_ERRORS:
+                    pass
+
+    def _get_purchase_unit_info(self, unit_name: str) -> PurchaseUnitInfo:
+        """获取购买单位信息"""
+        unit = PurchaseUnitInfo(name=unit_name)
+
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            # 直接查询purchase_units表（正确的表结构）
+            cursor.execute(
+                """
+                SELECT id, unit_name, contact_person, contact_phone, address
+                FROM purchase_units
+                WHERE unit_name = ?
+                LIMIT 1
+            """,
+                (unit_name,),
+            )
+
+            row = cursor.fetchone()
+
+            # 如果精确匹配失败，尝试模糊匹配
+            if not row:
+                cursor.execute(
+                    """
+                    SELECT id, unit_name, contact_person, contact_phone, address
+                    FROM purchase_units
+                    WHERE unit_name LIKE ?
+                    LIMIT 1
+                """,
+                    (f"%{unit_name}%",),
+                )
+                row = cursor.fetchone()
+
+            if row:
+                unit.id = row[0]
+                unit.name = row[1]
+                unit.contact_person = row[2] or ""
+                unit.contact_phone = row[3] or ""
+                unit.address = row[4] or ""
+                logger.info(f"成功获取购买单位信息: {unit.name}, 联系人: {unit.contact_person}")
+            else:
+                logger.warning(f"未找到购买单位信息: {unit_name}")
+
+            conn.close()
+
+        except BOUNDARY_ERRORS as e:
+            logger.error(f"获取购买单位信息失败: {e}")
+
+        return unit
+
+    def _generate_order_number(self) -> str:
+        from app.infrastructure.database.shipment_order_numbers import reserve_order_number
+
+        return reserve_order_number(output_dir=self.OUTPUT_FOLDER)["order_number"]
+
+    def _prepare_products(self, parsed_data: Dict, order_number: str) -> List[Dict]:
+        """准备产品数据 - 支持多产品"""
+        from app.domain.shipment.shipment_quantities import resolve_shipment_quantity
+
+        products = []
+
+        # 从parsed_data中获取产品列表
+        product_list = parsed_data.get("products", [])
+
+        # 如果有products列表，遍历处理
+        if product_list:
+            for index, p in enumerate(product_list, 1):
+                tins, kg, spec = resolve_shipment_quantity(p, row_index=index)
+                product = {
+                    "order_number": order_number,
+                    "model_number": p.get("model_number", ""),
+                    "name": p.get("name", ""),
+                    "quantity_kg": kg,
+                    "quantity_tins": tins,
+                    "tin_spec": spec,
+                    "unit_price": p.get("unit_price", 0),
+                    "amount": p.get("amount", 0),
+                }
+                if product["name"]:
+                    products.append(product)
+        else:
+            # 兼容单产品旧逻辑
+            tins, kg, spec = resolve_shipment_quantity(parsed_data, row_index=1)
+            product = {
+                "order_number": order_number,
+                "model_number": parsed_data.get("model_number", ""),
+                "name": parsed_data.get("product_name", ""),
+                "quantity_kg": kg,
+                "quantity_tins": tins,
+                "tin_spec": spec,
+                "unit_price": parsed_data.get("unit_price", 0),
+                "amount": parsed_data.get("amount", 0),
+            }
+
+            if product["name"]:
+                products.append(product)
+
+        return products
+
+    def _generate_output_filename(self, order_number: str) -> str:
+        """生成输出文件名"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return f"发货单_{order_number}_{timestamp}.xlsx"
+
+    def get_template_list(self) -> List[str]:
+        """获取可用模板列表"""
+        templates = []
+
+        for filename in os.listdir("."):
+            if filename.endswith(".xlsx") and not filename.startswith("~"):
+                templates.append(filename)
+
+        return templates

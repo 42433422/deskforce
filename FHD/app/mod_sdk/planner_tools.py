@@ -1,0 +1,417 @@
+"""里程碑 B：Planner 工具经 ``xcagi-planner-bridge`` 门面执行与注册。
+
+安装 Planner Mod 且 ``planner_tools_execution`` 为真时，对话链与 ``/tools/execute`` 走本模块，
+再委托宿主 ``execute_workflow_tool``（实现仍在宿主，边界在 Mod API）。
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+from pathlib import Path
+from typing import Any, Callable
+
+from app.utils.operational_errors import RECOVERABLE_ERRORS
+
+PLANNER_FACADE_MOD_ID = "xcagi-planner-bridge"
+
+logger = logging.getLogger(__name__)
+
+ExecuteToolFn = Callable[..., str]
+
+
+def _truthy_env(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _resolve_planner_mod_dir() -> Path | None:
+    try:
+        from app.infrastructure.mods.mod_manager import get_mod_manager
+
+        meta = get_mod_manager().get_mod(PLANNER_FACADE_MOD_ID)
+        if meta and meta.mod_path:
+            p = Path(meta.mod_path)
+            if (p / "manifest.json").is_file():
+                return p
+    except RECOVERABLE_ERRORS:
+        logger.debug("planner mod path via manager failed", exc_info=True)
+
+    roots: list[Path] = []
+    for key in ("XCAGI_MODS_ROOT", "XCAGI_MODS_DIR"):
+        raw = (os.environ.get(key) or "").strip()
+        if raw:
+            roots.append(Path(raw))
+    try:
+        from app.shell.xcagi_mods_discover import mods_dir
+
+        d = mods_dir()
+        if d:
+            roots.append(Path(d))
+    except RECOVERABLE_ERRORS:
+        pass
+
+    repo_mods = Path(__file__).resolve().parents[2] / "mods"
+    roots.extend([repo_mods, Path.cwd() / "mods"])
+
+    seen: set[str] = set()
+    for root in roots:
+        key = str(root.resolve()) if root.exists() else str(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        trial = root / PLANNER_FACADE_MOD_ID
+        if (trial / "manifest.json").is_file():
+            return trial
+    return None
+
+
+def _read_planner_manifest() -> dict[str, Any]:
+    mod_dir = _resolve_planner_mod_dir()
+    if not mod_dir:
+        return {}
+    try:
+        data = json.loads((mod_dir / "manifest.json").read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except RECOVERABLE_ERRORS:
+        logger.debug("read planner manifest failed", exc_info=True)
+        return {}
+
+
+def is_planner_mod_on_disk() -> bool:
+    return _resolve_planner_mod_dir() is not None
+
+
+def is_planner_mod_installed() -> bool:
+    try:
+        from app.infrastructure.mods.mod_manager import get_mod_manager, is_mods_disabled
+
+        if is_mods_disabled():
+            return False
+    except RECOVERABLE_ERRORS:
+        pass
+    try:
+        from app.infrastructure.mods.mod_manager import get_mod_manager
+
+        for row in get_mod_manager().list_all_mods():
+            if str(row.get("id") or "").strip() == PLANNER_FACADE_MOD_ID:
+                return True
+    except RECOVERABLE_ERRORS:
+        logger.debug("list_all_mods for planner failed", exc_info=True)
+    return is_planner_mod_on_disk()
+
+
+def _manifest_tools_execution_enabled() -> bool:
+    cfg = _read_planner_manifest().get("config") or {}
+    if not isinstance(cfg, dict):
+        return False
+    if cfg.get("planner_tools_execution") is True:
+        return True
+    tools_cfg = cfg.get("planner_tools") or {}
+    if isinstance(tools_cfg, dict) and tools_cfg.get("execution_via_mod_facade") is True:
+        return True
+    return False
+
+
+def is_planner_tools_via_mod_enabled() -> bool:
+    """对话与工具执行是否经 Mod 门面（默认：已安装且 manifest 声明）。"""
+    if _truthy_env("XCAGI_DISABLE_PLANNER_MOD_TOOLS"):
+        return False
+    if _truthy_env("XCAGI_PLANNER_TOOLS_VIA_MOD"):
+        return True
+    if not is_planner_mod_installed():
+        return False
+    return _manifest_tools_execution_enabled()
+
+
+def load_planner_tools_config() -> dict[str, Any]:
+    mod_dir = _resolve_planner_mod_dir()
+    if not mod_dir:
+        return {}
+    cfg_path = mod_dir / "config" / "planner_tools.json"
+    if not cfg_path.is_file():
+        return {}
+    try:
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except RECOVERABLE_ERRORS:
+        logger.warning("planner_tools.json parse failed: %s", cfg_path)
+        return {}
+
+
+def load_mod_planner_tool_extensions() -> list[dict[str, Any]]:
+    """manifest.config.planner_tool_extensions 或 config/planner_tool_extensions.json。"""
+    manifest = _read_planner_manifest()
+    cfg = manifest.get("config") or {}
+    inline = cfg.get("planner_tool_extensions") if isinstance(cfg, dict) else None
+    if isinstance(inline, list):
+        return [x for x in inline if isinstance(x, dict)]
+
+    mod_dir = _resolve_planner_mod_dir()
+    if not mod_dir:
+        return []
+    ext_path = mod_dir / "config" / "planner_tool_extensions.json"
+    if not ext_path.is_file():
+        return []
+    try:
+        data = json.loads(ext_path.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict)]
+        if isinstance(data, dict) and isinstance(data.get("tools"), list):
+            return [x for x in data["tools"] if isinstance(x, dict)]
+    except RECOVERABLE_ERRORS:
+        logger.warning("planner_tool_extensions.json parse failed")
+    return []
+
+
+def get_planner_chat_tool_registry() -> list[dict[str, Any]]:
+    from app.application.tools.workflow import get_workflow_tool_registry
+
+    reg = list(get_workflow_tool_registry())
+    extensions = load_mod_planner_tool_extensions()
+    if extensions:
+        reg = reg + extensions
+    return reg
+
+
+def resolve_planner_tool_executor() -> ExecuteToolFn:
+    if is_planner_tools_via_mod_enabled():
+        return execute_planner_workflow_tool
+    from app.application.tools.workflow import execute_workflow_tool
+
+    return execute_workflow_tool
+
+
+def _with_owned_upload_path(
+    args: dict[str, Any] | str, runtime_context: dict[str, Any] | None
+) -> dict[str, Any] | str:
+    """后续轮次只说「导入」时，模型只能拿到文件名；按当前账号换成自己的上传路径。"""
+    if not isinstance(args, dict) or not isinstance(runtime_context, dict):
+        return args
+    file_path = str(args.get("file_path") or "").strip()
+    if not file_path:
+        return args
+    from app.application.tools.workflow_spreadsheet_scope import resolve_owned_upload_path
+
+    resolved = resolve_owned_upload_path(file_path, runtime_context)
+    return {**args, "file_path": resolved} if resolved != file_path else args
+
+
+def execute_planner_workflow_tool(
+    name: str,
+    args: dict[str, Any] | str,
+    workspace_root: str | None = None,
+    *,
+    db_write_token: str | None = None,
+    runtime_context: dict[str, Any] | None = None,
+) -> str:
+    """里程碑 F：优先 Mod 原生 handler，其余委托宿主 workflow。"""
+    from app.mod_sdk.planner_native_tools import try_execute_native_planner_tool
+
+    if name == "import_excel_to_database":
+        args = _with_owned_upload_path(args, runtime_context)
+
+    native_raw, native_mod = try_execute_native_planner_tool(
+        name,
+        args,
+        workspace_root,
+        db_write_token=db_write_token,
+    )
+    if native_raw is not None:
+        logger.debug("planner tool native mod=%s tool=%s", native_mod, name)
+        return native_raw
+
+    try:
+        from app.domain.app_pure.employee_pack_runner import try_execute_employee_planner_tool
+
+        emp_raw = try_execute_employee_planner_tool(
+            name,
+            args,
+            workspace_root,
+            db_write_token=db_write_token,
+            runtime_context=runtime_context,
+        )
+        if emp_raw is not None:
+            logger.debug("planner tool employee pack tool=%s", name)
+            return emp_raw
+    except RECOVERABLE_ERRORS:
+        logger.debug("employee planner tool dispatch skipped", exc_info=True)
+
+    from app.application.tools.workflow import execute_workflow_tool
+
+    raw = execute_workflow_tool(
+        name,
+        args,
+        workspace_root,
+        db_write_token=db_write_token,
+        runtime_context=runtime_context,
+    )
+    if is_planner_tools_via_mod_enabled():
+        logger.debug(
+            "planner tool via mod facade: mod=%s tool=%s delegate=host.workflow",
+            PLANNER_FACADE_MOD_ID,
+            name,
+        )
+    return raw
+
+
+def execute_planner_tool_from_body(body: dict[str, Any] | None) -> dict[str, Any]:
+    payload = body or {}
+    name = str(payload.get("tool_name") or payload.get("name") or "").strip()
+    if not name:
+        return {"success": False, "error": "tool_name required"}
+
+    args = payload.get("arguments") or payload.get("args") or {}
+    # A packaged desktop backend runs with its CWD inside the read-only app
+    # bundle.  Tool calls that do not explicitly provide a workspace must
+    # therefore default to the user's data directory, not ``os.getcwd()``;
+    # otherwise the bundled Office employees cannot write their verified
+    # artifacts on a fresh install.
+    workspace_root = str(
+        os.environ.get("WORKSPACE_ROOT") or os.environ.get("XCAGI_DATA_DIR") or os.getcwd()
+    ).strip()
+    db_write_token = payload.get("db_write_token")
+    if db_write_token is not None:
+        db_write_token = str(db_write_token)
+
+    try:
+        raw = resolve_planner_tool_executor()(
+            name,
+            args,
+            workspace_root,
+            db_write_token=db_write_token,
+        )
+    except RECOVERABLE_ERRORS:
+        logger.exception("planner tool execute failed: %s", name)
+        return {
+            "success": False,
+            "error": "工具执行失败，请稍后重试",
+            "error_code": "planner_tool_execution_failed",
+            "tool_name": name,
+        }
+
+    execution_path = "host.workflow"
+    handler_mod: str | None = None
+    tool_success = False
+    tool_error = "工具执行返回了无效结果"
+    try:
+        probe = json.loads(raw)
+        if isinstance(probe, dict):
+            tool_success = bool(probe.get("success"))
+            if not tool_success:
+                tool_error = "工具执行失败，请检查输入后重试"
+            src = str(probe.get("source") or "")
+            if src.startswith("mod:"):
+                execution_path = "mod_native"
+                handler_mod = src.split(":", 1)[1] if ":" in src else None
+    except json.JSONDecodeError:
+        pass
+    if execution_path == "host.workflow" and is_planner_tools_via_mod_enabled():
+        execution_path = "mod_facade"
+        handler_mod = PLANNER_FACADE_MOD_ID
+
+    return {
+        # A planner facade must report the actual employee/tool outcome.  Do
+        # not turn a structured failure (or malformed response) into a
+        # completed task merely because dispatch itself returned normally.
+        "success": tool_success,
+        "tool_name": name,
+        "result": raw
+        if tool_success
+        else '{"success": false, "error_code": "planner_tool_failed"}',
+        "execution_path": execution_path,
+        "mod_id": handler_mod,
+        "delegate": "host.workflow" if execution_path != "mod_native" else None,
+        **({"error": tool_error} if not tool_success else {}),
+    }
+
+
+def list_planner_tools_registry_detail() -> dict[str, Any]:
+    reg = get_planner_chat_tool_registry()
+    names: list[str] = []
+    for item in reg:
+        fn = item.get("function") if isinstance(item, dict) else None
+        if isinstance(fn, dict) and fn.get("name"):
+            names.append(str(fn["name"]))
+
+    extensions = load_mod_planner_tool_extensions()
+    ext_names = []
+    for item in extensions:
+        fn = item.get("function") if isinstance(item, dict) else None
+        if isinstance(fn, dict) and fn.get("name"):
+            ext_names.append(str(fn["name"]))
+
+    via_mod = is_planner_tools_via_mod_enabled()
+    tools_cfg = load_planner_tools_config()
+    from app.mod_sdk.planner_native_tools import list_native_planner_tools_summary
+
+    native_summary = list_native_planner_tools_summary()
+    try:
+        from app.application.tools.registered_capabilities import (
+            ERP_CAPABILITY_TOOL_NAME,
+            registered_capability_catalog,
+        )
+
+        product_capabilities = registered_capability_catalog()
+    except RECOVERABLE_ERRORS:
+        product_capabilities = {}
+        ERP_CAPABILITY_TOOL_NAME = "execute_erp_capability"
+    try:
+        from app.mod_sdk.employee_tool_registry import build_employee_tools_status
+
+        employee_status = build_employee_tools_status()
+    except RECOVERABLE_ERRORS:
+        employee_status = {}
+    return {
+        "success": True,
+        "tool_count": len(names),
+        "tool_names": names,
+        "mod_extension_count": len(ext_names),
+        "mod_extension_names": ext_names,
+        "employee_planner": employee_status,
+        "employee_pack_tools": employee_status.get("employee_pack_tools") or [],
+        "registered_capability_tool": ERP_CAPABILITY_TOOL_NAME,
+        "registered_capability_count": int(product_capabilities.get("capability_count") or 0),
+        "registered_capability_ids": product_capabilities.get("capability_ids") or [],
+        "execution_via_mod_facade": via_mod,
+        "native_planner_tools": native_summary,
+        "execution_path": (
+            "mod_facade+native"
+            if via_mod and native_summary.get("enabled")
+            else (
+                "mod_native"
+                if native_summary.get("enabled")
+                else ("mod_facade" if via_mod else "host.workflow")
+            )
+        ),
+        "mod_id": PLANNER_FACADE_MOD_ID if via_mod else None,
+        "tools_execute_endpoint": (
+            f"/api/mod/{PLANNER_FACADE_MOD_ID}/tools/execute" if via_mod else None
+        ),
+        "source": "mod_sdk.planner_tools" if via_mod else "host.workflow_tool_registry",
+        "delegate": "host.workflow",
+        "planner_tools_config": tools_cfg.get("execution") if tools_cfg else {},
+        "note": (
+            "里程碑 F3：Planner Excel/文档工具可由 xcagi-planner-excel-tools 原生执行（见 manifest native_planner_tools）。"
+            if native_summary.get("tool_names")
+            else (
+                "里程碑 B：注册表与执行入口经 Mod 门面；handler 仍委托宿主 workflow。"
+                if via_mod
+                else "未启用 Mod 工具门面；安装 xcagi-planner-bridge 且 planner_tools_execution=true。"
+            )
+        ),
+    }
+
+
+__all__ = [
+    "PLANNER_FACADE_MOD_ID",
+    "execute_planner_tool_from_body",
+    "execute_planner_workflow_tool",
+    "get_planner_chat_tool_registry",
+    "is_planner_mod_installed",
+    "is_planner_tools_via_mod_enabled",
+    "list_planner_tools_registry_detail",
+    "load_mod_planner_tool_extensions",
+    "load_planner_tools_config",
+    "resolve_planner_tool_executor",
+]

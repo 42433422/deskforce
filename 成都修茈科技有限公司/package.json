@@ -1,0 +1,66 @@
+{
+  "name": "modstore-market",
+  "private": true,
+  "version": "0.0.1",
+  "engines": {
+    "node": "^22.22.2 || ^24.15.0 || >=26.0.0"
+  },
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "build:no-typecheck": "vite build",
+    "preview": "vite preview",
+    "typecheck": "vue-tsc --noEmit -p tsconfig.strict-baseline.json",
+    "typecheck:loose": "vue-tsc --noEmit",
+    "typecheck:strict": "vue-tsc --noEmit -p tsconfig.strict.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:e2e": "playwright test",
+    "test:e2e:install": "playwright install --with-deps chromium",
+    "test:all": "npm run typecheck && npm run test:coverage && npm run test:e2e",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write \"**/*.{js,ts,vue,json,md,css}\" --ignore-path .prettierignore",
+    "format:check": "prettier --check \"**/*.{js,ts,vue,json,md,css}\" --ignore-path .prettierignore"
+  },
+  "dependencies": {
+    "pinia": "^4.1.0",
+    "vue": "^3.5.45",
+    "vue-router": "^4.3.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.4",
+    "@playwright/test": "^1.65.0",
+    "@types/node": "^26.6.6",
+    "@vitejs/plugin-vue": "^6.0.10",
+    "@vitest/coverage-v8": "^5.1.0",
+    "@vue/eslint-config-prettier": "^10.1.0",
+    "@vue/eslint-config-typescript": "^14.9.0",
+    "@vue/test-utils": "^2.5.1",
+    "eslint": "^10.14.0",
+    "eslint-plugin-vue": "^10.12.1",
+    "fast-glob": "file:../FHD/frontend/compat-resource-glob.tgz",
+    "globals": "^17.14.0",
+    "happy-dom": "^21.0.4",
+    "prettier": "^3.9.10",
+    "typescript": "^5.6.3",
+    "vite": "^8.3.7",
+    "vitest": "^5.0.3",
+    "vue-tsc": "^3.3.14"
+  },
+  "overrides": {
+    "brace-expansion@^1.0.0": "1.1.21",
+    "brace-expansion@^2.0.0": "2.1.7",
+    "brace-expansion@>=5.0.0": "5.0.12",
+    "esbuild": "0.28.1",
+    "glob": "10.5.0",
+    "js-yaml": "4.3.2",
+    "nanoid": "3.3.18",
+    "postcss": "8.5.25",
+    "ws": "8.21.0",
+    "source-map-js": "1.2.2",
+    "fast-glob": "$fast-glob"
+  }
+}

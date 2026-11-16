@@ -1,0 +1,107 @@
+import js from '@eslint/js'
+import vuePlugin from 'eslint-plugin-vue'
+import vueParser from 'vue-eslint-parser'
+import tsParser from '@typescript-eslint/parser'
+import tsPlugin from '@typescript-eslint/eslint-plugin'
+import globals from 'globals'
+
+export default [
+  {
+    ignores: ['dist/**', 'node_modules/**', 'coverage/**'],
+  },
+  {
+    files: ['**/*.{js,mjs,cjs}', '**/*.{ts,mts,cts}', '**/*.vue'],
+    ...js.configs.recommended,
+    languageOptions: {
+      globals: {
+        ...globals.browser,
+        ...globals.node,
+      },
+    },
+  },
+  {
+    files: ['**/*.vue', '**/*.{ts,mts,cts}'],
+    languageOptions: {
+      parser: vueParser,
+      parserOptions: {
+        parser: tsParser,
+        ecmaVersion: 'latest',
+        sourceType: 'module',
+      },
+      globals: {
+        ...globals.browser,
+        ...globals.node,
+        defineProps: 'readonly',
+        defineEmits: 'readonly',
+        defineExpose: 'readonly',
+        withDefaults: 'readonly',
+      },
+    },
+    plugins: {
+      vue: vuePlugin,
+      '@typescript-eslint': tsPlugin,
+    },
+    rules: {
+      ...vuePlugin.configs.essential.rules,
+      ...tsPlugin.configs.recommended.rules,
+
+      'vue/multi-word-component-names': 'off',
+      'vue/valid-v-for': 'error',
+      'vue/no-mutating-props': 'error',
+
+      '@typescript-eslint/no-explicit-any': 'error',
+      '@typescript-eslint/no-unused-vars': [
+        'warn',
+        {
+          argsIgnorePattern: '^_',
+          caughtErrorsIgnorePattern: '^_',
+          varsIgnorePattern: '^_',
+        },
+      ],
+      '@typescript-eslint/no-empty-object-type': 'off',
+      '@typescript-eslint/ban-ts-comment': [
+        'error',
+        {
+          'ts-expect-error': 'allow-with-description',
+          'ts-ignore': true,
+          'ts-nocheck': true,
+          'ts-check': false,
+        },
+      ],
+
+      'no-console': 'off',
+      'no-debugger': 'error',
+      'no-empty': 'warn',
+      'no-useless-catch': 'warn',
+      'no-undef': 'off',
+      'no-useless-escape': 'warn',
+    },
+  },
+  {
+    files: ['**/*.vue'],
+    rules: {
+      '@typescript-eslint/no-unused-vars': 'off',
+      'no-unused-vars': 'off',
+    },
+  },
+  {
+    files: ['**/*.test.js', '**/*.spec.js', '**/*.test.ts', '**/*.spec.ts'],
+    rules: {
+      '@typescript-eslint/no-explicit-any': 'off',
+      // 防注水：禁止空断言占位（2026-08-01 清理 35 处 expect(true) 后上锁）
+      'no-restricted-syntax': [
+        'error',
+        {
+          selector:
+            "CallExpression[callee.object.callee.name='expect'][callee.object.arguments.0.value=true][callee.property.name='toBe'][arguments.0.value=true]",
+          message: '禁止空断言 expect(true).toBe(true)：请断言真实行为/状态，或删除该占位测试。',
+        },
+        {
+          selector:
+            "CallExpression[callee.object.callee.name='expect'][callee.object.arguments.0.value=true][callee.property.name='toBeTruthy']",
+          message: '禁止空断言 expect(true).toBeTruthy()：请断言真实行为/状态，或删除该占位测试。',
+        },
+      ],
+    },
+  },
+]

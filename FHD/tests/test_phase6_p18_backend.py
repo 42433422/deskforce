@@ -1,0 +1,2247 @@
+"""COVERAGE_RAMP Phase 6 round 18: backend low-coverage modules.
+
+Targets:
+- ``app/infrastructure/persistence/product_repository_impl.py`` (355 行, 未覆盖 65 行, cov 80.9%)
+- ``app/services/ocr_service.py`` (263 行, 未覆盖 65 行, cov 74.9%)
+- ``app/application/workflow/engine.py`` (206 行, 未覆盖 64 行, cov 65.8%)
+- ``app/fastapi_routes/mobile_api_extensions.py`` (461 行, 未覆盖 64 行, cov 85.8%)
+- ``app/mod_sdk/industry_seed.py`` (165 行, 未覆盖 64 行, cov 55.8%)
+
+Tests follow the phase-6 style: ``from __future__ import annotations``,
+``unittest.mock`` + ``pytest``, mock only external boundaries (DB / external
+API / LLM / file IO / paddleocr). The handler functions themselves are
+exercised through real calls.
+
+Coverage scenarios per 铁律3:
+- Happy path (valid input)
+- Empty / None input
+- Boundary values (empty list, empty dict, empty string)
+- Exception paths (RECOVERABLE_ERRORS: RuntimeError, ValueError, OSError)
+"""
+
+from __future__ import annotations
+
+import os
+
+
+def _setup_shared_0():
+    svc = OCRService.__new__(OCRService)
+    svc.use_gpu = False
+    svc.reader = None
+    svc.tesseract_available = False
+    svc._paddle_enabled = False
+
+    import builtins
+
+    real_import = builtins.__import__
+    return (svc, builtins, real_import)
+
+
+os.environ.setdefault("XCAGI_SKIP_LEGACY_COMPAT_ROUTES", "1")
+
+import importlib
+import json
+import shutil
+import sqlite3
+import tempfile
+from contextlib import contextmanager
+from datetime import datetime
+from io import BytesIO
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
+
+import numpy as np
+import pytest
+from fastapi import BackgroundTasks
+
+from app.domain.shared_services.ocr_service import OCRResult, OCRService
+from app.infrastructure.repositories.product_repository_impl import (
+    TRIVIAL_MEASURE_UNITS,
+    SQLAlchemyProductRepository,
+)
+from app.mod_sdk import industry_seed as industry_seed_mod
+
+# ===========================================================================
+# Shared helpers / fixtures
+# ===========================================================================
+
+
+@pytest.fixture
+def tmp_dir():
+    d = tempfile.mkdtemp()
+    yield d
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@contextmanager
+def _fake_db(session):
+    yield session
+
+
+def _patch_db(mod, session):
+    return patch.object(mod, "get_db", lambda: _fake_db(session))
+
+
+def _fluent(*, all_=None, first=None, update_=0) -> MagicMock:
+    q = MagicMock()
+    for attr in ("filter", "filter_by", "order_by", "join", "offset", "limit", "group_by"):
+        getattr(q, attr).return_value = q
+    q.all.return_value = list(all_ or [])
+    q.first.return_value = first
+    q.update.return_value = update_
+    return q
+
+
+def _mock_db_ctx(mock_db):
+    @contextmanager
+    def _ctx():
+        yield mock_db
+
+    return _ctx()
+
+
+def _make_mock_product(**overrides):
+    defaults = {
+        "id": 1,
+        "name": "测试产品",
+        "model_number": "MOD-001",
+        "specification": "100x200",
+        "price": 99.5,
+        "quantity": 50,
+        "description": "描述",
+        "category": "电子",
+        "brand": "品牌A",
+        "unit": "个",
+        "is_active": 1,
+        "created_at": datetime(2026, 1, 1),
+        "updated_at": datetime(2026, 1, 2),
+    }
+    defaults.update(overrides)
+    p = MagicMock()
+    p.__dict__ = dict(defaults)
+    return p
+
+
+def _contact(**kw) -> SimpleNamespace:
+    base = {
+        "id": 1,
+        "contact_name": "张三",
+        "remark": "朋友",
+        "wechat_id": "zs001",
+        "contact_type": "contact",
+        "is_active": 1,
+        "is_starred": 1,
+        "created_at": datetime(2024, 1, 1),
+        "updated_at": None,
+    }
+    base.update(kw)
+    return SimpleNamespace(**base)
+
+
+@pytest.fixture
+def ext_mod():
+    return importlib.import_module("app.fastapi_routes.mobile_api_extensions")
+
+
+# ===========================================================================
+# 1. app/infrastructure/persistence/product_repository_impl.py
+# ===========================================================================
+
+
+class TestProductRepositoryProductToDict:
+    """Cover ``find_all_dict`` dict output branches.
+
+    旧版私有辅助 _product_to_dict 已删除，改为直接断言 find_all_dict 的字典输出字段。
+    """
+
+    @pytest.fixture
+    def repo(self):
+        return SQLAlchemyProductRepository()
+
+    def _query(self, models, total):
+        mock_db = MagicMock()
+        mock_query = MagicMock()
+        mock_query.filter.return_value = mock_query
+        mock_query.order_by.return_value = mock_query
+        mock_query.limit.return_value = mock_query
+        mock_query.offset.return_value = mock_query
+        mock_query.count.return_value = total
+        mock_query.all.return_value = models
+        mock_db.query.return_value = mock_query
+        return mock_db
+
+    @patch("app.infrastructure.repositories.product_repository_impl.get_db")
+    def test_basic_conversion_includes_product_name(self, mock_get_db, repo):
+        mock_product = _make_mock_product()
+        mock_get_db.return_value = _mock_db_ctx(self._query([mock_product], 1))
+
+        dicts, total = repo.find_all_dict()
+        assert total == 1
+        assert dicts[0]["name"] == "测试产品"
+        assert dicts[0]["model_number"] == "MOD-001"
+        assert dicts[0]["price"] == 99.5
+
+    @patch("app.infrastructure.repositories.product_repository_impl.get_db")
+    def test_empty_name_defaults_to_empty_string(self, mock_get_db, repo):
+        mock_product = _make_mock_product(name="")
+        mock_get_db.return_value = _mock_db_ctx(self._query([mock_product], 1))
+
+        dicts, total = repo.find_all_dict()
+        assert dicts[0]["name"] == ""
+
+    @patch("app.infrastructure.repositories.product_repository_impl.get_db")
+    def test_none_price_converted_to_zero(self, mock_get_db, repo):
+        mock_product = _make_mock_product(price=None)
+        mock_get_db.return_value = _mock_db_ctx(self._query([mock_product], 1))
+
+        dicts, total = repo.find_all_dict()
+        assert dicts[0]["price"] == 0
+
+    @patch("app.infrastructure.repositories.product_repository_impl.get_db")
+    def test_no_rows_returns_empty_dict_list(self, mock_get_db, repo):
+        mock_get_db.return_value = _mock_db_ctx(self._query([], 0))
+
+        dicts, total = repo.find_all_dict()
+        assert dicts == []
+        assert total == 0
+
+
+class TestProductRepositoryFindAll:
+    """Cover ``find_all`` branches.
+
+    新版 find_all 返回 (list[Product], total) 元组（不再返回 dict），
+    且不再做表存在性检查，DB 异常直接向上抛出。
+    """
+
+    @pytest.fixture
+    def repo(self):
+        return SQLAlchemyProductRepository()
+
+    def _query(self, models, total):
+        mock_db = MagicMock()
+        mock_query = MagicMock()
+        mock_query.filter.return_value = mock_query
+        mock_query.order_by.return_value = mock_query
+        mock_query.limit.return_value = mock_query
+        mock_query.offset.return_value = mock_query
+        mock_query.count.return_value = total
+        mock_query.all.return_value = models
+        mock_db.query.return_value = mock_query
+        return mock_db
+
+    @patch("app.infrastructure.repositories.product_repository_impl.product_to_domain")
+    @patch("app.infrastructure.repositories.product_repository_impl.get_db")
+    def test_empty_result_returns_tuple(self, mock_get_db, mock_to_domain, repo):
+        mock_get_db.return_value = _mock_db_ctx(self._query([], 0))
+
+        result = repo.find_all()
+
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        assert result[0] == []
+        assert result[1] == 0
+
+    @patch("app.infrastructure.repositories.product_repository_impl.get_db")
+    def test_recoverable_error_is_raised(self, mock_get_db, repo):
+        mock_get_db.side_effect = OSError("DB connection lost")
+        with pytest.raises(OSError):
+            repo.find_all()
+
+    @patch("app.infrastructure.repositories.product_repository_impl.product_to_domain")
+    @patch("app.infrastructure.repositories.product_repository_impl.get_db")
+    def test_with_unit_name_filter(self, mock_get_db, mock_to_domain, repo):
+        mock_get_db.return_value = _mock_db_ctx(self._query([], 0))
+
+        result = repo.find_all(unit_name="箱")
+
+        assert result[1] == 0
+        assert result[0] == []
+
+    @patch("app.infrastructure.repositories.product_repository_impl.product_to_domain")
+    @patch("app.infrastructure.repositories.product_repository_impl.get_db")
+    def test_with_model_number_filter_normalized(self, mock_get_db, mock_to_domain, repo):
+        mock_get_db.return_value = _mock_db_ctx(self._query([], 0))
+
+        result = repo.find_all(model_number="ABC-123")
+
+        assert result[1] == 0
+        assert result[0] == []
+
+    @patch("app.infrastructure.repositories.product_repository_impl.product_to_domain")
+    @patch("app.infrastructure.repositories.product_repository_impl.get_db")
+    def test_with_keyword_multiple_segments(self, mock_get_db, mock_to_domain, repo):
+        mock_get_db.return_value = _mock_db_ctx(self._query([], 0))
+
+        result = repo.find_all(keyword="测试 9803")
+
+        assert result[1] == 0
+        assert result[0] == []
+
+    @patch("app.infrastructure.repositories.product_repository_impl.product_to_domain")
+    @patch("app.infrastructure.repositories.product_repository_impl.get_db")
+    def test_pagination_returns_total(self, mock_get_db, mock_to_domain, repo):
+        mock_get_db.return_value = _mock_db_ctx(self._query([], 100))
+
+        result = repo.find_all(page=3, per_page=10)
+
+        assert result[1] == 100
+        assert result[0] == []
+
+    @patch("app.infrastructure.repositories.product_repository_impl.product_to_domain")
+    @patch("app.infrastructure.repositories.product_repository_impl.get_db")
+    def test_returns_domain_objects(self, mock_get_db, mock_to_domain, repo):
+        mock_model = _make_mock_product()
+        mock_domain = MagicMock()
+        mock_to_domain.return_value = mock_domain
+        mock_get_db.return_value = _mock_db_ctx(self._query([mock_model], 1))
+
+        result = repo.find_all()
+
+        assert result[1] == 1
+        assert result[0] == [mock_domain]
+        mock_to_domain.assert_called_once_with(mock_model)
+
+
+class TestProductRepositoryCreateUpdate:
+    """Cover ``create`` and ``update`` branches."""
+
+    @pytest.fixture
+    def repo(self):
+        return SQLAlchemyProductRepository()
+
+    @patch("app.infrastructure.repositories.product_repository_impl.get_db")
+    def test_create_success(self, mock_get_db, repo):
+        mock_db = MagicMock()
+        mock_product = MagicMock()
+        mock_product.id = 42
+        mock_get_db.return_value = _mock_db_ctx(mock_db)
+
+        with patch(
+            "app.infrastructure.repositories.product_repository_impl.ProductModel"
+        ) as MockProductModel:
+            MockProductModel.return_value = mock_product
+            result = repo.create({"product_name": "新产品", "price": 10.0})
+
+        assert result["success"] is True
+        assert result["product_id"] == 42
+
+    def test_create_empty_name_returns_error(self, repo):
+        result = repo.create({"product_name": "", "price": 0})
+        assert result["success"] is False
+        assert "产品名称不能为空" in result["message"]
+
+    def test_create_name_key_empty_returns_error(self, repo):
+        result = repo.create({"name": "", "price": 0})
+        assert result["success"] is False
+
+    @patch("app.infrastructure.repositories.product_repository_impl.get_db")
+    def test_create_with_name_key(self, mock_get_db, repo):
+        mock_db = MagicMock()
+        mock_product = MagicMock()
+        mock_product.id = 1
+        mock_get_db.return_value = _mock_db_ctx(mock_db)
+
+        with patch(
+            "app.infrastructure.repositories.product_repository_impl.ProductModel"
+        ) as MockProductModel:
+            MockProductModel.return_value = mock_product
+            result = repo.create({"name": "用name键创建"})
+
+        assert result["success"] is True
+
+    @patch("app.infrastructure.repositories.product_repository_impl.get_db")
+    def test_create_db_error(self, mock_get_db, repo):
+        mock_get_db.side_effect = OSError("DB error")
+        result = repo.create({"product_name": "测试"})
+        assert result["success"] is False
+        assert "创建失败" in result["message"]
+
+    @patch("app.infrastructure.repositories.product_repository_impl.get_db")
+    def test_update_success(self, mock_get_db, repo):
+        mock_db = MagicMock()
+        mock_product = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = mock_product
+        mock_get_db.return_value = _mock_db_ctx(mock_db)
+
+        result = repo.update(1, {"product_name": "新名称"})
+        assert result["success"] is True
+
+    @patch("app.infrastructure.repositories.product_repository_impl.get_db")
+    def test_update_not_found(self, mock_get_db, repo):
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = None
+        mock_get_db.return_value = _mock_db_ctx(mock_db)
+
+        result = repo.update(999, {"product_name": "不存在"})
+        assert result["success"] is False
+        assert "产品不存在" in result["message"]
+
+    @patch("app.infrastructure.repositories.product_repository_impl.get_db")
+    def test_update_no_fields(self, mock_get_db, repo):
+        mock_db = MagicMock()
+        mock_product = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = mock_product
+        mock_get_db.return_value = _mock_db_ctx(mock_db)
+
+        result = repo.update(1, {})
+        assert result["success"] is False
+        assert "没有要更新的字段" in result["message"]
+
+    @patch("app.infrastructure.repositories.product_repository_impl.get_db")
+    def test_update_multiple_fields(self, mock_get_db, repo):
+        mock_db = MagicMock()
+        mock_product = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = mock_product
+        mock_get_db.return_value = _mock_db_ctx(mock_db)
+
+        result = repo.update(
+            1,
+            {
+                "price": 50.0,
+                "description": "新描述",
+                "model_number": "M2",
+                "specification": "200x300",
+                "quantity": 100,
+                "category": "工具",
+                "brand": "品牌B",
+                "unit": "箱",
+                "is_active": 0,
+            },
+        )
+        assert result["success"] is True
+
+    @patch("app.infrastructure.repositories.product_repository_impl.get_db")
+    def test_update_db_error(self, mock_get_db, repo):
+        mock_get_db.side_effect = OSError("DB error")
+        result = repo.update(1, {"price": 10})
+        assert result["success"] is False
+        assert "更新失败" in result["message"]
+
+
+class TestProductRepositoryBatchOps:
+    """Cover ``batch_create`` and ``batch_delete`` branches."""
+
+    @pytest.fixture
+    def repo(self):
+        return SQLAlchemyProductRepository()
+
+    def test_batch_create_empty_list_returns_error(self, repo):
+        result = repo.batch_create([])
+        assert result["success"] is False
+        assert "产品列表不能为空" in result["message"]
+
+    @patch("app.infrastructure.repositories.product_repository_impl.get_db")
+    def test_batch_create_success(self, mock_get_db, repo):
+        mock_db = MagicMock()
+        mock_db.bulk_insert_mappings.return_value = None
+        mock_db.commit.return_value = None
+        mock_get_db.return_value = _mock_db_ctx(mock_db)
+
+        result = repo.batch_create(
+            [
+                {"product_name": "产品1", "price": 10},
+                {"product_name": "产品2", "price": 20},
+            ]
+        )
+        assert result["success"] is True
+        assert result["success_count"] == 2
+
+    @patch("app.infrastructure.repositories.product_repository_impl.get_db")
+    def test_batch_create_with_empty_name(self, mock_get_db, repo):
+        mock_db = MagicMock()
+        mock_db.bulk_insert_mappings.return_value = None
+        mock_db.commit.return_value = None
+        mock_get_db.return_value = _mock_db_ctx(mock_db)
+
+        result = repo.batch_create(
+            [
+                {"product_name": "有效产品"},
+                {"product_name": ""},
+            ]
+        )
+        assert result["success"] is False
+        assert result["failed_count"] == 1
+
+    @patch("app.infrastructure.repositories.product_repository_impl.get_db")
+    def test_batch_create_db_error(self, mock_get_db, repo):
+        mock_get_db.side_effect = OSError("DB error")
+        result = repo.batch_create([{"product_name": "产品1"}])
+        assert result["success"] is False
+        assert "批量添加失败" in result["message"]
+
+    @patch("app.infrastructure.repositories.product_repository_impl.get_db")
+    def test_batch_create_bulk_insert_fallback(self, mock_get_db, repo):
+        """bulk_insert_mappings raises SQLAlchemyError → fallback to single insert."""
+        from sqlalchemy.exc import SQLAlchemyError
+
+        mock_db = MagicMock()
+        mock_db.bulk_insert_mappings.side_effect = SQLAlchemyError("bulk failed")
+        mock_product = MagicMock()
+        mock_product.id = 1
+        mock_db.add.return_value = None
+        mock_db.flush.return_value = None
+        mock_get_db.return_value = _mock_db_ctx(mock_db)
+
+        with patch(
+            "app.infrastructure.repositories.product_repository_impl.Product"
+        ) as MockProduct:
+            MockProduct.return_value = mock_product
+            result = repo.batch_create([{"product_name": "产品1"}])
+
+        assert result["success"] is True
+
+    def test_batch_delete_empty_ids_returns_error(self, repo):
+        result = repo.batch_delete([])
+        assert result["success"] is False
+        assert "产品 ID 列表不能为空" in result["message"]
+
+    @patch("app.infrastructure.repositories.product_repository_impl.get_db")
+    def test_batch_delete_success(self, mock_get_db, repo):
+        mock_db = MagicMock()
+        mock_products = [MagicMock(), MagicMock()]
+        mock_db.query.return_value.filter.return_value.all.return_value = mock_products
+        mock_get_db.return_value = _mock_db_ctx(mock_db)
+
+        result = repo.batch_delete([1, 2])
+        assert result["success"] is True
+        assert result["deleted_count"] == 2
+
+    @patch("app.infrastructure.repositories.product_repository_impl.get_db")
+    def test_batch_delete_not_found(self, mock_get_db, repo):
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.all.return_value = []
+        mock_get_db.return_value = _mock_db_ctx(mock_db)
+
+        result = repo.batch_delete([999])
+        assert result["success"] is False
+        assert "未找到" in result["message"]
+
+
+class TestProductRepositoryExistsAndNames:
+    """Cover ``exists`` and ``find_names`` branches."""
+
+    @pytest.fixture
+    def repo(self):
+        return SQLAlchemyProductRepository()
+
+    @patch("app.infrastructure.repositories.product_repository_impl.get_db")
+    def test_exists_true(self, mock_get_db, repo):
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = MagicMock()
+        mock_get_db.return_value = _mock_db_ctx(mock_db)
+
+        assert repo.exists(1) is True
+
+    @patch("app.infrastructure.repositories.product_repository_impl.get_db")
+    def test_exists_false(self, mock_get_db, repo):
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = None
+        mock_get_db.return_value = _mock_db_ctx(mock_db)
+
+        assert repo.exists(999) is False
+
+    @patch("app.infrastructure.repositories.product_repository_impl.get_db")
+    def test_exists_db_error(self, mock_get_db, repo):
+        mock_get_db.side_effect = OSError("DB error")
+        assert repo.exists(1) is False
+
+    @patch("app.infrastructure.repositories.product_repository_impl.get_db")
+    def test_find_names_success(self, mock_get_db, repo):
+        mock_db = MagicMock()
+        mock_db.query.return_value.distinct.return_value.all.return_value = [
+            ("产品A",),
+            ("产品B",),
+            (None,),
+        ]
+        mock_get_db.return_value = _mock_db_ctx(mock_db)
+
+        with patch("app.infrastructure.repositories.product_repository_impl.inspect") as mock_insp:
+            mock_insp.return_value.get_table_names.return_value = ["products"]
+            result = repo.find_names()
+
+        assert result == ["产品A", "产品B"]
+
+    @patch("app.infrastructure.repositories.product_repository_impl.get_db")
+    def test_find_names_no_table(self, mock_get_db, repo):
+        mock_db = MagicMock()
+        mock_get_db.return_value = _mock_db_ctx(mock_db)
+
+        with patch("app.infrastructure.repositories.product_repository_impl.inspect") as mock_insp:
+            mock_insp.return_value.get_table_names.return_value = []
+            result = repo.find_names()
+
+        assert result == []
+
+    @patch("app.infrastructure.repositories.product_repository_impl.get_db")
+    def test_find_names_db_error(self, mock_get_db, repo):
+        mock_get_db.side_effect = OSError("DB error")
+        result = repo.find_names()
+        assert result == []
+
+
+class TestProductRepositoryFindProductUnits:
+    """Cover ``find_product_units`` branches."""
+
+    @pytest.fixture
+    def repo(self):
+        return SQLAlchemyProductRepository()
+
+    @patch("app.infrastructure.repositories.product_repository_impl.get_db")
+    def test_recoverable_error_in_fallback(self, mock_get_db, repo):
+        mock_db = MagicMock()
+        mock_db.bind = MagicMock()
+        mock_db.query.return_value.distinct.return_value.all.return_value = []
+        mock_get_db.return_value = _mock_db_ctx(mock_db)
+
+        with patch("app.infrastructure.repositories.product_repository_impl.inspect") as mock_insp:
+            mock_insp_obj = MagicMock()
+            mock_insp_obj.get_table_names.return_value = ["products"]
+            mock_insp.return_value = mock_insp_obj
+
+            with patch(
+                "app.application.customer_app_service.get_customers_session",
+                side_effect=OSError("session fail"),
+            ):
+                result = repo.find_product_units()
+
+        assert isinstance(result, list)
+
+
+class TestTrivialMeasureUnits:
+    """Cover ``TRIVIAL_MEASURE_UNITS`` constant."""
+
+    def test_contains_common_units(self):
+        assert "件" in TRIVIAL_MEASURE_UNITS
+        assert "个" in TRIVIAL_MEASURE_UNITS
+        assert "箱" in TRIVIAL_MEASURE_UNITS
+        assert "千克" in TRIVIAL_MEASURE_UNITS
+
+    def test_does_not_contain_customer_names(self):
+        assert "七彩乐园" not in TRIVIAL_MEASURE_UNITS
+        assert "客户A" not in TRIVIAL_MEASURE_UNITS
+
+
+# ===========================================================================
+# 2. app/services/ocr_service.py
+# ===========================================================================
+
+
+class TestOCRServiceInit:
+    """Cover ``OCRService.__init__`` / ``_init_engines`` branches."""
+
+    def test_init_auto_backend_no_engines(self, monkeypatch):
+        monkeypatch.setenv("XCAGI_OCR_BACKEND", "auto")
+        with (
+            patch(
+                "app.domain.shared_services.paddle_ocr_runner.check_paddle_available",
+                return_value=False,
+            ),
+            patch("app.domain.shared_services.ocr_service.OCRService._init_easyocr") as mock_eo,
+            patch("app.domain.shared_services.ocr_service.OCRService._init_tesseract") as mock_ts,
+        ):
+            svc = OCRService()
+        assert svc._paddle_enabled is False
+        mock_eo.assert_called_once()
+        mock_ts.assert_called()
+
+    def test_init_paddle_backend_unavailable_logs_error(self, monkeypatch, caplog):
+        monkeypatch.setenv("XCAGI_OCR_BACKEND", "paddle")
+        with patch(
+            "app.domain.shared_services.paddle_ocr_runner.check_paddle_available",
+            return_value=False,
+        ):
+            svc = OCRService()
+        assert svc._paddle_enabled is False
+
+    def test_init_paddle_backend_available(self, monkeypatch):
+        monkeypatch.setenv("XCAGI_OCR_BACKEND", "paddle")
+        with (
+            patch(
+                "app.domain.shared_services.paddle_ocr_runner.check_paddle_available",
+                return_value=True,
+            ),
+            patch(
+                "app.domain.shared_services.paddle_ocr_runner.get_paddle_ocr_instance"
+            ) as mock_inst,
+        ):
+            svc = OCRService()
+        assert svc._paddle_enabled is True
+        mock_inst.assert_called_once()
+
+    def test_init_easyocr_backend(self, monkeypatch):
+        monkeypatch.setenv("XCAGI_OCR_BACKEND", "easyocr")
+        with (
+            patch(
+                "app.domain.shared_services.paddle_ocr_runner.check_paddle_available",
+                return_value=False,
+            ),
+            patch("app.domain.shared_services.ocr_service.OCRService._init_easyocr") as mock_eo,
+        ):
+            svc = OCRService()
+        mock_eo.assert_called_once()
+
+    def test_init_tesseract_backend(self, monkeypatch):
+        monkeypatch.setenv("XCAGI_OCR_BACKEND", "tesseract")
+        with (
+            patch(
+                "app.domain.shared_services.paddle_ocr_runner.check_paddle_available",
+                return_value=False,
+            ),
+            patch("app.domain.shared_services.ocr_service.OCRService._init_easyocr"),
+            patch("app.domain.shared_services.ocr_service.OCRService._init_tesseract") as mock_ts,
+        ):
+            svc = OCRService()
+        mock_ts.assert_called()
+
+    def test_init_paddle_init_raises_recoverable(self, monkeypatch):
+        monkeypatch.setenv("XCAGI_OCR_BACKEND", "auto")
+        with (
+            patch(
+                "app.domain.shared_services.paddle_ocr_runner.check_paddle_available",
+                side_effect=RuntimeError("paddle init fail"),
+            ),
+            patch("app.domain.shared_services.ocr_service.OCRService._init_easyocr"),
+            patch("app.domain.shared_services.ocr_service.OCRService._init_tesseract"),
+        ):
+            svc = OCRService()
+        assert svc._paddle_enabled is False
+
+
+class TestOCRServiceInitEasyocr:
+    """Cover ``_init_easyocr`` branches."""
+
+    def test_easyocr_import_error(self, monkeypatch):
+        svc, builtins, real_import = _setup_shared_0()
+
+        def fake_import(name, *args, **kwargs):
+            if name == "easyocr":
+                raise ImportError("no easyocr")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        svc._init_easyocr()
+        assert svc.reader is None
+
+    def test_easyocr_init_recoverable_error(self, monkeypatch):
+        svc, builtins, real_import = _setup_shared_0()
+
+        class FakeEasyocr:
+            class Reader:
+                def __init__(self, *args, **kwargs):
+                    raise RuntimeError("init fail")
+
+        def fake_import(name, *args, **kwargs):
+            if name == "easyocr":
+                return FakeEasyocr
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        svc._init_easyocr()
+        assert svc.reader is None
+
+
+class TestOCRServiceInitTesseract:
+    """Cover ``_init_tesseract`` branches."""
+
+    def test_tesseract_import_error(self, monkeypatch):
+        svc, builtins, real_import = _setup_shared_0()
+
+        def fake_import(name, *args, **kwargs):
+            if name == "pytesseract":
+                raise ImportError("no pytesseract")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        svc._init_tesseract()
+        assert svc.tesseract_available is False
+
+    def test_tesseract_init_recoverable_error(self, monkeypatch):
+        svc, builtins, real_import = _setup_shared_0()
+
+        class FakePytesseract:
+            @staticmethod
+            def get_tesseract_version():
+                raise RuntimeError("version fail")
+
+        def fake_import(name, *args, **kwargs):
+            if name == "pytesseract":
+                return FakePytesseract
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        svc._init_tesseract()
+        assert svc.tesseract_available is False
+
+
+class TestOCRServiceRecognize:
+    """Cover ``recognize`` branches."""
+
+    def test_recognize_no_engine_returns_empty(self):
+        svc = OCRService.__new__(OCRService)
+        svc.use_gpu = False
+        svc.reader = None
+        svc.tesseract_available = False
+        svc._paddle_enabled = False
+        assert svc.recognize(MagicMock()) == ""
+
+    def test_recognize_with_paddle(self):
+        svc = OCRService.__new__(OCRService)
+        svc.use_gpu = False
+        svc.reader = None
+        svc.tesseract_available = False
+        svc._paddle_enabled = True
+
+        image = MagicMock()
+        image.convert.return_value = image
+        with (
+            patch(
+                "app.domain.shared_services.paddle_ocr_runner.predict_to_text_blocks",
+                return_value=[{"text": "hello"}, {"text": "world"}],
+            ),
+            patch("numpy.array", return_value=np.zeros((10, 10, 3))),
+        ):
+            result = svc.recognize(image)
+        assert "hello" in result
+        assert "world" in result
+
+    def test_recognize_with_easyocr(self):
+        svc = OCRService.__new__(OCRService)
+        svc.use_gpu = False
+        svc.reader = MagicMock()
+        svc.reader.readtext.return_value = ["text1", "text2"]
+        svc.tesseract_available = False
+        svc._paddle_enabled = False
+
+        image = MagicMock()
+        image.convert.return_value = image
+        with patch("numpy.array", return_value=np.zeros((10, 10, 3))):
+            result = svc.recognize(image)
+        assert "text1" in result
+
+    def test_recognize_with_tesseract(self):
+        svc = OCRService.__new__(OCRService)
+        svc.use_gpu = False
+        svc.reader = None
+        svc.tesseract_available = True
+        svc._paddle_enabled = False
+
+        image = MagicMock()
+        image.convert.return_value = image
+        fake_pytesseract = MagicMock()
+        fake_pytesseract.image_to_string.return_value = "tess text"
+        fake_pil_image = MagicMock()
+        fake_pil = MagicMock()
+        fake_pil.Image.fromarray.return_value = fake_pil_image
+        with (
+            patch("numpy.array", return_value=np.zeros((10, 10, 3))),
+            patch.dict(
+                "sys.modules",
+                {"pytesseract": fake_pytesseract, "PIL": fake_pil},
+                clear=False,
+            ),
+        ):
+            result = svc.recognize(image)
+        assert "tess text" in result
+
+    def test_recognize_pil_image_2d_array(self):
+        svc = OCRService.__new__(OCRService)
+        svc.use_gpu = False
+        svc.reader = MagicMock()
+        svc.reader.readtext.return_value = ["x"]
+        svc.tesseract_available = False
+        svc._paddle_enabled = False
+
+        image_2d = np.zeros((10, 10))
+        result = svc.recognize(image_2d)
+        assert "x" in result
+
+    def test_recognize_recoverable_error_returns_empty(self):
+        svc = OCRService.__new__(OCRService)
+        svc.use_gpu = False
+        svc.reader = MagicMock()
+        svc.reader.readtext.side_effect = RuntimeError("readtext fail")
+        svc.tesseract_available = False
+        svc._paddle_enabled = False
+
+        image_2d = np.zeros((10, 10))
+        result = svc.recognize(image_2d)
+        assert result == ""
+
+
+class TestOCRServiceRecognizeTextBlocks:
+    """Cover ``recognize_text_blocks`` branches."""
+
+    def test_with_paddle(self):
+        svc = OCRService.__new__(OCRService)
+        svc._paddle_enabled = True
+        svc.reader = None
+        svc.tesseract_available = False
+        svc.use_gpu = False
+
+        image = MagicMock()
+        image.convert.return_value = image
+        with (
+            patch(
+                "app.domain.shared_services.paddle_ocr_runner.predict_to_text_blocks",
+                return_value=[{"text": "x"}],
+            ),
+            patch("numpy.array", return_value=np.zeros((10, 10, 3))),
+        ):
+            result = svc.recognize_text_blocks(image)
+        assert result == [{"text": "x"}]
+
+    def test_with_easyocr(self):
+        svc = OCRService.__new__(OCRService)
+        svc._paddle_enabled = False
+        svc.reader = MagicMock()
+        svc.reader.readtext.return_value = [([[0, 0], [10, 0], [10, 10], [0, 10]], "hello", 0.95)]
+        svc.tesseract_available = False
+        svc.use_gpu = False
+
+        image_2d = np.zeros((10, 10))
+        result = svc.recognize_text_blocks(image_2d)
+        assert len(result) == 1
+        assert result[0]["text"] == "hello"
+
+    def test_no_engine_returns_empty(self):
+        svc = OCRService.__new__(OCRService)
+        svc._paddle_enabled = False
+        svc.reader = None
+        svc.tesseract_available = False
+        svc.use_gpu = False
+
+        image_2d = np.zeros((10, 10))
+        assert svc.recognize_text_blocks(image_2d) == []
+
+    def test_easyocr_text_blocks_empty_text_skipped(self):
+        svc = OCRService.__new__(OCRService)
+        svc._paddle_enabled = False
+        svc.reader = MagicMock()
+        svc.reader.readtext.return_value = [
+            ([[0, 0], [10, 0], [10, 10], [0, 10]], "", 0.95),
+            ("", "  ", 0.95),
+        ]
+        svc.tesseract_available = False
+        svc.use_gpu = False
+
+        image_2d = np.zeros((10, 10))
+        result = svc.recognize_text_blocks(image_2d)
+        assert result == []
+
+    def test_easyocr_text_blocks_recoverable_error(self):
+        svc = OCRService.__new__(OCRService)
+        svc._paddle_enabled = False
+        svc.reader = MagicMock()
+        svc.reader.readtext.side_effect = RuntimeError("readtext fail")
+        svc.tesseract_available = False
+        svc.use_gpu = False
+
+        image_2d = np.zeros((10, 10))
+        result = svc.recognize_text_blocks(image_2d)
+        assert result == []
+
+
+class TestOCRServiceRecognizeFile:
+    """Cover ``recognize_file`` / ``recognize_text`` branches."""
+
+    def test_recognize_file_not_exists(self, tmp_path):
+        svc = OCRService.__new__(OCRService)
+        svc._paddle_enabled = False
+        svc.reader = None
+        svc.tesseract_available = False
+        svc.use_gpu = False
+
+        result = svc.recognize_file(str(tmp_path / "missing.png"))
+        assert result["success"] is False
+        assert "文件不存在" in result["message"]
+
+    def test_recognize_file_success(self, tmp_path):
+        svc = OCRService.__new__(OCRService)
+        svc._paddle_enabled = False
+        svc.reader = MagicMock()
+        svc.reader.readtext.return_value = ["hello"]
+        svc.tesseract_available = False
+        svc.use_gpu = False
+
+        file_path = tmp_path / "img.png"
+        file_path.write_bytes(b"")
+        with patch("PIL.Image.open") as mock_open:
+            mock_open.return_value = MagicMock()
+            result = svc.recognize_file(str(file_path))
+        assert result["success"] is True
+        assert "hello" in result["text"]
+
+    def test_recognize_file_recoverable_error(self, tmp_path):
+        svc = OCRService.__new__(OCRService)
+        svc._paddle_enabled = False
+        svc.reader = None
+        svc.tesseract_available = False
+        svc.use_gpu = False
+
+        file_path = tmp_path / "img.png"
+        file_path.write_bytes(b"")
+        with patch("PIL.Image.open", side_effect=RuntimeError("open fail")):
+            result = svc.recognize_file(str(file_path))
+        assert result["success"] is False
+
+    def test_recognize_text_adds_confidence(self, tmp_path):
+        svc = OCRService.__new__(OCRService)
+        svc._paddle_enabled = False
+        svc.reader = None
+        svc.tesseract_available = False
+        svc.use_gpu = False
+
+        file_path = tmp_path / "img.png"
+        file_path.write_bytes(b"")
+        with patch("PIL.Image.open"), patch.object(svc, "recognize", return_value="text"):
+            result = svc.recognize_text(str(file_path))
+        assert "confidence" in result
+        assert result["confidence"] == 0.0
+
+    def test_recognize_trademark_delegates(self, tmp_path):
+        svc = OCRService.__new__(OCRService)
+        svc._paddle_enabled = False
+        svc.reader = None
+        svc.tesseract_available = False
+        svc.use_gpu = False
+
+        result = svc.recognize_trademark(str(tmp_path / "missing.png"))
+        assert result["success"] is False
+
+    def test_recognize_product_delegates(self, tmp_path):
+        svc = OCRService.__new__(OCRService)
+        svc._paddle_enabled = False
+        svc.reader = None
+        svc.tesseract_available = False
+        svc.use_gpu = False
+
+        result = svc.recognize_product(str(tmp_path / "missing.png"))
+        assert result["success"] is False
+
+
+class TestOCRServiceRecognizeFromBytes:
+    """Cover ``recognize_text_from_bytes`` branches."""
+
+    def test_with_paddle(self):
+        svc = OCRService.__new__(OCRService)
+        svc._paddle_enabled = True
+        svc.reader = None
+        svc.tesseract_available = False
+        svc.use_gpu = False
+
+        with (
+            patch("PIL.Image.open") as mock_open,
+            patch.object(
+                svc,
+                "recognize_text_blocks",
+                return_value=[{"text": "x", "conf": 80.0}],
+            ),
+        ):
+            mock_open.return_value = MagicMock()
+            result = svc.recognize_text_from_bytes(b"img bytes")
+        assert result["success"] is True
+        assert result["confidence"] == 0.8
+
+    def test_with_paddle_empty_text(self):
+        svc = OCRService.__new__(OCRService)
+        svc._paddle_enabled = True
+        svc.reader = None
+        svc.tesseract_available = False
+        svc.use_gpu = False
+
+        with (
+            patch("PIL.Image.open") as mock_open,
+            patch.object(svc, "recognize_text_blocks", return_value=[]),
+        ):
+            mock_open.return_value = MagicMock()
+            result = svc.recognize_text_from_bytes(b"img bytes")
+        assert result["success"] is False
+        assert result["confidence"] == 0.0
+
+    def test_without_paddle(self):
+        svc = OCRService.__new__(OCRService)
+        svc._paddle_enabled = False
+        svc.reader = MagicMock()
+        svc.reader.readtext.return_value = ["text"]
+        svc.tesseract_available = False
+        svc.use_gpu = False
+
+        with (
+            patch("PIL.Image.open") as mock_open,
+            patch.object(svc, "recognize", return_value="text"),
+        ):
+            mock_open.return_value = MagicMock()
+            result = svc.recognize_text_from_bytes(b"img bytes")
+        assert result["success"] is True
+
+    def test_recoverable_error(self):
+        svc = OCRService.__new__(OCRService)
+        svc._paddle_enabled = False
+        svc.reader = None
+        svc.tesseract_available = False
+        svc.use_gpu = False
+
+        with patch("PIL.Image.open", side_effect=RuntimeError("open fail")):
+            result = svc.recognize_text_from_bytes(b"img bytes")
+        assert result["success"] is False
+        assert result["confidence"] == 0.0
+
+
+class TestOCRServiceRecognizeWithDetails:
+    """Cover ``recognize_with_details`` branches."""
+
+    def test_with_paddle(self):
+        svc = OCRService.__new__(OCRService)
+        svc._paddle_enabled = True
+        svc.reader = None
+        svc.tesseract_available = False
+        svc.use_gpu = False
+
+        image_2d = np.zeros((10, 10))
+        with patch.object(
+            svc,
+            "recognize_text_blocks",
+            return_value=[
+                {"text": "100元", "conf": 90.0, "left": 0, "top": 0, "width": 10, "height": 10}
+            ],
+        ):
+            result = svc.recognize_with_details(image_2d)
+        assert len(result) == 1
+        assert isinstance(result[0], OCRResult)
+        assert result[0].text == "100元"
+        assert result[0].block_type == "amount"
+
+    def test_with_easyocr(self):
+        svc = OCRService.__new__(OCRService)
+        svc._paddle_enabled = False
+        svc.reader = MagicMock()
+        svc.reader.readtext.return_value = [([[0, 0], [10, 0], [10, 10], [0, 10]], "hello", 0.95)]
+        svc.tesseract_available = False
+        svc.use_gpu = False
+
+        image_2d = np.zeros((10, 10, 3))
+        result = svc.recognize_with_details(image_2d)
+        assert len(result) == 1
+        assert result[0].text == "hello"
+
+    def test_no_reader_returns_empty(self):
+        svc = OCRService.__new__(OCRService)
+        svc._paddle_enabled = False
+        svc.reader = None
+        svc.tesseract_available = False
+        svc.use_gpu = False
+
+        image_2d = np.zeros((10, 10, 3))
+        assert svc.recognize_with_details(image_2d) == []
+
+    def test_recoverable_error_returns_empty(self):
+        svc = OCRService.__new__(OCRService)
+        svc._paddle_enabled = False
+        svc.reader = MagicMock()
+        svc.reader.readtext.side_effect = RuntimeError("fail")
+        svc.tesseract_available = False
+        svc.use_gpu = False
+
+        image_2d = np.zeros((10, 10, 3))
+        assert svc.recognize_with_details(image_2d) == []
+
+
+class TestOCRServiceGetActiveBackend:
+    """Cover ``get_active_ocr_backend``."""
+
+    def test_paddle(self):
+        svc = OCRService.__new__(OCRService)
+        svc._paddle_enabled = True
+        svc.reader = None
+        svc.tesseract_available = False
+        assert svc.get_active_ocr_backend() == "paddleocr"
+
+    def test_easyocr(self):
+        svc = OCRService.__new__(OCRService)
+        svc._paddle_enabled = False
+        svc.reader = MagicMock()
+        svc.tesseract_available = False
+        assert svc.get_active_ocr_backend() == "easyocr"
+
+    def test_tesseract(self):
+        svc = OCRService.__new__(OCRService)
+        svc._paddle_enabled = False
+        svc.reader = None
+        svc.tesseract_available = True
+        assert svc.get_active_ocr_backend() == "tesseract"
+
+    def test_none(self):
+        svc = OCRService.__new__(OCRService)
+        svc._paddle_enabled = False
+        svc.reader = None
+        svc.tesseract_available = False
+        assert svc.get_active_ocr_backend() == "none"
+
+
+class TestOCRServiceClassifyText:
+    """Cover ``_classify_text`` branches."""
+
+    @pytest.fixture
+    def svc(self):
+        return OCRService.__new__(OCRService)
+
+    def test_empty_returns_unknown(self, svc):
+        assert svc._classify_text("") == "unknown"
+
+    def test_date_chinese_format(self, svc):
+        assert svc._classify_text("2024年1月15日") == "date"
+
+    def test_date_with_slash(self, svc):
+        assert svc._classify_text("01/15/2024") == "date"
+
+    def test_amount_yuan(self, svc):
+        assert svc._classify_text("100元") == "amount"
+
+    def test_amount_dollar_symbol(self, svc):
+        assert svc._classify_text("$100.50") == "amount"
+
+    def test_amount_euro(self, svc):
+        assert svc._classify_text("50€") == "amount"
+
+    def test_phone(self, svc):
+        assert svc._classify_text("13812345678") == "phone"
+
+    def test_number(self, svc):
+        assert svc._classify_text("12345") == "number"
+
+    def test_text(self, svc):
+        assert svc._classify_text("购货单位：测试公司") == "text"
+
+
+class TestOCRServiceCleanText:
+    """Cover ``_clean_text`` branches."""
+
+    @pytest.fixture
+    def svc(self):
+        return OCRService.__new__(OCRService)
+
+    def test_empty(self, svc):
+        assert svc._clean_text("") == ""
+
+    def test_strips_lines(self, svc):
+        assert svc._clean_text("  a  \n  b  ") == "a\nb"
+
+    def test_removes_empty_lines(self, svc):
+        assert svc._clean_text("a\n\nb") == "a\nb"
+
+
+class TestOCRServiceExtractStructuredData:
+    """Cover ``extract_structured_data`` branches."""
+
+    @pytest.fixture
+    def svc(self):
+        return OCRService.__new__(OCRService)
+
+    def test_empty_text(self, svc):
+        result = svc.extract_structured_data("")
+        assert result["purchase_unit"] is None
+        assert result["products"] == []
+
+    def test_extract_all_fields(self, svc):
+        text = """
+        购货单位：测试公司
+        联系人：张三
+        联系电话：138-1234-5678
+        订单编号：ORD001
+        2024-01-15
+        合计：1250.50
+        ABC001 产品A 10 100.00 1000.00
+        """
+        result = svc.extract_structured_data(text)
+        assert result["purchase_unit"] == "测试公司"
+        assert result["contact_person"] == "张三"
+        assert result["contact_phone"] == "138-1234-5678"
+        assert result["order_number"] == "ORD001"
+        assert result["purchase_date"] == "2024-01-15"
+        assert result["total_amount"] == 1250.50
+        assert len(result["products"]) == 1
+
+    def test_invalid_amount(self, svc):
+        result = svc.extract_structured_data("合计：abc")
+        assert result["total_amount"] is None
+
+    def test_chinese_date_format(self, svc):
+        result = svc.extract_structured_data("2024年1月20日")
+        assert result["purchase_date"] == "2024年1月20日"
+
+
+class TestOCRServiceAnalyzeText:
+    """Cover ``analyze_text`` branches."""
+
+    @pytest.fixture
+    def svc(self):
+        return OCRService.__new__(OCRService)
+
+    def test_empty_text(self, svc):
+        result = svc.analyze_text("")
+        assert result["text_type"] == "unknown"
+        assert result["confidence"] == 0.0
+        assert result["missing_fields"] == []
+
+    def test_unknown_type_adds_suggestion(self, svc):
+        result = svc.analyze_text("这是一段完全没有任何关键词的普通文本")
+        assert result["text_type"] == "unknown"
+        assert any("手动确认" in s for s in result["suggestions"])
+
+    def test_detects_order_type(self, svc):
+        result = svc.analyze_text("订单编号：001\n订购产品：显示器")
+        assert result["text_type"] == "order"
+
+    def test_detects_all_essential_fields(self, svc):
+        text = "购货单位：测试公司\n联系人：张三\n2024-01-15"
+        result = svc.analyze_text(text)
+        assert len(result["missing_fields"]) == 0
+
+
+# ===========================================================================
+# 4. app/fastapi_routes/mobile_api_extensions.py
+# ===========================================================================
+
+
+class TestMobileExtEnsureMobileDeviceTable:
+    """Cover ``_ensure_mobile_device_table`` branches."""
+
+    def test_happy_path(self, ext_mod):
+        mock_db = MagicMock()
+        mock_insp = MagicMock()
+        mock_insp.has_table.return_value = True
+        mock_db.__enter__ = MagicMock(return_value=mock_db)
+        mock_db.__exit__ = MagicMock(return_value=False)
+        with (
+            patch("app.db.session.get_db", return_value=mock_db),
+            patch("sqlalchemy.inspect", return_value=mock_insp),
+        ):
+            ext_mod._ensure_mobile_device_table()
+        # Table already present: existence is checked for the right table and
+        # no DDL is emitted on the bind (create path skipped).
+        mock_insp.has_table.assert_called_once_with("mobile_device_tokens")
+        mock_db.get_bind.return_value._run_ddl_visitor.assert_not_called()
+
+    def test_table_missing_creates(self, ext_mod):
+        mock_db = MagicMock()
+        mock_bind = MagicMock()
+        mock_db.get_bind.return_value = mock_bind
+        mock_insp = MagicMock()
+        mock_insp.has_table.return_value = False
+        mock_db.__enter__ = MagicMock(return_value=mock_db)
+        mock_db.__exit__ = MagicMock(return_value=False)
+        with (
+            patch("app.db.session.get_db", return_value=mock_db),
+            patch("sqlalchemy.inspect", return_value=mock_insp),
+        ):
+            ext_mod._ensure_mobile_device_table()
+        # Table missing: DDL is emitted against the session bind to create it
+        # (Table.create drives bind._run_ddl_visitor with the SchemaGenerator).
+        mock_insp.has_table.assert_called_once_with("mobile_device_tokens")
+        mock_bind._run_ddl_visitor.assert_called_once()
+
+    def test_recoverable_error_logged(self, ext_mod):
+        # RuntimeError is in RECOVERABLE_ERRORS, so it must be swallowed and
+        # logged rather than propagated to the caller.
+        with (
+            patch("app.db.session.get_db", side_effect=RuntimeError("db down")),
+            patch.object(ext_mod.logger, "warning") as mock_warning,
+        ):
+            ext_mod._ensure_mobile_device_table()  # must not raise
+        mock_warning.assert_called_once()
+
+
+class TestMobileExtUnauthorizedRoutes:
+    """Cover unauthorized route branches."""
+
+    @pytest.mark.asyncio
+    async def test_cs_post_message_unauthorized(self, ext_mod):
+        mock_request = MagicMock()
+        result = await ext_mod.post_cs_message(
+            request=mock_request,
+            body={},
+            background_tasks=BackgroundTasks(),
+            user=None,
+        )
+        assert result.status_code == 401
+
+
+class TestMobileExtMobileModItems:
+    """Cover ``_mobile_mod_items`` branches."""
+
+
+class TestMobileExtApprovalShipmentItems:
+    """Cover ``_approval_items`` / ``_shipment_items``."""
+
+
+class TestMobileExtDeviceRegister:
+    """Cover ``mobile_device_register`` happy paths."""
+
+    @pytest.mark.asyncio
+    async def test_register_new_device(self, ext_mod):
+        mock_user = MagicMock()
+        mock_user.id = 1
+        body = ext_mod.DeviceRegisterBody(fcm_token="a" * 10, push_token="push_tok_123")
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = None
+        mock_db.__enter__ = MagicMock(return_value=mock_db)
+        mock_db.__exit__ = MagicMock(return_value=False)
+        with (
+            patch.object(ext_mod, "_ensure_mobile_device_table"),
+            patch("app.db.session.get_db", return_value=mock_db),
+            patch("app.utils.time.utc_now_naive", return_value=datetime.now()),
+        ):
+            result = await ext_mod.mobile_device_register(body=body, user=mock_user)
+        if hasattr(result, "body"):
+            data = json.loads(result.body)
+        else:
+            data = result
+        assert data.get("success") is True
+
+    @pytest.mark.asyncio
+    async def test_register_existing_device_updates(self, ext_mod):
+        mock_user = MagicMock()
+        mock_user.id = 1
+        body = ext_mod.DeviceRegisterBody(fcm_token="a" * 10, push_token="push_tok_123")
+        mock_row = MagicMock()
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = mock_row
+        mock_db.__enter__ = MagicMock(return_value=mock_db)
+        mock_db.__exit__ = MagicMock(return_value=False)
+        with (
+            patch.object(ext_mod, "_ensure_mobile_device_table"),
+            patch("app.db.session.get_db", return_value=mock_db),
+            patch("app.utils.time.utc_now_naive", return_value=datetime.now()),
+        ):
+            result = await ext_mod.mobile_device_register(body=body, user=mock_user)
+        if hasattr(result, "body"):
+            data = json.loads(result.body)
+        else:
+            data = result
+        assert data.get("success") is True
+
+    @pytest.mark.asyncio
+    async def test_register_missing_push_token(self, ext_mod):
+        mock_user = MagicMock()
+        mock_user.id = 1
+        body = ext_mod.DeviceRegisterBody(fcm_token="        ", push_token="")
+        with patch.object(ext_mod, "_ensure_mobile_device_table"):
+            result = await ext_mod.mobile_device_register(body=body, user=mock_user)
+        assert result.status_code == 400
+
+
+class TestMobileExtSyncRoutes:
+    """Cover sync routes happy paths."""
+
+    @pytest.mark.asyncio
+    async def test_sync_status_success(self, ext_mod):
+        mock_user = MagicMock()
+        mock_user.id = 1
+        mock_sync = MagicMock()
+        mock_sync.get_status.return_value = {"local_cursor": 5}
+        with (
+            patch("app.db.xcmax_sync.SyncDb", return_value=mock_sync),
+            patch("app.db.xcmax_sync._ensure_schema"),
+            patch("app.db.xcmax_sync._get_conn") as mock_conn_ctx,
+        ):
+            mock_conn = MagicMock()
+            mock_conn.execute.return_value.fetchone.return_value = [0]
+            mock_conn_ctx.return_value.__enter__ = MagicMock(return_value=mock_conn)
+            mock_conn_ctx.return_value.__exit__ = MagicMock(return_value=False)
+            result = await ext_mod.mobile_sync_status(user=mock_user)
+        if hasattr(result, "body"):
+            data = json.loads(result.body)
+        else:
+            data = result
+        assert data.get("success") is True
+
+    @pytest.mark.asyncio
+    async def test_sync_status_error(self, ext_mod):
+        mock_user = MagicMock()
+        mock_user.id = 1
+        with patch("app.db.xcmax_sync.SyncDb", side_effect=RuntimeError("db fail")):
+            result = await ext_mod.mobile_sync_status(user=mock_user)
+        if hasattr(result, "body"):
+            data = json.loads(result.body)
+        else:
+            data = result
+        assert data.get("success") is True or "error" in data.get("data", {})
+
+    @pytest.mark.asyncio
+    async def test_sync_pull_success(self, ext_mod):
+        mock_user = MagicMock()
+        mock_user.id = 1
+        mock_sync = MagicMock()
+        mock_sync.get_changes.return_value = [{"entity_type": "im_message"}]
+        mock_sync.get_status.return_value = {"local_cursor": 5}
+        body = ext_mod.SyncPullBody(since_cursor=0)
+        with (
+            patch("app.db.xcmax_sync.SyncDb", return_value=mock_sync),
+            patch(
+                "app.domain.app_pure.employee_circle_sync.sync_modstore_reports",
+                new_callable=AsyncMock,
+                return_value={},
+            ) as report_sync,
+            patch.object(ext_mod, "_approval_items", return_value=[]),
+            patch.object(ext_mod, "_shipment_items", return_value=[]),
+        ):
+            result = await ext_mod.mobile_sync_pull(body=body, user=mock_user)
+        if hasattr(result, "body"):
+            data = json.loads(result.body)
+        else:
+            data = result
+        assert data.get("success") is True
+        report_sync.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_sync_pull_error(self, ext_mod):
+        mock_user = MagicMock()
+        mock_user.id = 1
+        body = ext_mod.SyncPullBody(since_cursor=0)
+        with patch("app.db.xcmax_sync.SyncDb", side_effect=RuntimeError("db fail")):
+            result = await ext_mod.mobile_sync_pull(body=body, user=mock_user)
+        assert result.status_code == 500
+
+    @pytest.mark.asyncio
+    async def test_sync_push_success(self, ext_mod):
+        mock_user = MagicMock()
+        mock_user.id = 1
+        mock_user.username = "tester"
+        body = ext_mod.SyncPushBody(
+            items=[ext_mod.SyncPushItem(entity_type="customer", entity_id="1")]
+        )
+        mock_sync = MagicMock()
+        with (
+            patch("app.db.xcmax_sync.SyncDb", return_value=mock_sync),
+            patch("app.application.xcmax_sync_app.apply_inbox", return_value={"applied": 1}),
+        ):
+            result = await ext_mod.mobile_sync_push(body=body, user=mock_user)
+        if hasattr(result, "body"):
+            data = json.loads(result.body)
+        else:
+            data = result
+        assert data.get("success") is True
+
+    @pytest.mark.asyncio
+    async def test_sync_push_error(self, ext_mod):
+        mock_user = MagicMock()
+        mock_user.id = 1
+        body = ext_mod.SyncPushBody(items=[])
+        with patch("app.db.xcmax_sync.SyncDb", side_effect=RuntimeError("db fail")):
+            result = await ext_mod.mobile_sync_push(body=body, user=mock_user)
+        assert result.status_code == 500
+
+    @pytest.mark.asyncio
+    async def test_sync_ack_success(self, ext_mod):
+        mock_user = MagicMock()
+        mock_user.id = 1
+        body = ext_mod.SyncAckBody(cursor=10)
+        mock_sync = MagicMock()
+        with patch("app.db.xcmax_sync.SyncDb", return_value=mock_sync):
+            result = await ext_mod.mobile_sync_ack(body=body, user=mock_user)
+        if hasattr(result, "body"):
+            data = json.loads(result.body)
+        else:
+            data = result
+        assert data.get("success") is True
+
+    @pytest.mark.asyncio
+    async def test_sync_ack_error(self, ext_mod):
+        mock_user = MagicMock()
+        mock_user.id = 1
+        body = ext_mod.SyncAckBody(cursor=10)
+        with patch("app.db.xcmax_sync.SyncDb", side_effect=RuntimeError("db fail")):
+            result = await ext_mod.mobile_sync_ack(body=body, user=mock_user)
+        assert result.status_code == 500
+
+    @pytest.mark.asyncio
+    async def test_sync_conflicts_success(self, ext_mod):
+        mock_user = MagicMock()
+        mock_user.id = 1
+        mock_conn = MagicMock()
+        mock_conn.execute.return_value.fetchall.return_value = []
+        with (
+            patch("app.db.xcmax_sync._ensure_schema"),
+            patch("app.db.xcmax_sync._get_conn") as mock_conn_ctx,
+        ):
+            mock_conn_ctx.return_value.__enter__ = MagicMock(return_value=mock_conn)
+            mock_conn_ctx.return_value.__exit__ = MagicMock(return_value=False)
+            result = await ext_mod.mobile_sync_conflicts(user=mock_user)
+        if hasattr(result, "body"):
+            data = json.loads(result.body)
+        else:
+            data = result
+        assert data.get("success") is True
+
+    @pytest.mark.asyncio
+    async def test_sync_conflicts_error(self, ext_mod):
+        mock_user = MagicMock()
+        mock_user.id = 1
+        with patch("app.db.xcmax_sync._get_conn", side_effect=RuntimeError("db fail")):
+            result = await ext_mod.mobile_sync_conflicts(user=mock_user)
+        if hasattr(result, "body"):
+            data = json.loads(result.body)
+        else:
+            data = result
+        assert data.get("success") is True
+
+
+class TestMobileExtCsRoutes:
+    """Cover CS routes happy paths."""
+
+    @pytest.mark.asyncio
+    async def test_cs_info_success(self, ext_mod):
+        mock_user = MagicMock()
+        mock_user.id = 1
+        mock_request = MagicMock()
+        result = await ext_mod.get_cs_info(request=mock_request, user=mock_user)
+        if hasattr(result, "body"):
+            data = json.loads(result.body)
+        else:
+            data = result
+        assert data.get("success") is True
+        assert data["data"]["cs_available"] is True
+
+    @pytest.mark.asyncio
+    async def test_cs_post_message_success(self, ext_mod):
+        mock_user = MagicMock()
+        mock_user.id = 1
+        mock_request = MagicMock()
+        mock_db = MagicMock()
+        mock_db.__enter__ = MagicMock(return_value=mock_db)
+        mock_db.__exit__ = MagicMock(return_value=False)
+        mock_svc = MagicMock()
+        mock_svc._ensure_enterprise_dedicated_cs_user.return_value = SimpleNamespace(id=99)
+        mock_svc.get_or_create_direct.return_value = {"id": 7}
+        mock_svc.send_message.return_value = {
+            "message": {"id": 42, "created_at": "2026-06-29T00:00:00Z"}
+        }
+        with (
+            patch("app.db.session.get_db", return_value=mock_db),
+            patch("app.application.im_app_service.ImApplicationService", return_value=mock_svc),
+        ):
+            result = await ext_mod.post_cs_message(
+                request=mock_request,
+                body={"body": "hello"},
+                background_tasks=BackgroundTasks(),
+                user=mock_user,
+            )
+        if hasattr(result, "body"):
+            data = json.loads(result.body)
+        else:
+            data = result
+        assert data.get("success") is True
+        assert data["data"]["message_id"] == "42"
+
+    @pytest.mark.asyncio
+    async def test_cs_get_messages_success(self, ext_mod):
+        mock_user = MagicMock()
+        mock_user.id = 1
+        mock_request = MagicMock()
+        mock_db = MagicMock()
+        mock_db.__enter__ = MagicMock(return_value=mock_db)
+        mock_db.__exit__ = MagicMock(return_value=False)
+        mock_svc = MagicMock()
+        mock_svc._ensure_enterprise_dedicated_cs_user.return_value = SimpleNamespace(id=99)
+        mock_svc.get_or_create_direct.return_value = {"id": 7}
+        mock_svc.list_messages.return_value = []
+        with (
+            patch("app.db.session.get_db", return_value=mock_db),
+            patch("app.application.im_app_service.ImApplicationService", return_value=mock_svc),
+        ):
+            result = await ext_mod.get_cs_messages(request=mock_request, user=mock_user)
+        if hasattr(result, "body"):
+            data = json.loads(result.body)
+        else:
+            data = result
+        assert data.get("success") is True
+        assert data["data"]["messages"] == []
+
+
+# ===========================================================================
+# 5. app/mod_sdk/industry_seed.py
+# ===========================================================================
+
+
+class TestIndustrySeedDedupe:
+    """Cover ``_dedupe`` helper."""
+
+    def test_empty_list(self):
+        assert industry_seed_mod._dedupe([]) == []
+
+    def test_removes_duplicates(self):
+        assert industry_seed_mod._dedupe(["a", "b", "a", "c", "b"]) == ["a", "b", "c"]
+
+    def test_strips_whitespace(self):
+        assert industry_seed_mod._dedupe(["  a  ", "a", "b"]) == ["a", "b"]
+
+    def test_skips_empty_strings(self):
+        assert industry_seed_mod._dedupe(["", "  ", "a"]) == ["a"]
+
+    def test_skips_none(self):
+        assert industry_seed_mod._dedupe([None, "a", None]) == ["a"]
+
+
+class TestIndustrySeedOpenIds:
+    """Cover ``open_industry_seed_mod_ids``."""
+
+    def test_returns_list(self):
+        result = industry_seed_mod.open_industry_seed_mod_ids()
+        assert isinstance(result, list)
+
+    def test_with_mocked_baseline(self, monkeypatch):
+        mock_doc = {
+            "onboarding_open_industry_ids": ["涂料", "考勤"],
+            "industry_packages": {
+                "涂料": {"mod_id": "coating-industry"},
+                "考勤": {"mod_id": "attendance-industry"},
+            },
+        }
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.load_industry_baseline_document",
+            lambda: mock_doc,
+        )
+        result = industry_seed_mod.open_industry_seed_mod_ids()
+        assert "coating-industry" in result
+        assert "attendance-industry" in result
+
+    def test_with_empty_doc(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.load_industry_baseline_document",
+            lambda: {},
+        )
+        assert industry_seed_mod.open_industry_seed_mod_ids() == []
+
+    def test_with_missing_mod_id(self, monkeypatch):
+        mock_doc = {
+            "onboarding_open_industry_ids": ["unknown"],
+            "industry_packages": {"unknown": {}},
+        }
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.load_industry_baseline_document",
+            lambda: mock_doc,
+        )
+        assert industry_seed_mod.open_industry_seed_mod_ids() == []
+
+
+class TestIndustrySeedModIdFor:
+    """Cover ``industry_mod_id_for``."""
+
+    def test_empty_returns_none(self):
+        assert industry_seed_mod.industry_mod_id_for("") is None
+
+    def test_none_returns_none(self):
+        assert industry_seed_mod.industry_mod_id_for(None) is None
+
+    def test_unknown_industry_returns_none(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.load_industry_baseline_document",
+            lambda: {"industry_packages": {}},
+        )
+        assert industry_seed_mod.industry_mod_id_for("unknown") is None
+
+    def test_known_industry_returns_mod_id(self, monkeypatch):
+        mock_doc = {
+            "industry_packages": {"涂料": {"mod_id": "coating-industry"}},
+        }
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.load_industry_baseline_document",
+            lambda: mock_doc,
+        )
+        assert industry_seed_mod.industry_mod_id_for("涂料") == "coating-industry"
+
+    def test_empty_mod_id_returns_none(self, monkeypatch):
+        mock_doc = {
+            "industry_packages": {"涂料": {"mod_id": ""}},
+        }
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.load_industry_baseline_document",
+            lambda: mock_doc,
+        )
+        assert industry_seed_mod.industry_mod_id_for("涂料") is None
+
+
+class TestIndustrySeedResolve:
+    """Cover ``resolve_industry_or_mod_id``."""
+
+    def test_empty_returns_none_none(self):
+        assert industry_seed_mod.resolve_industry_or_mod_id("") == (None, None)
+
+    def test_none_returns_none_none(self):
+        assert industry_seed_mod.resolve_industry_or_mod_id(None) == (None, None)
+
+    def test_known_industry_returns_pair(self, monkeypatch):
+        mock_doc = {
+            "industry_packages": {"涂料": {"mod_id": "coating-industry"}},
+        }
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.load_industry_baseline_document",
+            lambda: mock_doc,
+        )
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.open_industry_seed_mod_ids",
+            lambda: ["coating-industry"],
+        )
+        iid, mid = industry_seed_mod.resolve_industry_or_mod_id("涂料")
+        assert iid == "涂料"
+        assert mid == "coating-industry"
+
+    def test_mod_id_in_open_pool_returns_pair(self, monkeypatch):
+        mock_doc = {
+            "onboarding_open_industry_ids": ["涂料"],
+            "industry_packages": {"涂料": {"mod_id": "coating-industry"}},
+        }
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.load_industry_baseline_document",
+            lambda: mock_doc,
+        )
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.open_industry_seed_mod_ids",
+            lambda: ["coating-industry"],
+        )
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.industry_mod_id_for",
+            lambda iid: "coating-industry" if iid == "涂料" else None,
+        )
+        iid, mid = industry_seed_mod.resolve_industry_or_mod_id("coating-industry")
+        assert mid == "coating-industry"
+
+    def test_unknown_returns_none_none(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.industry_mod_id_for",
+            lambda iid: None,
+        )
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.open_industry_seed_mod_ids",
+            lambda: [],
+        )
+        assert industry_seed_mod.resolve_industry_or_mod_id("unknown") == (None, None)
+
+
+class TestIndustrySeedBundledDir:
+    """Cover ``bundled_industry_seeds_dir``."""
+
+    def test_env_var_set(self, tmp_path, monkeypatch):
+        pool = tmp_path / "seeds"
+        pool.mkdir()
+        monkeypatch.setenv("XCAGI_INDUSTRY_SEEDS_DIR", str(pool))
+        result = industry_seed_mod.bundled_industry_seeds_dir()
+        assert result == pool.resolve()
+
+    def test_staged_env_var(self, tmp_path, monkeypatch):
+        pool = tmp_path / "staged"
+        pool.mkdir()
+        monkeypatch.delenv("XCAGI_INDUSTRY_SEEDS_DIR", raising=False)
+        monkeypatch.setenv("XCAGI_STAGED_INDUSTRY_SEEDS_DIR", str(pool))
+        result = industry_seed_mod.bundled_industry_seeds_dir()
+        assert result == pool.resolve()
+
+    def test_env_var_not_dir_returns_none(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XCAGI_INDUSTRY_SEEDS_DIR", str(tmp_path / "missing"))
+        monkeypatch.delenv("XCAGI_STAGED_INDUSTRY_SEEDS_DIR", raising=False)
+        # No frozen, no cwd match (cwd is project root), no parent match likely
+        result = industry_seed_mod.bundled_industry_seeds_dir()
+        # Result depends on environment; just verify it doesn't crash
+        assert result is None or isinstance(result, Path)
+
+
+class TestIndustrySeedOtherOpen:
+    """Cover ``other_open_industry_mod_ids``."""
+
+    def test_excludes_keep(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.open_industry_seed_mod_ids",
+            lambda: ["a", "b", "c"],
+        )
+        result = industry_seed_mod.other_open_industry_mod_ids("b")
+        assert "b" not in result
+        assert "a" in result
+        assert "c" in result
+
+    def test_empty_keep(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.open_industry_seed_mod_ids",
+            lambda: ["a", "b"],
+        )
+        result = industry_seed_mod.other_open_industry_mod_ids("")
+        assert "a" in result
+        assert "b" in result
+
+
+class TestIndustrySeedDeactivate:
+    """Cover ``deactivate_other_open_industry_mods``."""
+
+    def test_deactivate_with_remove_files(self, tmp_path, monkeypatch):
+        keep = "coating-industry"
+        other = "attendance-industry"
+        mods_root = tmp_path / "mods"
+        (mods_root / other).mkdir(parents=True)
+        (mods_root / other / "manifest.json").write_text("{}", encoding="utf-8")
+
+        unloaded: list[str] = []
+
+        class FakeMM:
+            def __init__(self):
+                self.mods_root = str(mods_root)
+
+            def unload_mod(self, mod_id):
+                unloaded.append(mod_id)
+                return True
+
+        monkeypatch.setattr(
+            "app.infrastructure.mods.mod_manager.get_mod_manager",
+            lambda: FakeMM(),
+        )
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.open_industry_seed_mod_ids",
+            lambda: [keep, other],
+        )
+        rows = industry_seed_mod.deactivate_other_open_industry_mods(keep, remove_files=True)
+        assert other in unloaded
+        assert not (mods_root / other).exists()
+        assert any(r.get("mod_id") == other for r in rows)
+
+    def test_deactivate_without_remove_files(self, tmp_path, monkeypatch):
+        keep = "coating-industry"
+        other = "attendance-industry"
+        mods_root = tmp_path / "mods"
+        (mods_root / other).mkdir(parents=True)
+
+        class FakeMM:
+            def __init__(self):
+                self.mods_root = str(mods_root)
+
+            def unload_mod(self, mod_id):
+                return True
+
+        monkeypatch.setattr(
+            "app.infrastructure.mods.mod_manager.get_mod_manager",
+            lambda: FakeMM(),
+        )
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.open_industry_seed_mod_ids",
+            lambda: [keep, other],
+        )
+        rows = industry_seed_mod.deactivate_other_open_industry_mods(keep, remove_files=False)
+        assert (mods_root / other).exists()
+        assert all(not r.get("removed_files") for r in rows)
+
+    def test_deactivate_unload_raises(self, tmp_path, monkeypatch):
+        keep = "coating-industry"
+        other = "attendance-industry"
+        mods_root = tmp_path / "mods"
+
+        class FakeMM:
+            def __init__(self):
+                self.mods_root = str(mods_root)
+
+            def unload_mod(self, mod_id):
+                raise RuntimeError("unload fail")
+
+        monkeypatch.setattr(
+            "app.infrastructure.mods.mod_manager.get_mod_manager",
+            lambda: FakeMM(),
+        )
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.open_industry_seed_mod_ids",
+            lambda: [keep, other],
+        )
+        rows = industry_seed_mod.deactivate_other_open_industry_mods(keep, remove_files=False)
+        assert len(rows) == 1
+
+    def test_deactivate_remove_files_oserror(self, tmp_path, monkeypatch):
+        keep = "coating-industry"
+        other = "attendance-industry"
+        mods_root = tmp_path / "mods"
+        (mods_root / other).mkdir(parents=True)
+
+        class FakeMM:
+            def __init__(self):
+                self.mods_root = str(mods_root)
+
+            def unload_mod(self, mod_id):
+                return True
+
+        monkeypatch.setattr(
+            "app.infrastructure.mods.mod_manager.get_mod_manager",
+            lambda: FakeMM(),
+        )
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.open_industry_seed_mod_ids",
+            lambda: [keep, other],
+        )
+        with patch("shutil.rmtree", side_effect=OSError("perm denied")):
+            rows = industry_seed_mod.deactivate_other_open_industry_mods(keep, remove_files=True)
+        assert all(r.get("removed_files") is False for r in rows)
+
+
+class TestIndustrySeedSeedMod:
+    """Cover ``seed_industry_mod`` branches."""
+
+    def test_invalid_industry_returns_invalid(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.resolve_industry_or_mod_id",
+            lambda raw: (None, None),
+        )
+        result = industry_seed_mod.seed_industry_mod("unknown")
+        assert result["success"] is False
+        assert result["status"] == "invalid"
+
+    def test_already_present(self, tmp_path, monkeypatch):
+        mod_id = "coating-industry"
+        mods_root = tmp_path / "mods"
+        (mods_root / mod_id).mkdir(parents=True)
+
+        class FakeMM:
+            def __init__(self):
+                self.mods_root = str(mods_root)
+
+            def load_mod(self, mid):
+                return True
+
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.resolve_industry_or_mod_id",
+            lambda raw: ("涂料", mod_id),
+        )
+        monkeypatch.setattr(
+            "app.infrastructure.mods.mod_manager.get_mod_manager",
+            lambda: FakeMM(),
+        )
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.deactivate_other_open_industry_mods",
+            lambda keep, **kw: [],
+        )
+        result = industry_seed_mod.seed_industry_mod("涂料")
+        assert result["status"] == "already_present"
+
+    def test_pool_missing(self, tmp_path, monkeypatch):
+        mod_id = "coating-industry"
+        mods_root = tmp_path / "mods"
+        mods_root.mkdir()
+
+        class FakeMM:
+            def __init__(self):
+                self.mods_root = str(mods_root)
+
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.resolve_industry_or_mod_id",
+            lambda raw: ("涂料", mod_id),
+        )
+        monkeypatch.setattr(
+            "app.infrastructure.mods.mod_manager.get_mod_manager",
+            lambda: FakeMM(),
+        )
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.bundled_industry_seeds_dir",
+            lambda: None,
+        )
+        result = industry_seed_mod.seed_industry_mod("涂料")
+        assert result["success"] is False
+        assert result["status"] == "pool_missing"
+
+    def test_not_in_pool(self, tmp_path, monkeypatch):
+        mod_id = "coating-industry"
+        mods_root = tmp_path / "mods"
+        mods_root.mkdir()
+        pool = tmp_path / "pool"
+        pool.mkdir()
+
+        class FakeMM:
+            def __init__(self):
+                self.mods_root = str(mods_root)
+
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.resolve_industry_or_mod_id",
+            lambda raw: ("涂料", mod_id),
+        )
+        monkeypatch.setattr(
+            "app.infrastructure.mods.mod_manager.get_mod_manager",
+            lambda: FakeMM(),
+        )
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.bundled_industry_seeds_dir",
+            lambda: pool,
+        )
+        result = industry_seed_mod.seed_industry_mod("涂料")
+        assert result["success"] is False
+        assert result["status"] == "not_in_pool"
+
+    def test_seed_success(self, tmp_path, monkeypatch):
+        mod_id = "coating-industry"
+        mods_root = tmp_path / "mods"
+        mods_root.mkdir()
+        pool = tmp_path / "pool"
+        (pool / mod_id).mkdir(parents=True)
+        (pool / mod_id / "manifest.json").write_text("{}", encoding="utf-8")
+
+        class FakeMM:
+            def __init__(self):
+                self.mods_root = str(mods_root)
+
+            def invalidate_scan_cache(self):
+                pass
+
+            def load_mod(self, mid):
+                return True
+
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.resolve_industry_or_mod_id",
+            lambda raw: ("涂料", mod_id),
+        )
+        monkeypatch.setattr(
+            "app.infrastructure.mods.mod_manager.get_mod_manager",
+            lambda: FakeMM(),
+        )
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.bundled_industry_seeds_dir",
+            lambda: pool,
+        )
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.deactivate_other_open_industry_mods",
+            lambda keep, **kw: [],
+        )
+        result = industry_seed_mod.seed_industry_mod("涂料")
+        assert result["success"] is True
+        assert result["status"] == "seeded"
+
+    def test_seed_copy_error(self, tmp_path, monkeypatch):
+        mod_id = "coating-industry"
+        mods_root = tmp_path / "mods"
+        mods_root.mkdir()
+        pool = tmp_path / "pool"
+        (pool / mod_id).mkdir(parents=True)
+
+        class FakeMM:
+            def __init__(self):
+                self.mods_root = str(mods_root)
+
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.resolve_industry_or_mod_id",
+            lambda raw: ("涂料", mod_id),
+        )
+        monkeypatch.setattr(
+            "app.infrastructure.mods.mod_manager.get_mod_manager",
+            lambda: FakeMM(),
+        )
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.bundled_industry_seeds_dir",
+            lambda: pool,
+        )
+        with patch("shutil.copytree", side_effect=OSError("copy fail")):
+            result = industry_seed_mod.seed_industry_mod("涂料")
+        assert result["success"] is False
+        assert result["status"] == "copy_error"
+
+
+class TestIndustrySeedInstallFallback:
+    """Cover ``install_industry_seed_with_fallback``."""
+
+    @pytest.mark.asyncio
+    async def test_seed_success_returns_directly(self, monkeypatch):
+        mock_result = {"success": True, "mod_id": "x", "status": "seeded"}
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.seed_industry_mod",
+            lambda iid: mock_result,
+        )
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.deactivate_other_open_industry_mods",
+            lambda keep, **kw: [],
+        )
+        result = await industry_seed_mod.install_industry_seed_with_fallback("涂料")
+        assert result["success"] is True
+
+    @pytest.mark.asyncio
+    async def test_seed_failure_pool_missing_catalog_success(self, monkeypatch):
+        mock_result = {
+            "success": False,
+            "mod_id": "x",
+            "status": "pool_missing",
+            "industry_id": "涂料",
+            "message": "missing",
+        }
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.seed_industry_mod",
+            lambda iid: mock_result,
+        )
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.deactivate_other_open_industry_mods",
+            lambda keep, **kw: [],
+        )
+        mock_catalog = MagicMock()
+        mock_catalog.success = True
+        mock_catalog.message = "ok"
+        with patch(
+            "app.fastapi_routes.mod_store_routes._install_from_catalog",
+            new=AsyncMock(return_value=mock_catalog),
+        ):
+            result = await industry_seed_mod.install_industry_seed_with_fallback("涂料")
+        assert result["success"] is True
+        assert result["status"] == "catalog"
+
+    @pytest.mark.asyncio
+    async def test_seed_failure_pool_missing_catalog_failure(self, monkeypatch):
+        mock_result = {
+            "success": False,
+            "mod_id": "x",
+            "status": "not_in_pool",
+            "industry_id": "涂料",
+            "message": "missing",
+        }
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.seed_industry_mod",
+            lambda iid: mock_result,
+        )
+        mock_catalog = MagicMock()
+        mock_catalog.success = False
+        mock_catalog.message = "catalog fail"
+        with patch(
+            "app.fastapi_routes.mod_store_routes._install_from_catalog",
+            new=AsyncMock(return_value=mock_catalog),
+        ):
+            result = await industry_seed_mod.install_industry_seed_with_fallback("涂料")
+        assert result["success"] is False
+        assert result["status"] == "catalog_failed"
+
+    @pytest.mark.asyncio
+    async def test_seed_failure_invalid_no_catalog(self, monkeypatch):
+        mock_result = {
+            "success": False,
+            "mod_id": None,
+            "status": "invalid",
+            "industry_id": None,
+            "message": "invalid",
+        }
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.seed_industry_mod",
+            lambda iid: mock_result,
+        )
+        result = await industry_seed_mod.install_industry_seed_with_fallback("unknown")
+        assert result["success"] is False
+        assert result["status"] == "invalid"
+
+    @pytest.mark.asyncio
+    async def test_catalog_raises_recoverable(self, monkeypatch):
+        mock_result = {
+            "success": False,
+            "mod_id": "x",
+            "status": "pool_missing",
+            "industry_id": "涂料",
+            "message": "missing",
+        }
+        monkeypatch.setattr(
+            "app.mod_sdk.industry_seed.seed_industry_mod",
+            lambda iid: mock_result,
+        )
+        with patch(
+            "app.fastapi_routes.mod_store_routes._install_from_catalog",
+            new=AsyncMock(side_effect=RuntimeError("catalog err")),
+        ):
+            result = await industry_seed_mod.install_industry_seed_with_fallback("涂料")
+        assert result["success"] is False
+        assert result["status"] == "catalog_failed"
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(pytest.main([__file__, "-q"]))

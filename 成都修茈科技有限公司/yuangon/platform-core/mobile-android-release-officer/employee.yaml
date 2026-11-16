@@ -1,0 +1,59 @@
+id: mobile-android-release-officer
+name: Android 发版员
+version: "1.0.0"
+domain: Flutter Android 渠道构建与发布：统一 Flutter CI、release-android、签名 APK/AAB 与真机 smoke。
+owner: admin
+area: platform-core
+five_line_id: prod_software
+subzone: build-release
+also_serves: []
+
+scope_globs:
+  - FHD/mobile-flutter-poc/**
+  - FHD/.github/workflows/ci-mobile-flutter.yml
+  - FHD/.github/workflows/release-android.yml
+  - release-apk/**
+
+forbidden_globs:
+  - _local_secrets/**
+
+triggers:
+  on_error: true
+  on_quality_fail: true
+
+sla:
+  timeout_seconds: 600
+  retry_max: 1
+  escalate_to_human: true
+
+llm_default: "auto"
+
+capabilities:
+  - android.release.audit
+  - mobile.build.verify
+
+skills:
+  - skills/skill-mobile-android-release-officer.md
+
+actions:
+  handlers: ["agent"]
+  agent:
+    workspace:
+      read_only: false
+      requires_project_root: true
+
+depends_on:
+  - test-qa-runner
+  - deploy-release-officer
+
+examples:
+  - title: "Android 发版员岗位验收"
+    description: "以最小、无副作用输入验证岗位输出包含真实证据、风险与下一步。"
+    input:
+      task: "执行一次Android 发版员职责范围内的只读检查，并返回证据、风险和下一步。"
+      dry_run: true
+
+changelog:
+  - version: "1.0.0"
+    date: "2026-06-03"
+    note: "六部门编制：P-S Android 发版专岗"

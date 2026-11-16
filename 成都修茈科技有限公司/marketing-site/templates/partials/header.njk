@@ -1,0 +1,41 @@
+<header class="site-header">
+  <div class="container header-inner">
+    <a class="brand-mark" href="/index.html"{%- if activeNav === 'home' %} aria-label="XCAGI 官网首页"{% endif %}>
+      <span class="brand-seal"><img src="/assets/xiu-ci-logo.png" alt="修茈科技 Logo" /></span>
+      <span class="brand-name"><strong>XCAGI</strong><span>企业业务自动化平台</span></span>
+    </a>
+    <nav class="nav"{% if activeNav === 'home' %} id="main-nav"{% endif %} aria-label="站点导航">
+      <div class="nav-menu">
+        <a {% if activeNav === 'home' %}class="active" {% endif %}data-nav="product" href="/index.html#product">产品</a>
+        <a {% if activeNav === 'solutions' %}class="active" {% endif %}data-nav="solutions" href="/solutions.html">解决方案</a>
+        <a {% if activeNav === 'cases' %}class="active" {% endif %}data-nav="cases" href="/cases.html">客户案例</a>
+        <a data-nav="pricing" href="/index.html#pricing">价格</a>
+        <a data-nav="download" href="/download">下载</a>
+        <a {% if activeNav === 'capabilities' %}class="active" {% endif %}data-nav="capabilities" href="/capabilities/">验证中心</a>
+        <a {% if activeNav === 'contact' %}class="active" {% endif %}data-nav="contact" href="/contact.html">联系我们</a>
+        <details class="nav-secondary">
+          <summary>技术与透明度</summary>
+          <div class="nav-secondary-panel">
+            <a href="/developer.html">开发者中心</a><a href="/world-will">世界意志</a>
+            <a href="/download/breakpoints">断点清单</a><a href="/download/goals">工作目标</a>
+          </div>
+        </details>
+      </div>
+    </nav>
+    <button class="mobile-menu-toggle" id="mobile-menu-toggle" type="button" aria-controls="mobile-menu" aria-label="打开菜单" aria-expanded="false"><span></span><span></span><span></span></button>
+  </div>
+</header>
+<div class="mobile-menu-overlay" id="mobile-menu-overlay"></div>
+<nav class="mobile-menu" id="mobile-menu" aria-hidden="true" inert>
+  <a href="/index.html#product" class="mobile-menu-link{% if activeNav === 'home' %} active{% endif %}">产品</a>
+  <a href="/solutions.html" class="mobile-menu-link{% if activeNav === 'solutions' %} active{% endif %}">解决方案</a>
+  <a href="/cases.html" class="mobile-menu-link{% if activeNav === 'cases' %} active{% endif %}">客户案例</a>
+  <a href="/index.html#pricing" class="mobile-menu-link">价格</a>
+  <a href="/download" class="mobile-menu-link">下载</a>
+  <a href="/capabilities/" class="mobile-menu-link{% if activeNav === 'capabilities' %} active{% endif %}">验证中心</a>
+  <a href="/contact.html" class="mobile-menu-link{% if activeNav === 'contact' %} active{% endif %}">联系我们</a>
+  <details class="mobile-secondary"><summary>技术与透明度</summary>
+    <a href="/developer.html" class="mobile-menu-link">开发者中心</a><a href="/world-will" class="mobile-menu-link">世界意志</a>
+    <a href="/download/breakpoints" class="mobile-menu-link">断点清单</a><a href="/download/goals" class="mobile-menu-link">工作目标</a>
+  </details>
+</nav>

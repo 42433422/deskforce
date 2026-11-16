@@ -1,0 +1,673 @@
+"""Confirmed ETL execution, retry, and rollback operations."""
+
+from __future__ import annotations
+
+import logging
+import math
+import time
+from contextvars import copy_context
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
+
+from sqlalchemy import or_
+from sqlalchemy.orm import Session
+
+from app.application.elt.errors import EltConflict, EltError
+from app.application.elt.operation_owner import (
+    OperationOwner,
+    activate_operation,
+    bind_owner,
+    claim_operation,
+    fail_operation,
+    finish_operation,
+    unbind_owner,
+)
+from app.application.elt.parsers import MAX_ROWS
+from app.application.elt.preview_confirmation import (
+    invalidate_preview,
+    record_confirmation,
+    verify_execution,
+    verify_preview,
+)
+from app.application.elt.service_rollback import RollbackServiceMixin
+from app.application.elt.service_support import (
+    EXECUTOR,
+    SUBMITTED,
+    SUBMITTED_LOCK,
+    dump_json,
+    load_json,
+    new_session,
+    safe_error,
+    utcnow,
+)
+from app.application.elt.targets import TargetAdapter, get_adapter
+from app.application.elt.targets.batch import AttendanceAdapter
+from app.db.models.elt import EltRun, EltRunRow, EltUpload
+from app.infrastructure.tenant_scope import tenant_id_for_write, tenant_scope
+from app.utils.operational_errors import BOUNDARY_ERRORS, RECOVERABLE_ERRORS
+
+logger = logging.getLogger(__name__)
+
+
+def _unconfirmed_mappings(mappings: Any) -> list[dict[str, Any]]:
+    """Mappings below a confident match stay out of the warehouse until a person confirms them."""
+    if not isinstance(mappings, list):
+        return []
+    pending: list[dict[str, Any]] = []
+    for item in mappings:
+        if not isinstance(item, dict) or not str(item.get("source") or "").strip():
+            continue
+        if item.get("confirmed") is True or "confidence" not in item:
+            continue
+        try:
+            confidence = float(item["confidence"])
+        except (TypeError, ValueError):
+            pending.append(item)
+            continue
+        if not math.isfinite(confidence) or not 0.9 <= confidence <= 1:
+            pending.append(item)
+    return pending
+
+
+class ExecutionServiceMixin(RollbackServiceMixin):
+    if TYPE_CHECKING:
+        _owned_run: Any
+        _owned_target_config: Any
+        _execution_upload: Any
+        _load_source_snapshot: Any
+        _owned_upload_record: Any
+        _row_context: Any
+        _submit_preview: Any
+        _submit_revalidation: Any
+        get_run: Any
+        run_dict: Any
+
+    def execute(
+        self,
+        db: Session,
+        *,
+        run_id: str,
+        owner_user_id: int,
+        confirmed: bool,
+        valid_rows_only: bool,
+        preview_revision: str | None = None,
+    ) -> dict[str, Any]:
+        run = self._owned_run(db, run_id, owner_user_id)
+        if not confirmed:
+            raise EltError("ELT_CONFIRMATION_REQUIRED", "执行前必须显式确认")
+        if run.status != "preview_ready":
+            raise EltConflict("ELT_PREVIEW_REQUIRED", "请先完成预演再执行")
+        if run.error_rows and not valid_rows_only:
+            raise EltConflict(
+                "ELT_INVALID_ROWS_BLOCKED",
+                "预演存在错误行；默认阻断整批。仅在明确选择“仅写入正确行”后才能继续",
+            )
+        operation = claim_operation(
+            db,
+            run,
+            "execute_queue",
+            allowed_statuses={"preview_ready"},
+            require_unrolled_back=True,
+        )
+        bind_owner(db, operation)
+        committed = False
+        try:
+            # The ownership update locks this run. Read again under that lock,
+            # rather than approving a stale ORM snapshot before a concurrent edit.
+            db.refresh(run)
+            if int(run.total_rows or 0) == 0:
+                raise EltConflict("ELT_PREVIEW_EMPTY", "没有识别出可入库的数据，不能确认或入库")
+            pending_mappings = _unconfirmed_mappings(
+                load_json(run.draft_json, {}).get("field_mappings")
+            )
+            if pending_mappings:
+                names = "、".join(
+                    str(item.get("target") or item.get("source") or "字段")
+                    for item in pending_mappings[:8]
+                )
+                raise EltConflict(
+                    "ELT_MAPPING_CONFIRMATION_REQUIRED",
+                    f"有歧义的字段尚未确认：{names}。请确认映射后再入库",
+                )
+            if run.error_rows and not valid_rows_only:
+                raise EltConflict(
+                    "ELT_INVALID_ROWS_BLOCKED", "预演存在错误行，请核对后明确选择执行范围"
+                )
+            get_adapter(run.target_type)
+            verify_preview(db, run, preview_revision)
+            self._execution_upload(db, run, owner_user_id)
+            draft = load_json(run.draft_json, {})
+            if run.target_type == "webhook":
+                self._owned_target_config(
+                    db, str(draft.get("target_config_id") or ""), owner_user_id
+                )
+            if run.target_type == "attendance":
+                AttendanceAdapter.require_complete_selection(
+                    run.new_rows + run.update_rows,
+                    run.total_rows,
+                    skip_rows=int(run.skip_rows or 0),
+                )
+            assert preview_revision is not None
+            record_confirmation(run, preview_revision, valid_rows_only=valid_rows_only)
+            run.status = "executing"
+            run.stage = "executing"
+            run.progress = 0
+            run.confirmed_at = utcnow()
+            run.error_code = None
+            run.error_message = None
+            from app.application.elt.audit import record_elt_audit
+
+            record_elt_audit(
+                db,
+                actor=owner_user_id,
+                action="elt_confirm",
+                payload={
+                    "run_id": run.id,
+                    "upload_id": run.upload_id,
+                    "file_sha256": run.file_sha256,
+                    "target_type": run.target_type,
+                    "preview_revision": preview_revision,
+                    "valid_rows_only": valid_rows_only,
+                    "outcome": "confirmed",
+                },
+            )
+            tenant_id = tenant_id_for_write()
+            db.commit()
+            committed = True
+        finally:
+            try:
+                # Rejected approval must not leave a durable lease or fail the run.
+                if not committed:
+                    db.rollback()
+            finally:
+                unbind_owner(db)
+        try:
+            self._submit_execution(
+                run.id, tenant_id, owner_user_id, valid_rows_only, operation_token=operation.token
+            )
+        except RECOVERABLE_ERRORS as exc:
+            code, message = safe_error(exc)
+            fail_operation(db, operation, code=code, message=message)
+            raise
+        db.expire_all()
+        return cast("dict[str, Any]", self.get_run(db, run_id=run.id, owner_user_id=owner_user_id))
+
+    def _submit_execution(
+        self,
+        run_id: str,
+        tenant_id: int,
+        owner_user_id: int,
+        valid_rows_only: bool,
+        *,
+        operation_token: str | None = None,
+    ) -> None:
+        with SUBMITTED_LOCK:
+            if run_id in SUBMITTED and operation_token is None:
+                return
+            SUBMITTED.add(run_id)
+
+        def work() -> None:
+            try:
+                with tenant_scope(tenant_id):
+                    self._execute_worker(
+                        run_id, owner_user_id, valid_rows_only, operation_token=operation_token
+                    )
+            finally:
+                with SUBMITTED_LOCK:
+                    SUBMITTED.discard(run_id)
+
+        EXECUTOR.submit(copy_context().run, work)
+
+    def _execute_worker(
+        self,
+        run_id: str,
+        owner_user_id: int,
+        valid_rows_only: bool,
+        *,
+        operation_token: str | None = None,
+    ) -> None:
+        db = new_session()
+        started_at = time.monotonic()
+        operation: OperationOwner | None = None
+        external_started = False
+        try:
+            run = self._owned_run(db, run_id, owner_user_id)
+            adapter = get_adapter(run.target_type)
+            batch_executor = getattr(adapter, "execute_batch", None)
+            # Row adapters inherit a rejecting batch stub; only an implementation
+            # override may enter the external-effect path.
+            uses_batch = (
+                callable(batch_executor)
+                and getattr(batch_executor, "__func__", batch_executor)
+                is not TargetAdapter.execute_batch
+            )
+            kind = "batch_execute" if uses_batch else "execute"
+            operation = (
+                activate_operation(db, run, kind, operation_token)
+                if operation_token
+                else claim_operation(
+                    db, run, kind, allowed_statuses={"executing"}, require_unrolled_back=True
+                )
+            )
+            bind_owner(db, operation)
+            db.commit()
+            # Recheck after queueing and dispatch using this exact target snapshot.
+            target_config = verify_execution(db, run, valid_rows_only=valid_rows_only)
+            upload = self._execution_upload(db, run, owner_user_id)
+            draft = load_json(run.draft_json, {})
+
+            eligible_filters = (
+                EltRunRow.run_id == run.id,
+                EltRunRow.owner_user_id == owner_user_id,
+                EltRunRow.final_action.in_(["new", "update"]),
+                or_(
+                    EltRunRow.execution_status.is_(None),
+                    EltRunRow.execution_status.not_in(["success", "rolled_back"]),
+                ),
+            )
+            eligible_count = db.query(EltRunRow).filter(*eligible_filters).count()
+            if run.target_type == "attendance":
+                AttendanceAdapter.require_complete_selection(
+                    eligible_count, run.total_rows, skip_rows=int(run.skip_rows or 0)
+                )
+                run.stage = "persisting"
+                db.commit()
+            context = self._row_context(run, upload, 0)
+            context["skip_rows"] = int(run.skip_rows or 0)
+            context["_execution_cache"] = {}
+            context["row_count"] = eligible_count
+            context["total_rows"] = run.total_rows
+            context["output_headers"] = [
+                str(item.get("target") or "")
+                for item in draft.get("field_mappings") or []
+                if str(item.get("target") or "")
+            ]
+            if run.target_type in {"export_xlsx", "export_csv"}:
+                from app.application.elt.result_export import export_context
+
+                features = load_json(run.source_features_json, {})
+                first_sheet = (
+                    db.query(EltRunRow.source_sheet)
+                    .filter(
+                        EltRunRow.run_id == run.id,
+                        EltRunRow.owner_user_id == owner_user_id,
+                    )
+                    .order_by(EltRunRow.id)
+                    .limit(1)
+                    .scalar()
+                )
+                context.update(export_context(draft, adapter, features, str(first_sheet or "")))
+            if target_config:
+                context["target_config"] = {
+                    "endpoint_url": target_config["endpoint_url"],
+                    "headers": target_config["headers"],
+                    "secret_ref": target_config["secret_ref"],
+                }
+
+            def progress_callback(processed: int, total: int) -> None:
+                current = self._owned_run(db, run_id, owner_user_id)
+                current.progress = min(99, int(processed / max(1, total) * 100))
+                db.commit()
+
+            context["progress_callback"] = progress_callback
+            if uses_batch:
+                previous = (
+                    db.query(EltRunRow)
+                    .filter(
+                        EltRunRow.run_id == run.id,
+                        EltRunRow.owner_user_id == owner_user_id,
+                        EltRunRow.execution_status == "success",
+                    )
+                    .count()
+                )
+
+                def normalized_rows():
+                    last_id = 0
+                    page_size = 500
+                    max_pages = (MAX_ROWS + page_size - 1) // page_size + 1
+                    for _page_number in range(max_pages):
+                        page = (
+                            db.query(EltRunRow)
+                            .filter(*eligible_filters, EltRunRow.id > last_id)
+                            .order_by(EltRunRow.id)
+                            .limit(page_size)
+                            .all()
+                        )
+                        if not page:
+                            break
+                        for row in page:
+                            last_id = row.id
+                            payload = load_json(row.normalized_json, {})
+                            if run.target_type == "attendance" and isinstance(payload, dict):
+                                provenance = load_json(row.provenance_json, {})
+                                payload = {
+                                    **payload,
+                                    "source_row": row.source_row,
+                                    "source_sheet": row.source_sheet,
+                                    "slice_id": (provenance.get("slice") or {}).get("slice_id"),
+                                    "validation_result": load_json(row.validation_json, []),
+                                }
+                            yield payload
+
+                external_started = True
+                result = adapter.execute_batch(normalized_rows(), context)
+                db.query(EltRunRow).filter(*eligible_filters).update(
+                    {
+                        EltRunRow.execution_status: "success",
+                        EltRunRow.execution_error_code: None,
+                        EltRunRow.execution_error_message: None,
+                    },
+                    synchronize_session=False,
+                )
+                executed = result.get("executed")
+                run.executed_rows = previous + int(eligible_count if executed is None else executed)
+                run.receipt_json = dump_json(result.get("receipt") or {})
+                db.commit()
+            else:
+                eligible = (
+                    db.query(EltRunRow).filter(*eligible_filters).order_by(EltRunRow.id).all()
+                )
+                self._execute_rows(
+                    db,
+                    run,
+                    upload,
+                    adapter,
+                    eligible,
+                    set(draft.get("allowed_update_fields") or []),
+                    context,
+                )
+            run = self._owned_run(db, run_id, owner_user_id)
+            rows_written = (
+                int(run.executed_rows or 0) + int(run.new_rows or 0) + int(run.update_rows or 0)
+            )
+            if run.target_type == "attendance":
+                receipt_now = load_json(run.receipt_json, {})
+                output_path = Path(str(receipt_now.get("output_path") or ""))
+                if not output_path.is_file():
+                    raise EltError("ELT_OUTPUT_MISSING", "考勤结果文件未生成")
+                import hashlib
+
+                actual = hashlib.sha256(output_path.read_bytes()).hexdigest()
+                if receipt_now.get("sha256") and receipt_now.get("sha256") != actual:
+                    raise EltError("ELT_OUTPUT_HASH_MISMATCH", "考勤结果文件与回执哈希不一致")
+            attendance_errors = run.target_type == "attendance" and int(run.error_rows or 0)
+            if attendance_errors and int(run.executed_rows or 0):
+                run.status = "partial"
+                run.stage = "partial"
+            elif attendance_errors and not int(run.executed_rows or 0):
+                run.status = "failed"
+                run.stage = "failed"
+            else:
+                run.status = "completed"
+                run.stage = "completed"
+            run.progress = 100
+            run.executed_at = utcnow()
+            receipt = load_json(run.receipt_json, {})
+            stored_entities = load_json(run.summary_json, {}).get("entities")
+            receipt.update(
+                {
+                    "run_id": run.id,
+                    "target_type": run.target_type,
+                    "executed_rows": run.executed_rows,
+                    "new_rows": run.new_rows,
+                    "update_rows": run.update_rows,
+                    "skip_rows": run.skip_rows,
+                    "error_rows": run.error_rows,
+                    "reversible": run.reversible,
+                    "partial": bool(valid_rows_only and run.error_rows),
+                    "rows_written": bool(rows_written),
+                    **(
+                        {
+                            "entities": {
+                                key: int(stored_entities.get(key) or 0)
+                                for key in (
+                                    "customers",
+                                    "purchase_units",
+                                    "products",
+                                    "records",
+                                )
+                            }
+                        }
+                        if isinstance(stored_entities, dict)
+                        else {}
+                    ),
+                }
+            )
+            if run.target_type == "shipment_records" and run.status in {"completed", "partial"}:
+                try:
+                    from app.application.elt.shipment_layout_fill import (
+                        write_committed_shipment_workbook,
+                    )
+
+                    produced = write_committed_shipment_workbook(db, run)
+                except BOUNDARY_ERRORS:
+                    logger.exception("shipment result workbook skipped for %s", run.id)
+                    produced = None
+                if produced:
+                    receipt.update(produced)
+            run.receipt_json = dump_json(receipt)
+            from app.application.elt.audit import record_elt_audit
+
+            wrote = int(run.executed_rows or 0)
+            if wrote:
+                record_elt_audit(
+                    db,
+                    actor=owner_user_id,
+                    action="elt_submit",
+                    payload={
+                        "run_id": run.id,
+                        "upload_id": run.upload_id,
+                        "file_sha256": run.file_sha256,
+                        "target_type": run.target_type,
+                        "outcome": "partial" if run.status != "completed" else "success",
+                        "executed_rows": wrote,
+                        "executed_at": run.executed_at.isoformat() if run.executed_at else None,
+                        "new_rows": run.new_rows,
+                        "update_rows": run.update_rows,
+                        "skip_rows": run.skip_rows,
+                        "error_rows": run.error_rows,
+                    },
+                )
+            if run.status == "failed":
+                record_elt_audit(
+                    db,
+                    actor=owner_user_id,
+                    action="elt_exception",
+                    payload={
+                        "run_id": run.id,
+                        "upload_id": run.upload_id,
+                        "target_type": run.target_type,
+                        "outcome": "failed",
+                        "error_code": run.error_code,
+                        "executed_rows": wrote,
+                    },
+                )
+            finish_operation(db, operation)
+            db.commit()
+            self._record_execution_metrics(run, started_at, "success")
+        except BOUNDARY_ERRORS as exc:  # Task boundary; external effects retain unknown status.
+            db.rollback()
+            code, message = safe_error(exc)
+            try:
+                if operation is not None and fail_operation(
+                    db, operation, code=code, message=message, outcome_unknown=external_started
+                ):
+                    run = self._owned_run(db, run_id, owner_user_id)
+                    self._record_execution_metrics(run, started_at, "failed")
+            except RECOVERABLE_ERRORS:
+                db.rollback()
+                logger.exception("Unable to persist ETL execution failure for %s", run_id)
+        finally:
+            unbind_owner(db)
+            db.close()
+
+    @staticmethod
+    def _record_execution_metrics(run: EltRun, started_at: float, status: str) -> None:
+        try:
+            from app.utils.metrics import etl_run_duration_seconds, etl_runs_total
+
+            etl_runs_total.labels("execute", run.target_type, status).inc()
+            etl_run_duration_seconds.labels("execute", run.target_type).observe(
+                max(0.0, time.monotonic() - started_at)
+            )
+        except RECOVERABLE_ERRORS:
+            logger.debug("ETL execution metrics unavailable", exc_info=True)
+
+    def _execute_rows(
+        self,
+        db: Session,
+        run: EltRun,
+        upload: EltUpload,
+        adapter: TargetAdapter,
+        rows: list[EltRunRow],
+        allowed_updates: set[str],
+        base_context: dict[str, Any],
+    ) -> None:
+        executed = run.executed_rows
+        total = len(rows)
+        for chunk_start in range(0, total, 500):
+            chunk = rows[chunk_start : chunk_start + 500]
+            completed_in_chunk = 0
+            try:
+                for row in chunk:
+                    context = {
+                        **base_context,
+                        "source_row": row.source_row,
+                        "preview_before": load_json(row.before_json, {}),
+                    }
+                    result = adapter.execute_row(
+                        db,
+                        load_json(row.normalized_json, {}),
+                        action=row.final_action,
+                        match_ref=str(row.match_ref or ""),
+                        allowed_update_fields=allowed_updates,
+                        context=context,
+                    )
+                    row.match_ref = str(result.get("match_ref") or row.match_ref or "")
+                    row.after_json = dump_json(result.get("after") or load_json(row.after_json, {}))
+                    row.execution_status = "success"
+                    row.execution_error_code = None
+                    row.execution_error_message = None
+                    completed_in_chunk += 1
+                executed += completed_in_chunk
+                run.executed_rows = executed
+                run.progress = min(99, int((chunk_start + len(chunk)) / max(1, total) * 100))
+                db.commit()
+            except RECOVERABLE_ERRORS as exc:
+                if isinstance(exc, EltError) and exc.code == "ELT_OPERATION_LEASE_LOST":
+                    db.rollback()
+                    raise
+                failed_row_id = row.id
+                completed_row_ids = [item.id for item in chunk[:completed_in_chunk]]
+                db.rollback()
+                code, message = safe_error(exc)
+                for completed_row_id in completed_row_ids:
+                    completed_row = db.get(EltRunRow, completed_row_id)
+                    if completed_row is None:
+                        continue
+                    context = {
+                        **base_context,
+                        "source_row": completed_row.source_row,
+                        "preview_before": load_json(completed_row.before_json, {}),
+                    }
+                    result = adapter.execute_row(
+                        db,
+                        load_json(completed_row.normalized_json, {}),
+                        action=completed_row.final_action,
+                        match_ref=str(completed_row.match_ref or ""),
+                        allowed_update_fields=allowed_updates,
+                        context=context,
+                    )
+                    completed_row.match_ref = str(
+                        result.get("match_ref") or completed_row.match_ref or ""
+                    )
+                    completed_row.after_json = dump_json(
+                        result.get("after") or load_json(completed_row.after_json, {})
+                    )
+                    completed_row.execution_status = "success"
+                    completed_row.execution_error_code = None
+                    completed_row.execution_error_message = None
+                if completed_row_ids:
+                    executed += len(completed_row_ids)
+                    replay_run = self._owned_run(db, run.id, run.owner_user_id)
+                    replay_run.executed_rows = executed
+                    db.commit()
+                failed_row = db.get(EltRunRow, failed_row_id)
+                if failed_row:
+                    failed_row.execution_status = "failed"
+                    failed_row.execution_error_code = code
+                    failed_row.execution_error_message = message[:500]
+                run = self._owned_run(db, run.id, run.owner_user_id)
+                run.executed_rows = executed
+                if executed:
+                    if run.executed_at is None:
+                        run.executed_at = utcnow()
+                    from app.application.elt.audit import record_elt_audit
+
+                    record_elt_audit(
+                        db,
+                        actor=run.owner_user_id,
+                        action="elt_submit",
+                        payload={
+                            "run_id": run.id,
+                            "upload_id": run.upload_id,
+                            "file_sha256": run.file_sha256,
+                            "target_type": run.target_type,
+                            "outcome": "partial",
+                            "executed_rows": executed,
+                            "executed_at": run.executed_at.isoformat(),
+                            "error_code": code,
+                            "failed_source_row": failed_row.source_row if failed_row else None,
+                        },
+                    )
+                db.commit()
+                raise
+
+    def retry(self, db: Session, *, run_id: str, owner_user_id: int) -> dict[str, Any]:
+        run = self._owned_run(db, run_id, owner_user_id)
+        if run.status not in {"failed", "interrupted"}:
+            raise EltConflict("ELT_RETRY_NOT_ALLOWED", "当前运行无需重试")
+        if run.rollback_status == "completed":
+            raise EltConflict("ELT_ALREADY_ROLLED_BACK", "本次运行已经撤销，不能重试")
+        source_snapshot = self._load_source_snapshot(db, run)
+        if source_snapshot is not None:
+            source_snapshot.close()
+        operation = claim_operation(
+            db,
+            run,
+            "preview_queue",
+            allowed_statuses={"failed", "interrupted"},
+            require_unrolled_back=True,
+        )
+        bind_owner(db, operation)
+        db.refresh(run)
+        invalidate_preview(run)
+        run.status = "previewing"
+        # A committed snapshot resumes at transformation; incomplete historical
+        # imports must be extracted again, never certified just by their row count.
+        rerun_parse = run.executed_rows == 0
+        run.stage = (
+            "transforming"
+            if source_snapshot is not None
+            else ("parsing" if rerun_parse else "validating")
+        )
+        run.progress = 20 if source_snapshot is not None or not rerun_parse else 5
+        run.error_code = None
+        run.error_message = None
+        tenant_id = tenant_id_for_write()
+        db.commit()
+        unbind_owner(db)
+        try:
+            from app.utils.metrics import etl_retries_total
+
+            etl_retries_total.labels(run.target_type).inc()
+        except RECOVERABLE_ERRORS:
+            logger.debug("ETL retry metrics unavailable", exc_info=True)
+        if rerun_parse:
+            self._submit_preview(run_id, tenant_id, owner_user_id, operation_token=operation.token)
+        else:
+            self._submit_revalidation(
+                run_id, tenant_id, owner_user_id, operation_token=operation.token
+            )
+        db.expire_all()
+        return cast("dict[str, Any]", self.get_run(db, run_id=run_id, owner_user_id=owner_user_id))

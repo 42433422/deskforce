@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+# 服务器端：按 manifest 镜像 digest 执行 docker compose pull/up → 健康检查 → 失败回滚。
+#
+# 环境变量:
+#   FHD_DEPLOY_ROOT        默认 /opt/fhd-full
+#   FHD_COMPOSE_FILE       默认 $DEPLOY_ROOT/docker/docker-compose.fhd-prod.yml
+#   FHD_API_IMAGE          镜像仓库（无 digest）
+#   FHD_API_IMAGE_DIGEST   sha256:...
+#   FHD_HEALTH_PORT        默认 5100
+#   FHD_ENV_FILE           默认 /root/fhd-full.env
+#   FHD_USE_BUNDLED_REDIS  1 时加 --profile bundled-redis
+#   FHD_IMAGE_TARBALL      可选，update 站 fhd-api-image.tar.gz（GHCR pull 失败时加载）
+#   FHD_ARTIFACT_DIR       默认同 manifest 目录，用于查找 fhd-api-image.tar.gz
+#   FHD_GIT_SHA            manifest git_sha（tar load 打 tag 用）
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+if [[ -f "$SCRIPT_DIR/lib/deploy_emit.sh" ]]; then
+  # shellcheck source=lib/deploy_emit.sh
+  . "$SCRIPT_DIR/lib/deploy_emit.sh"
+else
+  deploy_emit() { echo "[deploy] $*"; }
+fi
+if [[ -f "$SCRIPT_DIR/lib/autonomy_gate.sh" ]]; then
+  # shellcheck source=lib/autonomy_gate.sh
+  . "$SCRIPT_DIR/lib/autonomy_gate.sh"
+else
+  echo "[deploy] ERROR: autonomy gate bridge is missing" >&2
+  exit 78
+fi
+if [[ -f "$SCRIPT_DIR/lib/verify_release_identity.sh" ]]; then
+  # shellcheck source=lib/verify_release_identity.sh
+  . "$SCRIPT_DIR/lib/verify_release_identity.sh"
+else
+  echo "[deploy] ERROR: release identity verifier is missing" >&2
+  exit 78
+fi
+export DEPLOY_SCRIPT_ID="fhd_apply_release_compose"
+
+DEPLOY_ROOT="${FHD_DEPLOY_ROOT:-/opt/fhd-full}"
+COMPOSE_FILE="${FHD_COMPOSE_FILE:-$DEPLOY_ROOT/docker/docker-compose.fhd-prod.yml}"
+HEALTH_PORT="${FHD_HEALTH_PORT:-5100}"
+ENV_FILE="${FHD_ENV_FILE:-/root/fhd-full.env}"
+LOG="${FHD_DEPLOY_LOG:-/var/log/fhd-auto-update.log}"
+EXPECTED_GIT_SHA="${FHD_GIT_SHA:-}"
+EXPECTED_ARTIFACT_SHA256="${FHD_ARTIFACT_SHA256:-}"
+EXPECTED_ADMIN_CONSOLE_SHA256="${FHD_ADMIN_CONSOLE_SHA256:-}"
+
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"
+}
+
+if [[ "${FHD_REQUIRE_EXACT_IDENTITY:-1}" == "1" \
+    && ( -z "$EXPECTED_GIT_SHA" || -z "$EXPECTED_ARTIFACT_SHA256" || -z "$EXPECTED_ADMIN_CONSOLE_SHA256" ) ]]; then
+  log "ERROR: Git, artifact and admin console identities are required"
+  exit 78
+fi
+
+docker_host_db_env() {
+  if [[ ! -f "$ENV_FILE" ]]; then
+    return 0
+  fi
+  local db vdb
+  db="$(grep -m1 '^DATABASE_URL=' "$ENV_FILE" | cut -d= -f2- || true)"
+  if [[ -n "$db" ]]; then
+    export DATABASE_URL="${db/@127.0.0.1:/@host.docker.internal:}"
+  fi
+  vdb="$(grep -m1 '^VECTOR_DB_URL=' "$ENV_FILE" | cut -d= -f2- || true)"
+  if [[ -n "$vdb" ]]; then
+    export VECTOR_DB_URL="${vdb/@127.0.0.1:/@host.docker.internal:}"
+  fi
+}
+
+resolve_local_image_ref() {
+  local tag_sha="${FHD_GIT_SHA:-${DIGEST#sha256:}}"
+  tag_sha="${tag_sha:0:12}"
+  if [[ -n "$tag_sha" ]] && docker image inspect "${IMAGE}:sha-${tag_sha}" >/dev/null 2>&1; then
+    export FHD_API_IMAGE_REF="${IMAGE}:sha-${tag_sha}"
+    log "使用本地 tag ref=${FHD_API_IMAGE_REF}"
+    return 0
+  fi
+  if docker image inspect "${IMAGE}@${DIGEST}" >/dev/null 2>&1; then
+    export FHD_API_IMAGE_REF="${IMAGE}@${DIGEST}"
+    return 0
+  fi
+  return 1
+}
+
+rollback_systemd() {
+  autonomy_evaluate_action "rollback_release" "rollback:systemd:${FHD_GIT_SHA:-unknown}"
+  log "回滚至 systemd tarball 模式"
+  docker compose "${COMPOSE_OPTS[@]}" down --remove-orphans 2>/dev/null || true
+  systemctl enable fhd-full.service 2>/dev/null || true
+  autonomy_evaluate_action "restart_service" "restart:rollback-systemd:${FHD_GIT_SHA:-unknown}"
+  systemctl restart fhd-full.service || systemctl start fhd-full.service || true
+}
+
+if ! command -v docker >/dev/null 2>&1; then
+  log "ERROR: 未安装 docker，无法 compose 部署"
+  deploy_emit apply failed "docker_missing"
+  exit 1
+fi
+
+if ! docker compose version >/dev/null 2>&1; then
+  log "ERROR: 需要 Docker Compose v2（docker compose）"
+  deploy_emit apply failed "compose_v2_missing"
+  exit 1
+fi
+
+IMAGE="${FHD_API_IMAGE:-}"
+DIGEST="${FHD_API_IMAGE_DIGEST:-}"
+if [[ -z "$IMAGE" || -z "$DIGEST" ]]; then
+  log "ERROR: FHD_API_IMAGE / FHD_API_IMAGE_DIGEST 未设置"
+  deploy_emit apply failed "missing_image"
+  exit 1
+fi
+
+if [[ ! -f "$COMPOSE_FILE" ]]; then
+  log "ERROR: compose 文件不存在: $COMPOSE_FILE"
+  deploy_emit apply failed "missing_compose"
+  exit 1
+fi
+
+PREV_DIGEST=""
+PREV_GIT_SHA=""
+PREV_ARTIFACT_SHA256=""
+PREV_ADMIN_CONSOLE_SHA256=""
+if [[ -f "$DEPLOY_ROOT/.deploy-image-digest" ]]; then
+  PREV_DIGEST="$(tr -d '[:space:]' < "$DEPLOY_ROOT/.deploy-image-digest")"
+fi
+[[ -f "$DEPLOY_ROOT/.deploy-git-sha" ]] \
+  && PREV_GIT_SHA="$(tr -d '[:space:]' < "$DEPLOY_ROOT/.deploy-git-sha")"
+[[ -f "$DEPLOY_ROOT/.deploy-sha256" ]] \
+  && PREV_ARTIFACT_SHA256="$(tr -d '[:space:]' < "$DEPLOY_ROOT/.deploy-sha256")"
+[[ -f "$DEPLOY_ROOT/.deploy-admin-console-sha256" ]] \
+  && PREV_ADMIN_CONSOLE_SHA256="$(tr -d '[:space:]' < "$DEPLOY_ROOT/.deploy-admin-console-sha256")"
+
+deploy_emit apply started "image=${IMAGE} digest=${DIGEST:0:19}..."
+log "开始 compose 发布 image=$IMAGE digest=${DIGEST:0:19}..."
+
+export FHD_API_IMAGE="$IMAGE"
+export FHD_API_IMAGE_DIGEST="$DIGEST"
+export FHD_ARTIFACT_SHA256="$EXPECTED_ARTIFACT_SHA256"
+export FHD_ADMIN_CONSOLE_SHA256="$EXPECTED_ADMIN_CONSOLE_SHA256"
+export FHD_GIT_SHA="$EXPECTED_GIT_SHA"
+export FHD_API_IMAGE_REF="${IMAGE}@${DIGEST}"
+export FHD_DEPLOY_ROOT="$DEPLOY_ROOT"
+export FHD_ENV_FILE="$ENV_FILE"
+docker_host_db_env
+
+COMPOSE_OPTS=(-f "$COMPOSE_FILE")
+if [[ "${FHD_USE_BUNDLED_REDIS:-0}" == "1" ]]; then
+  COMPOSE_OPTS+=(--profile bundled-redis)
+fi
+
+rollback_compose() {
+  local digest="$1"
+  if [[ -z "$digest" || -z "$PREV_GIT_SHA" || -z "$PREV_ARTIFACT_SHA256" || -z "$PREV_ADMIN_CONSOLE_SHA256" ]]; then
+    log "WARN: 上一版本身份不完整，跳过 compose 回滚"
+    return 1
+  fi
+  autonomy_evaluate_action "rollback_release" "rollback:compose:${digest:0:16}"
+  log "compose 回滚至 digest=${digest:0:19}..."
+  export FHD_API_IMAGE_DIGEST="$digest"
+  export FHD_GIT_SHA="$PREV_GIT_SHA"
+  export FHD_ARTIFACT_SHA256="$PREV_ARTIFACT_SHA256"
+  export FHD_ADMIN_CONSOLE_SHA256="$PREV_ADMIN_CONSOLE_SHA256"
+  export FHD_API_IMAGE_REF="${FHD_API_IMAGE}@${digest}"
+  docker compose "${COMPOSE_OPTS[@]}" pull fhd-api || true
+  docker compose "${COMPOSE_OPTS[@]}" up -d --pull never fhd-api || return 1
+  for _ in $(seq 1 30); do
+    if verify_release_health_identity \
+        "http://127.0.0.1:${HEALTH_PORT}${FHD_HEALTH_PATH:-/api/health}?lite=true" \
+        "$PREV_GIT_SHA" \
+        "$digest" \
+        "$PREV_ARTIFACT_SHA256" \
+        "$PREV_ADMIN_CONSOLE_SHA256"; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+deploy_emit pull started
+PULL_OK=0
+if docker compose "${COMPOSE_OPTS[@]}" pull fhd-api; then
+  PULL_OK=1
+elif resolve_local_image_ref; then
+  log "WARN: pull 失败但本地已有镜像，继续 up"
+  PULL_OK=1
+else
+  IMAGE_TAR="${FHD_IMAGE_TARBALL:-}"
+  if [[ -z "$IMAGE_TAR" && -n "${FHD_ARTIFACT_DIR:-}" ]]; then
+    IMAGE_TAR="${FHD_ARTIFACT_DIR}/fhd-api-image.tar.gz"
+  fi
+  if [[ -z "$IMAGE_TAR" ]]; then
+    IMAGE_TAR="/var/www/update/releases/stable/server/fhd-api-image.tar.gz"
+  fi
+  if [[ -n "$IMAGE_TAR" && -f "$IMAGE_TAR" ]]; then
+    log "尝试从 tar 加载镜像（无 GHCR PAT）: $IMAGE_TAR"
+    if FHD_IMAGE_TARBALL="$IMAGE_TAR" FHD_API_IMAGE="$IMAGE" FHD_API_IMAGE_DIGEST="$DIGEST" \
+      FHD_GIT_SHA="${FHD_GIT_SHA:-}" bash "$SCRIPT_DIR/fhd-load-release-image.sh"; then
+      if resolve_local_image_ref; then
+        PULL_OK=1
+      fi
+    fi
+  fi
+fi
+if [[ "$PULL_OK" != "1" ]]; then
+  log "ERROR: docker compose pull 失败且无本地镜像"
+  deploy_emit pull failed
+  rollback_compose "$PREV_DIGEST" || rollback_systemd
+  deploy_emit apply failed "pull_failed"
+  exit 1
+fi
+deploy_emit pull ok
+
+deploy_emit up started
+if ! docker compose "${COMPOSE_OPTS[@]}" up -d --pull never fhd-api; then
+  log "ERROR: docker compose up 失败"
+  deploy_emit up failed
+  rollback_compose "$PREV_DIGEST" || rollback_systemd
+  deploy_emit apply failed "up_failed"
+  exit 1
+fi
+deploy_emit up ok
+
+sleep "${FHD_HEALTH_INITIAL_SLEEP:-15}"
+
+API_CODE=000
+HEALTH_PATH="${FHD_HEALTH_PATH:-/api/health}"
+HEALTH_RETRIES="${FHD_HEALTH_RETRIES:-90}"
+HEALTH_INTERVAL="${FHD_HEALTH_INTERVAL:-3}"
+for _ in $(seq 1 "$HEALTH_RETRIES"); do
+  if verify_release_health_identity \
+      "http://127.0.0.1:${HEALTH_PORT}${HEALTH_PATH}?lite=true" \
+      "$EXPECTED_GIT_SHA" \
+      "$DIGEST" \
+      "$EXPECTED_ARTIFACT_SHA256" \
+      "$EXPECTED_ADMIN_CONSOLE_SHA256"; then
+    API_CODE=200
+    break
+  fi
+  sleep "$HEALTH_INTERVAL"
+done
+
+if [[ "$API_CODE" == "200" ]] && ! python3 "$SCRIPT_DIR/lib/verify_admin_console.py" \
+    --base-url "http://127.0.0.1:${HEALTH_PORT}/admin/" \
+    --expected-git-sha "$EXPECTED_GIT_SHA" \
+    --expected-sha256 "$EXPECTED_ADMIN_CONSOLE_SHA256"; then
+  API_CODE=admin_identity_mismatch
+fi
+
+if [[ "$API_CODE" != "200" ]]; then
+  log "ERROR: /api/health 未就绪 (code=$API_CODE)，尝试 compose 回滚"
+  rollback_compose "$PREV_DIGEST" || rollback_systemd
+  deploy_emit apply failed "health_check rollback"
+  exit 1
+fi
+
+echo "$DIGEST" > "$DEPLOY_ROOT/.deploy-image-digest"
+echo "$EXPECTED_GIT_SHA" > "$DEPLOY_ROOT/.deploy-git-sha"
+echo "$EXPECTED_ARTIFACT_SHA256" > "$DEPLOY_ROOT/.deploy-sha256"
+echo "$EXPECTED_ADMIN_CONSOLE_SHA256" > "$DEPLOY_ROOT/.deploy-admin-console-sha256"
+
+log "compose 发布成功 health=200 digest=${DIGEST:0:19}..."
+deploy_emit apply ok "port=$HEALTH_PORT mode=compose"

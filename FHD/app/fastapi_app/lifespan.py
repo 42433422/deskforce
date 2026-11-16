@@ -1,0 +1,576 @@
+"""FastAPI lifespan：数据库、Mod、NeuroBus 启动与关闭。"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from sqlalchemy.engine import make_url
+
+from app.db import get_runtime_engine
+from app.db.init_db import (
+    ensure_product_query_indexes,
+    ensure_sessions_account_meta_columns,
+    ensure_sessions_enterprise_entitlement_columns,
+    ensure_sessions_market_access_token_column,
+    ensure_sessions_market_refresh_token_column,
+    ensure_user_profile_columns,
+    init_approval_tables,
+    init_distillation_tables,
+    init_extract_logs_tables,
+    init_service_bridge_tables,
+    init_template_tables,
+    initialize_databases,
+)
+from app.db.init_tutorial import init_tutorial_v2_tables
+from app.fastapi_app.asset_install_lifecycle import (
+    start_paid_asset_installs,
+    stop_paid_asset_installs,
+)
+from app.fastapi_app.event_loop_noise import install_proactor_reset_filter
+from app.utils.operational_errors import RECOVERABLE_ERRORS
+
+from .node_role import passive_node_enabled
+from .sqlite_paths import is_sqlite_url, resolve_effective_database_url, sqlite_db_file_from_url
+
+logger = logging.getLogger(__name__)
+
+
+def _desktop_fast_start_enabled() -> bool:
+    raw = os.environ.get("XCAGI_DESKTOP_FAST_START", "1").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+def _parent_watchdog_pid() -> int | None:
+    """Electron 启动后端时写入 XCAGI_PARENT_PID；仅该场景启用看门狗。"""
+    raw = os.environ.get("XCAGI_PARENT_PID", "").strip()
+    if not raw.isdigit():
+        return None
+    pid = int(raw)
+    return pid if pid > 0 else None
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if os.name == "nt":
+        import ctypes
+
+        synchronize = 0x00100000
+        wait_timeout = 0x00000102
+        # Linux CI mypy stubs omit WinDLL; resolve at runtime on Windows only.
+        win_dll = getattr(ctypes, "WinDLL", None)
+        if win_dll is None:
+            return False
+        kernel32 = win_dll("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(synchronize, False, pid)
+        if not handle:
+            return False
+        try:
+            return bool(kernel32.WaitForSingleObject(handle, 0) == wait_timeout)
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+async def _watch_parent_process(pid: int) -> None:
+    """父进程（Electron）消失后主动退出，避免成为占住端口的孤儿后端。"""
+    while True:
+        await asyncio.sleep(2.0)
+        if not _pid_is_alive(pid):
+            logger.error("desktop parent process %s exited; terminating backend", pid)
+            os._exit(0)
+
+
+def _start_parent_watchdog() -> asyncio.Task | None:
+    pid = _parent_watchdog_pid()
+    if pid is None:
+        return None
+    return asyncio.create_task(_watch_parent_process(pid))
+
+
+def _start_agent_tasks(app: FastAPI) -> None:
+    if passive_node_enabled():
+        return
+    from app.application.agent_orchestrator.task_dispatcher import start_agent_task_dispatcher
+
+    app.state.agent_task_dispatcher = start_agent_task_dispatcher()
+
+
+def _stop_agent_tasks(app: FastAPI) -> None:
+    if not hasattr(app.state, "agent_task_dispatcher"):
+        return
+    from app.application.agent_orchestrator.task_dispatcher import stop_agent_task_dispatcher
+
+    stop_agent_task_dispatcher()
+    del app.state.agent_task_dispatcher
+
+
+def _log_ai_capability_status() -> None:
+    """启动时暴露模型路由与语义兜底配置，避免“有引擎没点火”无人察觉。"""
+    try:
+        from app.infrastructure.llm.model_router import get_model_router
+
+        status = get_model_router().status()
+        logger.info(
+            "model routing: enabled=%s default=%s small=%s large=%s",
+            status.get("enabled"),
+            status.get("default_tier"),
+            status.get("small_model"),
+            status.get("large_model"),
+        )
+    except RECOVERABLE_ERRORS:
+        logger.warning("model routing status unavailable", exc_info=True)
+
+    try:
+        from app.domain.shared_services.intent_semantic_router import (
+            semantic_router_status,
+        )
+
+        semantic = semantic_router_status()
+        logger.info(
+            "intent semantic fallback: enabled=%s model=%s threshold=%s override=%s",
+            semantic.get("enabled"),
+            semantic.get("model"),
+            semantic.get("threshold"),
+            semantic.get("override_threshold"),
+        )
+    except RECOVERABLE_ERRORS:
+        logger.warning("intent semantic status unavailable", exc_info=True)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """FastAPI 应用生命周期管理"""
+    if getattr(app.state, "catalog_admission", None) is not None:
+        from .guarded_catalog import lifespan as guarded_lifespan
+
+        async with guarded_lifespan(app):
+            yield
+        return
+    logger.info("🚀 FastAPI 应用启动中...")
+
+    from app.fastapi_app.startup_timing import mark_startup
+
+    mark_startup("lifespan_begin")
+
+    install_proactor_reset_filter()
+
+    from app.neuro_async_bridge import set_neuro_main_loop
+
+    set_neuro_main_loop(asyncio.get_running_loop())
+
+    await asyncio.gather(
+        _init_mods_async(app),
+        _initialize_databases_async(app),
+    )
+
+    mark_startup("lifespan_db_done")
+
+    _log_ai_capability_status()
+
+    _start_agent_tasks(app)
+
+    start_paid_asset_installs()
+
+    try:
+        from app.application.desktop_admin_gate import purge_admin_sessions_on_desktop
+
+        purged = await asyncio.to_thread(purge_admin_sessions_on_desktop)
+        if purged:
+            logger.info("desktop admin gate: startup purged %s admin session(s)", purged)
+    except RECOVERABLE_ERRORS as exc:
+        logger.warning("desktop admin session purge skipped: %s", exc)
+
+    fast_start = _desktop_fast_start_enabled()
+
+    if fast_start:
+        from app.fastapi_app.deferred_startup import schedule_deferred_heavy_startup
+
+        await schedule_deferred_heavy_startup(app)
+    else:
+        try:
+            from app.mod_sdk.desktop_deliverable import ensure_deliverable_runtime
+
+            await ensure_deliverable_runtime(app)
+        except RECOVERABLE_ERRORS as exc:
+            logger.warning("Deliverable runtime setup skipped: %s", exc)
+
+        try:
+            from app.utils.performance.performance_initializer import init_performance_optimization
+
+            init_performance_optimization(app)
+            mark_startup("performance_optimizer_ready")
+        except RECOVERABLE_ERRORS as exc:
+            logger.warning("Performance optimizer init skipped: %s", exc)
+
+        await _init_neuro_ddd_async(app)
+        await _init_employee_runtime_async(app)
+        await _init_mobile_relay_desktop_async(app)
+
+        if not passive_node_enabled():
+            try:
+                from app.desktop_runtime.backup_scheduler import start_backup_scheduler
+
+                start_backup_scheduler()
+            except RECOVERABLE_ERRORS as exc:
+                logger.warning("⚠️ 桌面端定时备份调度器启动失败: %s", exc)
+            try:
+                from app.desktop_runtime.sync_outbox_scheduler import start_sync_outbox_scheduler
+
+                start_sync_outbox_scheduler()
+            except RECOVERABLE_ERRORS as exc:
+                logger.warning("⚠️ 同步 outbox 补推调度器启动失败: %s", exc)
+
+    mark_startup("lifespan_ready")
+    logger.info("✅ FastAPI 应用启动完成%s", "（重服务后台加载）" if fast_start else "")
+    try:
+        from app.desktop_runtime.process_memory import start_process_memory_guard
+
+        start_process_memory_guard()
+    except RECOVERABLE_ERRORS as exc:
+        logger.warning("desktop memory guard skipped: %s", exc)
+
+    parent_watchdog = _start_parent_watchdog()
+    try:
+        yield
+    finally:
+        if parent_watchdog is not None:
+            parent_watchdog.cancel()
+        try:
+            from app.desktop_runtime.process_memory import stop_process_memory_guard
+
+            stop_process_memory_guard()
+        except RECOVERABLE_ERRORS:
+            logger.debug("desktop memory guard stop skipped", exc_info=True)
+        # 无论正常关闭还是被注入异常（如 CancelledError）终止，都在 finally 中
+        # 完成全部清理，避免神经总线、监控循环与各调度线程在异常关闭路径下泄漏。
+        from app.fastapi_app.mod_startup import wait_for_background_mod_load
+
+        await asyncio.to_thread(wait_for_background_mod_load, app)
+        _stop_agent_tasks(app)
+        await stop_paid_asset_installs()
+        from app.fastapi_app.resource_cleanup import close_llm_http_clients
+
+        await close_llm_http_clients()
+
+        logger.info("🛑 FastAPI 应用关闭中...")
+        if fast_start:
+            from app.fastapi_app.deferred_startup import cancel_deferred_heavy_startup
+
+            await cancel_deferred_heavy_startup(app)
+        try:
+            from app.desktop_runtime.backup_scheduler import stop_backup_scheduler
+
+            stop_backup_scheduler()
+        except RECOVERABLE_ERRORS as exc:
+            logger.warning("⚠️ 桌面端定时备份调度器关闭失败: %s", exc)
+        try:
+            from app.desktop_runtime.sync_outbox_scheduler import stop_sync_outbox_scheduler
+
+            stop_sync_outbox_scheduler()
+        except RECOVERABLE_ERRORS as exc:
+            logger.warning("⚠️ 同步 outbox 补推调度器关闭失败: %s", exc)
+        try:
+            from app.application.employee_runtime.scheduler import stop_employee_scheduler
+
+            stop_employee_scheduler()
+            logger.info("✅ 员工本地调度器已关闭")
+        except RECOVERABLE_ERRORS as e:
+            logger.warning("⚠️ 员工本地调度器关闭失败: %s", e)
+        try:
+            from app.domain.shared_services.mobile_relay_desktop_client import (
+                stop_desktop_relay_poller,
+            )
+
+            stop_desktop_relay_poller()
+            logger.info("✅ 移动端云中继轮询已关闭")
+        except RECOVERABLE_ERRORS as e:
+            logger.warning("⚠️ 移动端云中继轮询关闭失败: %s", e)
+        try:
+            from app.neuro_bus.bus_setup import teardown_neuro_bus
+
+            await teardown_neuro_bus()
+            logger.info("✅ 神经总线已关闭")
+            try:
+                from app.neuro_bus.health_monitor import get_health_monitor
+
+                get_health_monitor().stop_monitoring()
+                task = getattr(app.state, "neuro_health_monitor_task", None)
+                if task and not task.done():
+                    task.cancel()
+                logger.info("✅ HealthMonitor 监控循环已停止")
+            except RECOVERABLE_ERRORS as hm_err:
+                logger.warning("⚠️ HealthMonitor 关闭失败: %s", hm_err)
+        except RECOVERABLE_ERRORS as e:
+            logger.warning("⚠️ 神经总线关闭失败: %s", e)
+
+
+async def _initialize_databases_async(app: FastAPI):
+    """异步初始化数据库"""
+    db_url = str(getattr(app.state.config, "DATABASE_URL", "") or "").strip()
+    if db_url:
+        try:
+            safe = make_url(db_url).render_as_string(hide_password=True)
+        except (ValueError, TypeError):
+            safe = db_url
+        logger.info("初始化数据库... (DATABASE_URL=%s)", safe)
+    else:
+        logger.info("初始化数据库... (DATABASE_URL 未设置，使用默认策略)")
+
+    await asyncio.get_running_loop().run_in_executor(None, _initialize_databases_sync, app)
+
+
+def _run_ensure_ai_action_audit_table() -> None:
+    """Initialize audit DDL through a normal import that also works when frozen."""
+    from app.domain.shared_services.ai_action_audit_service import ensure_ai_action_audit_table
+
+    ensure_ai_action_audit_table()
+
+
+def _initialize_databases_sync(app: FastAPI):
+    """同步数据库初始化（在后台线程中执行）"""
+    database_url = resolve_effective_database_url(getattr(app.state.config, "DATABASE_URL", None))
+    try:
+        if is_sqlite_url(database_url):
+            initialize_databases()
+            try:
+                from app.db.init_db import ensure_sqlite_per_mod_database_copies
+                from app.infrastructure.mods.mod_manager import get_mod_manager
+
+                mm = get_mod_manager()
+                ids = [m.id for m in (mm.list_loaded_mods() or []) if getattr(m, "id", None)]
+                if not ids:
+                    ids = [m.id for m in mm.scan_mods() if getattr(m, "id", None)]
+                ensure_sqlite_per_mod_database_copies(ids)
+            except RECOVERABLE_ERRORS as mod_db_exc:
+                logger.warning("SQLite 按 Mod 拆分母库副本时跳过: %s", mod_db_exc)
+            sqlite_file = sqlite_db_file_from_url(database_url)
+            if sqlite_file:
+                init_template_tables(sqlite_file)
+            else:
+                init_template_tables()
+
+        engine = get_runtime_engine()
+
+        init_distillation_tables(engine)
+        init_extract_logs_tables(engine)
+        ensure_product_query_indexes(engine)
+        cfg_db_url = database_url
+        from app.db.init_db import ensure_runtime_auth_bootstrap
+
+        ensure_runtime_auth_bootstrap(engine, database_url=cfg_db_url or None)
+        from app.db import get_host_engine
+        from app.db.tenant_rbac_bootstrap import ensure_tenant_rbac_schema
+
+        ensure_tenant_rbac_schema(get_host_engine())
+        ensure_sessions_market_access_token_column(engine, database_url=cfg_db_url or None)
+        ensure_sessions_market_refresh_token_column(engine, database_url=cfg_db_url or None)
+        ensure_sessions_enterprise_entitlement_columns(engine, database_url=cfg_db_url or None)
+        ensure_sessions_account_meta_columns(engine, database_url=cfg_db_url or None)
+        ensure_user_profile_columns(engine, database_url=cfg_db_url or None)
+        try:
+            from app.db.init_db import ensure_users_tenant_id_column
+
+            ensure_users_tenant_id_column(engine, database_url=cfg_db_url or None)
+        except (ImportError, AttributeError) as tenant_err:
+            logger.warning("users.tenant_id 自检函数不可用，已跳过: %s", tenant_err)
+        try:
+            from app.db.init_db import ensure_business_tenant_id_columns
+
+            ensure_business_tenant_id_columns(engine, database_url=cfg_db_url or None)
+        except (ImportError, AttributeError) as biz_tenant_err:
+            logger.warning("业务表 tenant_id 自检函数不可用，已跳过: %s", biz_tenant_err)
+        try:
+            init_approval_tables(engine)
+        except RECOVERABLE_ERRORS as approval_err:
+            logger.warning("approval 表初始化失败（不影响主流程）: %s", approval_err)
+        try:
+            init_tutorial_v2_tables(engine)
+        except RECOVERABLE_ERRORS as tutorial_err:
+            logger.warning("tutorial v2 表初始化失败（不影响主流程）: %s", tutorial_err)
+        try:
+            init_service_bridge_tables(engine)
+        except RECOVERABLE_ERRORS as bridge_err:
+            logger.warning("service_bridge 表初始化失败（不影响主流程）: %s", bridge_err)
+
+        try:
+            from app.db.init_db import init_persona_tables
+
+            init_persona_tables(engine)
+        except RECOVERABLE_ERRORS as persona_err:
+            logger.warning("persona 表初始化失败（不影响主流程）: %s", persona_err)
+
+        if not is_sqlite_url(database_url):
+            try:
+                from app.db.ensure_mod_postgres import ensure_postgres_per_mod_databases
+                from app.infrastructure.mods.mod_manager import get_mod_manager
+
+                mm = get_mod_manager()
+                mod_ids = [m.id for m in (mm.list_loaded_mods() or []) if getattr(m, "id", None)]
+                if not mod_ids:
+                    mod_ids = [m.id for m in mm.scan_mods() if getattr(m, "id", None)]
+                created = ensure_postgres_per_mod_databases(mod_ids=mod_ids, migrate_new=True)
+                if created:
+                    logger.info("已自动创建并迁移 Mod 分库: %s", ", ".join(created))
+            except RECOVERABLE_ERRORS as mod_pg_exc:
+                logger.warning("PostgreSQL Mod 分库自检跳过: %s", mod_pg_exc)
+
+        try:
+            _run_ensure_ai_action_audit_table()
+            from app.runtime_integrity import clear_runtime_issue
+
+            clear_runtime_issue("ai_action_audit")
+        except RECOVERABLE_ERRORS:
+            from app.runtime_integrity import record_runtime_issue
+
+            record_runtime_issue("ai_action_audit", "AI action audit unavailable", ttl_seconds=3600)
+            logger.exception("AI审计表初始化失败（不影响主流程）")
+    except RECOVERABLE_ERRORS as e:
+        safe_url = str(database_url or "").strip()
+        try:
+            if safe_url:
+                safe_url = make_url(safe_url).render_as_string(hide_password=True)
+        except (ValueError, TypeError):
+            pass
+        logger.exception("数据库初始化失败 (DATABASE_URL=%s): %s", safe_url or "<default>", e)
+        if is_sqlite_url(database_url):
+            raise RuntimeError(
+                "本地数据库初始化失败：请检查 userData/data/xcagi.db 权限或磁盘空间。"
+            ) from e
+        raise RuntimeError(
+            "数据库初始化失败：请确认 PostgreSQL 已启动且 DATABASE_URL 可连通。"
+        ) from e
+
+
+async def _init_neuro_ddd_async(app: FastAPI):
+    """异步初始化 NeuroBus，并注册默认意图域（与对话意图桥接共用）。"""
+    import os
+
+    if passive_node_enabled():
+        logger.info("被动应用节点：跳过 NeuroBus 后台运行时")
+        return
+    raw = os.environ.get("XCAGI_NEURO_INTENT", "1").strip().lower()
+    if raw in {"0", "false", "off", "no"}:
+        logger.info(
+            "神经总线未启用（XCAGI_NEURO_INTENT=%s）", os.environ.get("XCAGI_NEURO_INTENT", "")
+        )
+        return
+    try:
+        from app.neuro_bus.bus_setup import get_neuro_bus_manager
+        from app.neuro_bus.register_runtime import register_neuro_runtime
+
+        bus = await register_neuro_runtime()
+        app.state.neuro_bus = bus
+        app.state.neuro_bus_manager = get_neuro_bus_manager()
+        logger.info("✅ 神经总线已启动，域: %s", bus.registered_domains)
+        try:
+            from app.neuro_bus.health_monitor import configure_runtime_health_monitor
+
+            monitor, durable = configure_runtime_health_monitor()
+            app.state.neuro_health_monitor_task = asyncio.create_task(monitor.start_monitoring())
+            logger.info("✅ HealthMonitor 监控循环已启动 (durable_remediation=%s)", durable)
+        except RECOVERABLE_ERRORS as hm_err:
+            logger.warning("⚠️ HealthMonitor 启动失败: %s", hm_err)
+
+        # 注册认知层 / 潜意识层 / 进化层 handler（Phase 2-4 接线）
+        try:
+            from app.domain.neuro.register_cognition_handlers import register_cognition_handlers
+
+            cognition_result = register_cognition_handlers()
+            app.state.neuro_cognition = cognition_result
+            if cognition_result.get("enabled"):
+                logger.info(
+                    "✅ 认知层 handler 已注册（%d 个）",
+                    cognition_result.get("handler_count", 0),
+                )
+        except RECOVERABLE_ERRORS as cog_err:
+            logger.warning("⚠️ 认知层 handler 注册失败: %s", cog_err)
+    except RECOVERABLE_ERRORS as e:
+        logger.warning("⚠️ 神经总线初始化失败: %s", e)
+
+
+async def _init_employee_runtime_async(app: FastAPI):
+    """Initialize local AI employee triggers and cron scheduler."""
+    from app.mod_sdk.product_plane import automatic_employee_runtime_enabled
+
+    if not automatic_employee_runtime_enabled():
+        app.state.employee_triggers = {
+            "registered": [],
+            "active_employees": [],
+            "disabled_by_product_plane": True,
+        }
+        app.state.employee_scheduler = {
+            "running": False,
+            "disabled_by_product_plane": True,
+        }
+        logger.info("enterprise client: employee triggers and scheduler are disabled")
+        return
+    if passive_node_enabled():
+        logger.info("被动应用节点：跳过员工触发器与本地调度器")
+        return
+    try:
+        from app.application.employee_runtime.scheduler import start_employee_scheduler
+        from app.application.employee_runtime.triggers import refresh_employee_triggers
+
+        trigger_status = await asyncio.to_thread(refresh_employee_triggers)
+        scheduler_status = await asyncio.to_thread(start_employee_scheduler)
+        app.state.employee_triggers = trigger_status
+        app.state.employee_scheduler = scheduler_status
+        logger.info(
+            "✅ 员工运行时已启动 triggers=%d scheduler_running=%s",
+            len(trigger_status.get("registered") or []),
+            scheduler_status.get("running"),
+        )
+    except RECOVERABLE_ERRORS as e:
+        logger.warning("⚠️ 员工运行时初始化失败: %s", e)
+
+
+async def _init_mobile_relay_desktop_async(app: FastAPI):
+    """Resume desktop relay polling when this runtime has a saved cloud binding."""
+    if passive_node_enabled():
+        logger.info("被动应用节点：跳过移动端云中继轮询")
+        return
+    try:
+        from app.domain.shared_services.mobile_relay_desktop_client import (
+            _migrate_legacy_config_once,
+            start_desktop_relay_poller,
+        )
+
+        # 源码升级后，旧的仓库根回落配置一次性迁移到稳定路径，保住既有配对，
+        # 再恢复轮询（否则桌面会以与手机已配对 relay 不同的身份去 poll，任务卡在「排队中」）。
+        await asyncio.to_thread(_migrate_legacy_config_once)
+        running = await asyncio.to_thread(start_desktop_relay_poller)
+        app.state.mobile_relay_desktop_running = running
+        if running:
+            logger.info("✅ 移动端云中继轮询已启动")
+    except RECOVERABLE_ERRORS as e:
+        logger.warning("⚠️ 移动端云中继轮询启动失败: %s", e)
+
+
+async def _init_mods_async(app: FastAPI):
+    """初始化 Mod 扩展（create_fastapi_app 已分阶段挂载；此处仅补偿失败重试）。"""
+    if getattr(app.state, "mods_deferred_bootstrap", False):
+        logger.info("Mod bootstrap deferred; skipping lifespan mod init")
+        return
+    if getattr(app.state, "mods_full_load_done", False):
+        logger.info("Mod extensions fully loaded; skipping lifespan mod init")
+        return
+    if getattr(app.state, "mods_background_load_scheduled", False):
+        logger.info("Mod background load in progress; skipping lifespan duplicate load")
+        return
+    if getattr(app.state, "mods_routes_loaded", False):
+        logger.info("Mod routes staged; skipping lifespan full sync load")
+        return
+    try:
+        from app.fastapi_app.mod_startup import bootstrap_mod_extensions_sync
+
+        await asyncio.to_thread(bootstrap_mod_extensions_sync, app)
+        logger.info("✅ Mod 扩展分阶段加载已启动（lifespan 补偿路径）")
+    except RECOVERABLE_ERRORS as e:
+        logger.warning("⚠️ Mod 扩展初始化失败: %s", e)

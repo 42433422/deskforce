@@ -1,0 +1,64 @@
+import { api } from './core'
+import type { ApiResponse } from '@/types/api'
+
+export interface Industry {
+  id: number
+  name: string
+  code: string
+  description?: string
+  config?: Record<string, unknown>
+  [key: string]: unknown
+}
+
+type ShellReadOptions = { timeoutMs?: number; quiet?: boolean }
+
+export const systemApi = {
+  getIndustries(options: ShellReadOptions = {}): Promise<ApiResponse<Industry[]>> {
+    return api.get<ApiResponse<Industry[]>>('/api/system/industries', {}, { timeoutMs: 30_000, quiet: true, ...options })
+  },
+
+  getCurrentIndustry(options: ShellReadOptions = {}): Promise<ApiResponse<Industry>> {
+    return api.get<ApiResponse<Industry>>('/api/system/industry', {}, { timeoutMs: 30_000, quiet: true, ...options })
+  },
+
+  getIndustryDetail(industryId: number | string): Promise<ApiResponse<Industry>> {
+    return api.get<ApiResponse<Industry>>(`/api/system/industry/${industryId}`)
+  },
+
+  getSystemConfig(): Promise<ApiResponse<unknown>> {
+    return api.get<ApiResponse<unknown>>('/api/system/config')
+  },
+
+  getHostProfile(): Promise<ApiResponse<unknown>> {
+    return api.get<ApiResponse<unknown>>('/api/system/host-profile')
+  },
+
+  getIndustryPresets(): Promise<ApiResponse<unknown>> {
+    return api.get<ApiResponse<unknown>>('/api/system/industry-presets')
+  },
+
+  getWorkflowEmployeeCatalog(): Promise<ApiResponse<unknown>> {
+    return api.get<ApiResponse<unknown>>('/api/system/workflow-employee-catalog')
+  },
+
+  getEmployeeRegistryRules(): Promise<ApiResponse<unknown>> {
+    return api.get<ApiResponse<unknown>>('/api/system/employee-registry-rules')
+  },
+
+  /** 编制矩阵 SSOT 派生（areas/departments/labels/descriptions/all_planned_ids） */
+  getDutyRoster(): Promise<ApiResponse<DutyRosterData>> {
+    return api.get<ApiResponse<DutyRosterData>>('/api/system/duty-roster')
+  },
+}
+
+/** 后端 /api/system/duty-roster 返回的 SSOT 派生数据。 */
+export interface DutyRosterData {
+  areas: Record<string, { label: string; ids: string[] }>
+  departments: Record<string, unknown>
+  employee_labels: Record<string, string>
+  employee_descriptions: Record<string, string>
+  all_planned_ids: string[]
+  schema_version: number
+}
+
+export default systemApi

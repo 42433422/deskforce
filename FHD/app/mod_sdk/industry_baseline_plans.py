@@ -1,0 +1,385 @@
+"""Catalog promotion and baseline-plan assembly for industry onboarding."""
+
+from __future__ import annotations
+
+from typing import Any, cast
+
+
+def ensure_industries_selectable(catalog: dict[str, Any], industry_ids: set[str]) -> dict[str, Any]:
+    """Promote account/workspace industries into selectable catalog rows."""
+    from app.mod_sdk import industry_baseline as facade
+
+    wanted = {str(value).strip() for value in industry_ids if str(value or "").strip()}
+    if not wanted:
+        return catalog
+    open_packages = [
+        dict(package)
+        for package in (catalog.get("open_packages") or [])
+        if isinstance(package, dict)
+    ]
+    open_ids = {
+        str(package.get("industry_id") or "").strip()
+        for package in open_packages
+        if str(package.get("industry_id") or "").strip()
+    }
+    presets_doc: dict[str, Any] = {}
+    try:
+        from app.mod_sdk.host_profile import load_industry_presets_document
+
+        presets_doc = load_industry_presets_document()
+    except facade.RECOVERABLE_ERRORS:
+        presets_doc = {}
+    presets = (
+        cast("dict[str, Any]", presets_doc.get("presets"))
+        if isinstance(presets_doc.get("presets"), dict)
+        else {}
+    )
+    preview_packages: list[Any] = []
+    for package in catalog.get("preview_packages") or []:
+        industry_id = (
+            str(package.get("industry_id") or "").strip() if isinstance(package, dict) else ""
+        )
+        if industry_id and industry_id in wanted and industry_id not in open_ids:
+            row = dict(package)
+            row["selectable"] = True
+            open_packages.append(row)
+            open_ids.add(industry_id)
+        else:
+            preview_packages.append(package)
+    for industry_id in wanted:
+        if industry_id not in open_ids:
+            open_packages.append(
+                facade._onboarding_package_row(industry_id, selectable=True, presets=presets)
+            )
+            open_ids.add(industry_id)
+    result = dict(catalog)
+    result["open_packages"] = open_packages
+    result["preview_packages"] = preview_packages
+    result["open_industry_ids"] = [
+        str(package.get("industry_id") or "").strip()
+        for package in open_packages
+        if isinstance(package, dict) and str(package.get("industry_id") or "").strip()
+    ]
+    return result
+
+
+def delivery_statuses_for_session(session_id: str) -> dict[str, str]:
+    """Read only this session's entitled, identity-matched private delivery stages."""
+    from app.application.private_mod_delivery_progress import overall_status
+    from app.application.private_mod_delivery_state import STAGES, account_projects
+    from app.enterprise.private_delivery_binding import load_session_private_delivery_binding
+    from app.mod_sdk.customer_delivery import delivery_for_account_custom_mod
+    from app.utils.operational_errors import RECOVERABLE_ERRORS
+
+    try:
+        binding = load_session_private_delivery_binding(session_id)
+        uid = binding.get("market_user_id")
+        if not isinstance(uid, int) or isinstance(uid, bool) or uid <= 0:
+            return {}
+        username = str(binding.get("username") or "").strip().casefold()
+        targets: set[str] = set()
+        for mod_id in binding.get("mod_ids") or []:
+            row = delivery_for_account_custom_mod(mod_id)
+            if not row or row.get("delivery_mode") != "private_mod":
+                continue
+            owner = str(row.get("customer_account") or "").strip().casefold()
+            if owner and owner != username:
+                continue
+            if row.get("market_user_id") is not None and row["market_user_id"] != uid:
+                continue
+            targets.add(mod_id)
+        if not targets:
+            return {}
+        result: dict[str, str] = {}
+        for project in account_projects(f"market:{uid}", targets, strict=True):
+            mod_id = project.get("mod_id")
+            tracks = project.get("tracks")
+            if not isinstance(mod_id, str) or mod_id not in targets or not isinstance(tracks, dict):
+                continue
+            required = [tracks.get("modules", tracks.get("business")), tracks.get("employees")]
+            if any(
+                not isinstance(track, dict) or track.get("status") not in (*STAGES, "partial")
+                for track in required
+            ):
+                continue
+            selected = [
+                tracks[key] for key in ("modules", "business", "employees") if key in tracks
+            ]
+            if any(
+                not isinstance(track, dict) or not isinstance(track.get("nodes", {}), dict)
+                for track in selected
+            ):
+                continue
+            nodes = [node for track in selected for node in track.get("nodes", {}).values()]
+            if any(
+                not isinstance(node, dict) or node.get("status") not in STAGES for node in nodes
+            ):
+                continue
+            result[mod_id] = overall_status(project)
+        return result
+    except RECOVERABLE_ERRORS:
+        return {}
+
+
+def build_industry_baseline_plan(
+    industry_id: str,
+    installed_mod_ids: list[str] | None = None,
+    *,
+    entitled_mod_ids: set[str] | None = None,
+    skip_account_custom_gate: bool = False,
+    account_username: str = "",
+    delivery_statuses: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Assemble installation readiness for one industry and account."""
+    from app.mod_sdk import industry_baseline as facade
+    from app.mod_sdk.customer_delivery import delivery_for_account_custom_mod
+
+    document = facade.load_industry_baseline_document()
+    labels = {
+        str(key): str(value) for key, value in (document.get("mod_labels") or {}).items() if key
+    }
+    core_ids = facade._dedupe(
+        [str(value) for value in (document.get("core_mod_ids") or []) if value]
+    )
+    row = facade._industry_row(industry_id)
+    industry_key = str(industry_id or "").strip() or "通用"
+    required_ids = facade._dedupe(
+        core_ids + [str(value) for value in (row.get("host_mod_ids") or []) if value]
+    )
+    optional_ids = facade._dedupe(
+        [
+            str(value).strip()
+            for value in (row.get("optional_host_mod_ids") or [])
+            if str(value or "").strip() and str(value).strip() not in required_ids
+        ]
+    )
+    industry_package_mod_ids = facade._industry_package_mod_ids_for(industry_key)
+    capability_mod_ids = facade._industry_capability_mod_ids_for(row)
+    legacy_industry_mod_ids = (
+        []
+        if industry_package_mod_ids
+        else facade._dedupe([str(value) for value in (row.get("industry_mod_ids") or []) if value])
+    )
+    industry_package_group_mod_ids = facade._dedupe(
+        industry_package_mod_ids + legacy_industry_mod_ids
+    )
+    industry_mod_ids = facade._industry_mod_ids_for(industry_key, row)
+    installed = set(facade._installed_mod_ids() if installed_mod_ids is None else installed_mod_ids)
+
+    def item(
+        mod_id: str,
+        tier: str,
+        required: bool,
+        *,
+        show_mod_id: bool | None = None,
+        label: str | None = None,
+    ) -> dict[str, Any]:
+        visible_id = (
+            tier in ("core", "host", "optional", "account_custom")
+            if show_mod_id is None
+            else show_mod_id
+        )
+        resolved_label = label
+        if not resolved_label:
+            if tier == "account_custom":
+                from app.mod_sdk.customer_delivery import label_for_account_custom_mod
+
+                resolved_label = label_for_account_custom_mod(mod_id, industry_key)
+            elif tier == "custom":
+                resolved_label = facade._label_for_custom_mod(mod_id, industry_key, labels)
+            else:
+                resolved_label = facade._label_for_mod(mod_id, industry_key, labels)
+        delivery = (
+            delivery_for_account_custom_mod(mod_id, industry_key)
+            if tier == "account_custom"
+            else None
+        )
+        private_runtime = (
+            str(delivery.get("runtime_mod_id") or "").strip()
+            if delivery and delivery.get("delivery_mode") == "private_mod"
+            else None
+        )
+        entry = {
+            "mod_id": mod_id,
+            "label": resolved_label,
+            "tier": tier,
+            "required": required,
+            "installed": (
+                bool(private_runtime and private_runtime in installed)
+                if private_runtime is not None
+                else facade._mod_installed(mod_id, installed)
+            ),
+            "show_mod_id": visible_id,
+        }
+        if private_runtime is not None:
+            entry["runtime_mod_id"] = private_runtime
+            status = (delivery_statuses or {}).get(mod_id, "unknown")
+            deferred = not entry["installed"] and status in {
+                "production",
+                "testing",
+                "acceptance",
+                "rework",
+                "partial",
+            }
+            entry.update(delivery_status=status, delivery_deferred=deferred)
+            if deferred:
+                entry["required"] = False
+        return entry
+
+    custom_hint, _ = facade._custom_line_spec(
+        industry_package_group_mod_ids[0] if industry_package_group_mod_ids else ""
+    )
+    from app.mod_sdk.customer_delivery import account_custom_mod_ids_for_industry
+
+    account_custom_base = account_custom_mod_ids_for_industry(industry_key, entitled_mod_ids)
+    employee_extension_ids = (
+        facade._custom_employee_extension_ids(industry_key, row, document)
+        if account_custom_base
+        else []
+    )
+    account_custom_ids = facade._dedupe(account_custom_base + employee_extension_ids)
+    custom_mod_ids = facade._dedupe(industry_mod_ids + account_custom_ids)
+    groups: list[dict[str, Any]] = [
+        {
+            "id": "core",
+            "title": "侧栏对话底座",
+            "hint": "干净起步：侧栏挂上智能对话与智能生态入口（宿主桥接，非员工数据）",
+            "items": [item(mod_id, "core", True) for mod_id in core_ids],
+        },
+        {
+            "id": "host",
+            "title": "行业侧栏基础线",
+            "hint": "按行业补侧栏业务菜单与表格工具等宿主能力卡片（不含 AI 员工）",
+            "items": [
+                item(mod_id, "host", True) for mod_id in required_ids if mod_id not in core_ids
+            ],
+        },
+    ]
+    if industry_package_group_mod_ids:
+        groups.append(
+            {
+                "id": "industry_package",
+                "title": "行业包",
+                "hint": custom_hint or "行业通用 Mod：侧栏与业务门面（不含账号定制员工）",
+                "items": [
+                    item(mod_id, "industry_package", False, show_mod_id=False)
+                    for mod_id in industry_package_group_mod_ids
+                ],
+            }
+        )
+    if capability_mod_ids:
+        groups.append(
+            {
+                "id": "business_modules",
+                "title": "通用业务模块",
+                "hint": "与所属行业组合使用的通用模块；模块能力不会改写客户行业。",
+                "items": [
+                    item(mod_id, "business_module", False, show_mod_id=False)
+                    for mod_id in capability_mod_ids
+                ],
+            }
+        )
+    if account_custom_ids:
+        groups.append(
+            {
+                "id": "account_custom",
+                "title": "账号定制",
+                "hint": "账号定制 Mod：装齐后解锁定制能力与定制 AI 员工",
+                "items": [
+                    item(mod_id, "account_custom", True, show_mod_id=True)
+                    for mod_id in account_custom_ids
+                ],
+            }
+        )
+    groups.append(
+        {
+            "id": "optional",
+            "title": "可选增强",
+            "hint": "用到再装，不阻塞进入对话",
+            "items": [item(mod_id, "optional", False) for mod_id in optional_ids],
+        }
+    )
+    groups = [group for group in groups if group.get("items")]
+    flat_items = [entry for group in groups for entry in group["items"]]
+    missing_required = [
+        entry["mod_id"] for entry in flat_items if entry["required"] and not entry["installed"]
+    ]
+    missing_optional = [
+        entry["mod_id"]
+        for entry in flat_items
+        if not entry["required"] and not entry["installed"] and not entry.get("delivery_deferred")
+    ]
+    missing_industry = [
+        entry["mod_id"]
+        for entry in flat_items
+        if entry["tier"] in ("industry_package", "business_module", "custom")
+        and not entry["installed"]
+    ]
+    missing_account_custom = [
+        entry["mod_id"]
+        for entry in flat_items
+        if entry["tier"] == "account_custom" and not entry["installed"]
+    ]
+    deferred_ids = {entry["mod_id"] for entry in flat_items if entry.get("delivery_deferred")}
+    seed_packages: list[dict[str, Any]] = []
+    from app.mod_sdk.customer_delivery import delivery_seed_package_for_mod
+
+    for mod_id in facade._dedupe(industry_mod_ids + account_custom_ids):
+        if mod_id in deferred_ids:
+            continue
+        package = delivery_seed_package_for_mod(
+            mod_id,
+            industry_key,
+            account_username=account_username,
+        )
+        if not package:
+            continue
+        delivery = delivery_for_account_custom_mod(mod_id, industry_key)
+        seed_mod_id = (
+            str(delivery.get("runtime_mod_id") or "").strip()
+            if delivery and delivery.get("delivery_mode") == "private_mod"
+            else mod_id
+        )
+        if not seed_mod_id:
+            continue
+        seed_packages.append({**package, "mod_id": seed_mod_id})
+        for entry in flat_items:
+            if entry.get("mod_id") == mod_id:
+                entry["delivery_seed_package"] = dict(package)
+
+    host_ready = not missing_required
+    industry_ready = not missing_industry
+    account_ready = skip_account_custom_gate or not missing_account_custom
+    industry_package = None
+    package = facade._industry_package(industry_key)
+    if package.get("mod_id"):
+        industry_package = {
+            "mod_id": str(package.get("mod_id") or "").strip(),
+            "product_name": str(package.get("product_name") or "").strip(),
+        }
+    return {
+        "schema_version": 1,
+        "industry_id": industry_key,
+        "summary": str(row.get("summary") or "").strip(),
+        "industry_package": industry_package,
+        "groups": groups,
+        "required_mod_ids": required_ids,
+        "optional_mod_ids": optional_ids,
+        "industry_mod_ids": industry_mod_ids,
+        "industry_package_mod_ids": industry_package_mod_ids,
+        "capability_mod_ids": capability_mod_ids,
+        "custom_mod_ids": custom_mod_ids,
+        "missing_required_mod_ids": missing_required,
+        "missing_optional_mod_ids": missing_optional,
+        "missing_industry_mod_ids": missing_industry,
+        "account_custom_mod_ids": account_custom_ids,
+        "missing_account_custom_mod_ids": missing_account_custom,
+        "account_delivery_seed_packages": seed_packages,
+        "deferred_account_custom_mod_ids": sorted(deferred_ids),
+        "host_baseline_ready": host_ready,
+        "account_custom_ready": account_ready,
+        "custom_employee_extension_mod_ids": employee_extension_ids,
+        "baseline_ready": host_ready,
+        "full_stack_ready": host_ready and account_ready and industry_ready,
+        "industry_mod_ready": industry_ready,
+    }

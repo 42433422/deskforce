@@ -1,0 +1,156 @@
+import { apiFetch, DEFAULT_MOD_API_TIMEOUT_MS } from '@/utils/apiBase'
+import type {
+  DeliverableStatus,
+  EmployeePlannerStatus,
+  IndustryBaselinePlan,
+  OnboardingIndustryCatalog,
+  PlatformShellCapabilities,
+} from '@/constants/platformShell'
+
+let cached: PlatformShellCapabilities | null = null
+let deliverableCached: DeliverableStatus | null = null
+const baselineCache = new Map<string, IndustryBaselinePlan>()
+let onboardingCatalogCached: OnboardingIndustryCatalog | null = null
+
+function offlineIndustryBaseline(industryId: string): IndustryBaselinePlan {
+  return {
+    industry_id: industryId,
+    summary: '行业基线暂不可用',
+    groups: [],
+    required_mod_ids: [],
+    optional_mod_ids: [],
+    industry_mod_ids: [],
+    missing_required_mod_ids: [],
+    missing_optional_mod_ids: [],
+    missing_industry_mod_ids: [],
+    host_baseline_ready: false,
+    account_custom_ready: false,
+    baseline_ready: false,
+    full_stack_ready: false,
+    industry_mod_ready: false,
+  }
+}
+
+export async function fetchPlatformShellCapabilities(force = false): Promise<PlatformShellCapabilities> {
+  if (cached && !force) return cached
+  const r = await apiFetch('/api/platform-shell/capabilities', {
+    timeoutMs: DEFAULT_MOD_API_TIMEOUT_MS,
+  })
+  if (!r.ok) throw new Error(`platform-shell/capabilities HTTP ${r.status}`)
+  const body = await r.json()
+  const data = (body?.data || body) as PlatformShellCapabilities
+  cached = data
+  return data
+}
+
+export function isBridgeModInstalled(caps: PlatformShellCapabilities, modId: string): boolean {
+  const row = (caps.bridge_mods || []).find((b) => b.mod_id === modId)
+  return Boolean(row?.installed)
+}
+
+export async function fetchDeliverableStatus(force = false): Promise<DeliverableStatus> {
+  if (deliverableCached && !force) return deliverableCached
+  const r = await apiFetch('/api/platform-shell/deliverable-status', {
+    timeoutMs: DEFAULT_MOD_API_TIMEOUT_MS,
+  })
+  if (!r.ok) throw new Error(`deliverable-status HTTP ${r.status}`)
+  const body = await r.json()
+  const data = (body?.data || body) as DeliverableStatus
+  deliverableCached = data
+  return data
+}
+
+export function clearDeliverableStatusCache(): void {
+  deliverableCached = null
+  cached = null
+  baselineCache.clear()
+  onboardingCatalogCached = null
+  void import('@/utils/hostPackOnboardingGate')
+    .then(({ invalidateHostPackCompletionCache }) => invalidateHostPackCompletionCache())
+    .catch(() => {})
+}
+
+export async function fetchOnboardingIndustryCatalog(force = false): Promise<OnboardingIndustryCatalog> {
+  if (!force && onboardingCatalogCached) return onboardingCatalogCached
+  const r = await apiFetch('/api/platform-shell/onboarding-industries', {
+    timeoutMs: DEFAULT_MOD_API_TIMEOUT_MS,
+  })
+  if (!r.ok) throw new Error(`onboarding-industries HTTP ${r.status}`)
+  const body = await r.json()
+  const data = (body?.data || body) as OnboardingIndustryCatalog
+  onboardingCatalogCached = data
+  return data
+}
+
+export interface OnboardingDemoSeedResult {
+  seeded?: boolean
+  seed_status?: string
+  workspace_path?: string
+  message?: string
+  industry_id?: string
+  customer?: { id?: number; name?: string; existing?: boolean }
+  product?: { id?: number; name?: string; existing?: boolean }
+  demo_queries?: { ai_prompt?: string }
+}
+
+export async function seedOnboardingDemo(industryId: string): Promise<OnboardingDemoSeedResult> {
+  const r = await apiFetch('/api/platform-shell/onboarding/seed-demo', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ industry_id: String(industryId || '').trim() || '通用' }),
+    timeoutMs: DEFAULT_MOD_API_TIMEOUT_MS,
+  })
+  if (!r.ok) throw new Error(`onboarding/seed-demo HTTP ${r.status}`)
+  const body = await r.json()
+  return (body?.data || body) as OnboardingDemoSeedResult
+}
+
+export async function fetchIndustryBaseline(
+  industryId: string,
+  force = false,
+  options: { requireAvailable?: boolean } = {},
+): Promise<IndustryBaselinePlan> {
+  const key = String(industryId || '').trim() || '通用'
+  if (!force && baselineCache.has(key)) {
+    return baselineCache.get(key) as IndustryBaselinePlan
+  }
+  let data: IndustryBaselinePlan
+  try {
+    const r = await apiFetch(`/api/platform-shell/industry-baseline?industry_id=${encodeURIComponent(key)}`, {
+      timeoutMs: DEFAULT_MOD_API_TIMEOUT_MS,
+    })
+    if (!r.ok) throw new Error(`industry-baseline HTTP ${r.status}`)
+    const body = await r.json()
+    data = (body?.data || body) as IndustryBaselinePlan
+  } catch (error) {
+    if (options.requireAvailable) throw error
+    return offlineIndustryBaseline(key)
+  }
+  baselineCache.set(key, data)
+  return data
+}
+
+export async function fetchEmployeePlannerStatus(_force = false): Promise<EmployeePlannerStatus> {
+  const r = await apiFetch('/api/platform-shell/employee-planner-status', {
+    timeoutMs: DEFAULT_MOD_API_TIMEOUT_MS,
+  })
+  if (!r.ok) throw new Error(`employee-planner-status HTTP ${r.status}`)
+  const body = await r.json()
+  return (body?.data || body) as EmployeePlannerStatus
+}
+
+export async function fetchEmployeeSsot(force = false): Promise<Record<string, unknown>> {
+  const cacheKey = '__employee_ssot_cache__'
+  const w = typeof window !== 'undefined' ? (window as unknown as Record<string, unknown>) : null
+  if (!force && w?.[cacheKey]) {
+    return w[cacheKey] as Record<string, unknown>
+  }
+  const r = await apiFetch('/api/platform-shell/employee-ssot', {
+    timeoutMs: DEFAULT_MOD_API_TIMEOUT_MS,
+  })
+  if (!r.ok) throw new Error(`employee-ssot HTTP ${r.status}`)
+  const body = await r.json()
+  const data = (body?.data || body) as Record<string, unknown>
+  if (w) w[cacheKey] = data
+  return data
+}

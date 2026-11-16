@@ -1,0 +1,2 @@
+# 后端测试隔离名单由 scripts/dev/test_fast.py 读取并 --ignore。
+# 当前为空，快车道覆盖范围与全量 pytest 一致。

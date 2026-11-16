@@ -1,0 +1,31 @@
+"""Shared fixtures / import-order guards for route tests.
+
+torch is imported lazily and transitively by several FastAPI endpoints (via
+``app.application`` → ``app.ai_engines.bert``). When the *first* torch import
+happens inside Starlette ``TestClient``'s anyio worker thread, the native
+extension initializes off the main thread and segfaults on macOS/arm64.
+
+Pre-importing torch here — on the main thread, before any TestClient request —
+side-steps that crash. It is a best-effort no-op when torch is not installed
+(desktop / slim-server builds), matching the optional-torch posture in
+``app/ai_engines/__init__.py``.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from app.utils.operational_errors import BOUNDARY_ERRORS
+
+try:  # pragma: no cover - environment dependent
+    import torch
+except BOUNDARY_ERRORS:
+    pass
+
+
+@pytest.fixture
+def digest_admin_branch(monkeypatch):
+    """Opt in only for digest business-branch units; HTTP auth tests use the real gate."""
+    monkeypatch.setattr(
+        "app.fastapi_routes.xcmax_admin._require_market_admin_session", lambda request: None
+    )

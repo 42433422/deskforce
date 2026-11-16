@@ -1,0 +1,426 @@
+"""认证应用服务：登录/改密/重置密码，委托 SessionManager 与会话基础设施。"""
+
+import logging
+import uuid
+from typing import Any, cast
+
+from app.db.models import Permission, Role, User
+from app.db.session import get_host_db as get_db
+from app.infrastructure.session import get_session_manager
+from app.utils.operational_errors import RECOVERABLE_ERRORS
+from app.utils.security.password_hash import check_password_hash, generate_password_hash
+from app.utils.time import utc_now_naive
+
+logger = logging.getLogger(__name__)
+
+
+def _authenticate_failure_message(exc: BaseException) -> str:
+    """将典型数据库/结构错误映射为可操作的登录提示（避免一律显示「稍后重试」）。"""
+    chunks: list[str] = []
+    cur: BaseException | None = exc
+    seen: set[int] = set()
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        chunks.append(str(cur).lower())
+        orig = getattr(cur, "orig", None)
+        if orig is not None:
+            chunks.append(str(orig).lower())
+        cur = cur.__cause__ or getattr(cur, "__context__", None)
+    blob = " ".join(chunks)
+    if "market_access_token" in blob:
+        return (
+            "数据库表 sessions 缺少 market_access_token 列，无法保存登录会话。"
+            "请在服务器 FHD 目录执行 alembic upgrade head，或重启后端由启动逻辑自动补齐该列。"
+        )
+    if "no such table: users" in blob:
+        return (
+            "本地 SQLite 缺少 users 表。请重启后端（将自动创建），"
+            '或在 FHD 目录执行：python -c "from app.db.init_db import ensure_runtime_auth_bootstrap; ensure_runtime_auth_bootstrap()"'
+        )
+    if 'relation "users"' in blob or ("users" in blob and "does not exist" in blob):
+        return (
+            "数据库缺少 users 表（尚未执行迁移或空库未自动引导）。"
+            "请在服务器 FHD 目录执行 alembic upgrade head，或重启后端以触发 PostgreSQL 登录表自动补齐。"
+        )
+    if 'relation "sessions"' in blob or ("sessions" in blob and "does not exist" in blob):
+        return (
+            "数据库缺少 sessions 表，无法创建登录会话。"
+            "请在服务器 FHD 目录执行 alembic upgrade head，或重启后端以触发 PostgreSQL 登录表自动补齐。"
+        )
+    return "登录失败，请稍后重试"
+
+
+class AuthApplicationService:
+    """认证应用服务"""
+
+    def __init__(self):
+        self.session_manager = get_session_manager()
+
+    def login(
+        self,
+        username: str,
+        password: str,
+        *,
+        totp_code: str | None = None,
+        enforce_mfa: bool = True,
+    ) -> dict[str, Any]:
+        """登录方法，调用 authenticate"""
+        return self.authenticate(username, password, totp_code=totp_code, enforce_mfa=enforce_mfa)
+
+    def create_session_for_username(self, username: str) -> dict[str, Any]:
+        """市场已验证身份后创建本地会话（手机验证码 / OIDC 等无本地密码场景）。"""
+        try:
+            from app.db.init_db import ensure_runtime_auth_bootstrap
+
+            ensure_runtime_auth_bootstrap(swallow_errors=True)
+        except RECOVERABLE_ERRORS as bootstrap_exc:
+            from app.db.bootstrap.guarded import enabled
+
+            if enabled():
+                raise
+            logger.warning("create_session_for_username bootstrap skip: %s", bootstrap_exc)
+        try:
+            with get_db() as db:
+                user = db.query(User).filter(User.username == username).first()
+                if not user:
+                    return {"success": False, "message": "用户不存在"}
+                if not user.is_active:
+                    return {"success": False, "message": "账户已被禁用"}
+                user.last_login = utc_now_naive()
+                session_result = self.session_manager.create_session_with_db(db, user.id)
+                if not session_result["success"]:
+                    return {"success": False, "message": "会话创建失败"}
+                return {
+                    "success": True,
+                    "user": {
+                        "id": user.id,
+                        "username": user.username,
+                        "display_name": user.display_name,
+                        "email": user.email,
+                        "role": user.role,
+                    },
+                    "session_id": session_result["session_id"],
+                    "expires_at": session_result["expires_at"],
+                }
+        except RECOVERABLE_ERRORS as exc:
+            err_id = uuid.uuid4().hex[:12]
+            logger.exception("create_session_for_username failed (error_id=%s)", err_id)
+            return {
+                "success": False,
+                "message": _authenticate_failure_message(exc),
+                "error_id": err_id,
+            }
+
+    def authenticate_oidc_user(self, profile: dict[str, Any]) -> dict[str, Any]:
+        """OIDC userinfo → 本地用户 JIT + session。"""
+        from app.utils.security.password_hash import generate_password_hash
+
+        username = str(
+            profile.get("preferred_username") or profile.get("email") or profile.get("sub") or ""
+        ).strip()
+        if not username:
+            return {"success": False, "message": "OIDC 未返回可用用户名"}
+        email = str(profile.get("email") or "").strip()
+        display_name = str(profile.get("name") or profile.get("given_name") or username).strip()
+        try:
+            from app.db.init_db import ensure_runtime_auth_bootstrap
+
+            ensure_runtime_auth_bootstrap(swallow_errors=True)
+        except RECOVERABLE_ERRORS:
+            from app.db.bootstrap.guarded import enabled
+
+            if enabled():
+                raise
+            pass
+        try:
+            with get_db() as db:
+                user = db.query(User).filter(User.username == username).first()
+                if user is None:
+                    from app.db.bootstrap.guarded import enabled
+
+                    if enabled():
+                        return {
+                            "success": False,
+                            "message": "Guarded login requires an existing account",
+                        }
+                    user = User(
+                        username=username,
+                        password=generate_password_hash(uuid.uuid4().hex),
+                        display_name=display_name[:64],
+                        email=email[:128],
+                        role="user",
+                        is_active=True,
+                        mfa_enabled=False,
+                        created_at=utc_now_naive(),
+                    )
+                    db.add(user)
+                    db.flush()
+                else:
+                    if display_name and not user.display_name:
+                        user.display_name = display_name[:64]
+                    if email and not user.email:
+                        user.email = email[:128]
+                user.last_login = utc_now_naive()
+                session_result = self.session_manager.create_session_with_db(db, user.id)
+                if not session_result["success"]:
+                    return {"success": False, "message": "会话创建失败"}
+                db.commit()
+                try:
+                    from app.neuro_bus.application_neuro_bridge import (
+                        neuro_notify_user_authenticated,
+                    )
+
+                    neuro_notify_user_authenticated(
+                        user_id=str(user.id), auth_method="oidc", success=True
+                    )
+                except RECOVERABLE_ERRORS:
+                    logger.debug("neuro_notify_user_authenticated skipped", exc_info=True)
+                return {
+                    "success": True,
+                    "user": {
+                        "id": user.id,
+                        "username": user.username,
+                        "display_name": user.display_name,
+                        "email": user.email,
+                        "role": user.role,
+                    },
+                    "session_id": session_result["session_id"],
+                    "expires_at": session_result["expires_at"],
+                }
+        except RECOVERABLE_ERRORS as exc:
+            err_id = uuid.uuid4().hex[:12]
+            logger.exception("authenticate_oidc_user failed (error_id=%s)", err_id)
+            return {
+                "success": False,
+                "message": _authenticate_failure_message(exc),
+                "error_id": err_id,
+            }
+
+    def authenticate(
+        self,
+        username: str,
+        password: str,
+        *,
+        totp_code: str | None = None,
+        enforce_mfa: bool = True,
+    ) -> dict[str, Any]:
+        try:
+            from app.db.init_db import ensure_runtime_auth_bootstrap
+
+            ensure_runtime_auth_bootstrap(swallow_errors=True)
+        except RECOVERABLE_ERRORS as bootstrap_exc:
+            from app.db.bootstrap.guarded import enabled
+
+            if enabled():
+                raise
+            logger.warning("登录前 auth 表自检跳过: %s", bootstrap_exc)
+        try:
+            from app.domain.app_pure.account_security import (
+                is_locked,
+                lock_remaining_seconds,
+                register_failed_attempt,
+                reset_failed_attempts,
+                verify_totp,
+            )
+
+            with get_db() as db:
+                user = db.query(User).filter(User.username == username).first()
+
+                if not user:
+                    return {"success": False, "message": "用户名或密码错误"}
+
+                if not user.is_active:
+                    return {"success": False, "message": "账户已被禁用"}
+
+                # 账户锁定：连续失败达阈值后临时锁定
+                if is_locked(user):
+                    mins = max(1, lock_remaining_seconds(user) // 60)
+                    return {
+                        "success": False,
+                        "locked": True,
+                        "message": f"账户因多次登录失败已锁定，请约 {mins} 分钟后重试",
+                    }
+
+                if not check_password_hash(user.password, password):
+                    locked_now = register_failed_attempt(user)
+                    db.commit()
+                    if locked_now:
+                        return {
+                            "success": False,
+                            "locked": True,
+                            "message": "连续登录失败次数过多，账户已临时锁定",
+                        }
+                    return {"success": False, "message": "用户名或密码错误"}
+
+                # MFA：用户开启 MFA 时校验 TOTP（enforce_mfa=False 用于市场已验证场景）
+                if enforce_mfa and getattr(user, "mfa_enabled", False):
+                    if not verify_totp(getattr(user, "totp_secret", "") or "", totp_code or ""):
+                        return {
+                            "success": False,
+                            "mfa_required": True,
+                            "message": "请输入动态验证码（MFA）",
+                        }
+
+                reset_failed_attempts(user)
+                user.last_login = utc_now_naive()
+                session_result = self.session_manager.create_session_with_db(db, user.id)
+                if not session_result["success"]:
+                    return {"success": False, "message": "会话创建失败"}
+
+                return {
+                    "success": True,
+                    "user": {
+                        "id": user.id,
+                        "username": user.username,
+                        "display_name": user.display_name,
+                        "email": user.email,
+                        "role": user.role,
+                    },
+                    "session_id": session_result["session_id"],
+                    "expires_at": session_result["expires_at"],
+                }
+        except RECOVERABLE_ERRORS as exc:
+            err_id = uuid.uuid4().hex[:12]
+            logger.exception("authenticate failed (error_id=%s)", err_id)
+            return {
+                "success": False,
+                "message": _authenticate_failure_message(exc),
+                "error_id": err_id,
+            }
+
+    def logout(self, session_id: str) -> bool:
+        return cast("bool", self.session_manager.delete_session(session_id))
+
+    def get_current_user(self, session_id: str) -> User | None:
+        return cast("User | None", self.session_manager.validate_session(session_id))
+
+    def get_user_permissions(self, user: User) -> list:
+        from app.db.bootstrap.guarded import enabled, existing_permissions
+
+        if enabled():
+            return existing_permissions(user)
+        from app.application.tenant_rbac_policy import (
+            TENANT_PERMISSION_CODES,
+            is_tenant_role,
+            owner_permission_for_user,
+            role_belongs_to_user,
+        )
+
+        try:
+            from app.db.init_db import ensure_runtime_auth_bootstrap
+
+            ensure_runtime_auth_bootstrap(swallow_errors=True)
+        except RECOVERABLE_ERRORS as bootstrap_exc:
+            logger.warning("权限表自检跳过: %s", bootstrap_exc)
+        try:
+            with get_db() as db:
+                if user.role == "admin" and user.tier == "admin" and user.tenant_id is None:
+                    perms = db.query(Permission).all()
+                    return [p.code for p in perms]
+
+                role = db.query(Role).filter(Role.name == user.role).first()
+                codes = [p.code for p in role.permissions] if role else []
+                if is_tenant_role(user.role):
+                    codes = (
+                        [code for code in codes if code in TENANT_PERMISSION_CODES]
+                        if role_belongs_to_user(user.role, user.tenant_id)
+                        else []
+                    )
+                if owner_permission_for_user(user) and "tenant.manage_roles" not in codes:
+                    codes.append("tenant.manage_roles")
+                return codes
+        except RECOVERABLE_ERRORS as exc:
+            logger.warning("get_user_permissions 回退为空列表: %s", exc)
+            if user.role == "admin" and user.tier == "admin" and user.tenant_id is None:
+                from app.db.models.permission import DEFAULT_PERMISSIONS
+
+                return [p["code"] for p in DEFAULT_PERMISSIONS]
+            return []
+
+    def has_permission(self, user: User, permission_code: str) -> bool:
+        from app.db.bootstrap.guarded import enabled
+
+        if enabled():
+            return permission_code in self.get_user_permissions(user)
+        if user.role == "admin" and user.tier == "admin" and user.tenant_id is None:
+            return True
+        perms = self.get_user_permissions(user)
+        return permission_code in perms
+
+    def change_password(self, user_id: int, old_password: str, new_password: str) -> dict[str, Any]:
+        with get_db() as db:
+            try:
+                user = db.query(User).filter(User.id == user_id).first()
+                if not user:
+                    return {"success": False, "message": "用户不存在"}
+
+                if not check_password_hash(user.password, old_password):
+                    return {"success": False, "message": "原密码错误"}
+
+                user.password = generate_password_hash(new_password)
+                db.commit()
+                try:
+                    from app.neuro_bus.application_neuro_bridge import (
+                        neuro_notify_user_authenticated,
+                    )
+
+                    neuro_notify_user_authenticated(
+                        user_id=str(user.id), auth_method="password", success=True
+                    )
+                except RECOVERABLE_ERRORS:
+                    logger.debug("neuro_notify_user_authenticated skipped", exc_info=True)
+                return {"success": True, "message": "密码修改成功"}
+            except RECOVERABLE_ERRORS:
+                db.rollback()
+                err_id = uuid.uuid4().hex[:12]
+                logger.exception("change_password failed (error_id=%s user_id=%s)", err_id, user_id)
+                return {
+                    "success": False,
+                    "message": "密码修改失败，请稍后重试",
+                    "error_id": err_id,
+                }
+
+    def reset_password(self, user_id: int, new_password: str) -> dict[str, Any]:
+        with get_db() as db:
+            try:
+                user = db.query(User).filter(User.id == user_id).first()
+                if not user:
+                    return {"success": False, "message": "用户不存在"}
+
+                user.password = generate_password_hash(new_password)
+                db.commit()
+                try:
+                    from app.neuro_bus.application_neuro_bridge import (
+                        neuro_notify_user_authenticated,
+                    )
+
+                    neuro_notify_user_authenticated(
+                        user_id=str(user.id), auth_method="update", success=True
+                    )
+                except RECOVERABLE_ERRORS:
+                    logger.debug("neuro_notify_user_authenticated skipped", exc_info=True)
+                self.session_manager.delete_user_sessions(user_id)
+                return {"success": True, "message": "密码已重置，请使用新密码登录"}
+            except RECOVERABLE_ERRORS:
+                db.rollback()
+                err_id = uuid.uuid4().hex[:12]
+                logger.exception("reset_password failed (error_id=%s user_id=%s)", err_id, user_id)
+                return {
+                    "success": False,
+                    "message": "密码重置失败，请稍后重试",
+                    "error_id": err_id,
+                }
+
+
+from app.neuro_bus.neuro_application_instrumentation import instrument_application_service_class
+
+instrument_application_service_class(AuthApplicationService)
+
+_auth_app_service: AuthApplicationService | None = None
+
+
+def get_auth_app_service() -> AuthApplicationService:
+    global _auth_app_service
+    if _auth_app_service is None:
+        _auth_app_service = AuthApplicationService()
+    return _auth_app_service

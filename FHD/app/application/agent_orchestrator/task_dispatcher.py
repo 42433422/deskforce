@@ -1,0 +1,375 @@
+"""Concurrent background dispatcher for durable Agent task executions."""
+
+from __future__ import annotations
+
+import contextvars
+import logging
+import os
+import threading
+import time
+import uuid
+from dataclasses import dataclass
+from typing import Callable
+
+from app.application.agent_orchestrator.orchestrator import AgentOrchestrator
+from app.application.agent_orchestrator.run_repository import (
+    AgentRunRepository,
+    get_agent_run_repository,
+)
+from app.application.agent_orchestrator.task_execution_repository import (
+    AgentTaskExecution,
+    TaskExecutionRepository,
+    get_task_execution_repository,
+)
+from app.utils.operational_errors import RECOVERABLE_ERRORS
+
+logger = logging.getLogger(__name__)
+_open_effect: contextvars.ContextVar[object | None] = contextvars.ContextVar(
+    "task_open_effect", default=None
+)
+
+
+def note_open_effect(run_id: str, effect_id: str) -> None:
+    """Record a side effect only while a worker is inside a real tool call."""
+    repo = _open_effect.get()
+    marker = getattr(repo, "mark_open_effect", None)
+    if marker is not None:
+        marker(run_id, effect_id)
+
+
+@dataclass
+class _ActiveWorker:
+    execution: AgentTaskExecution
+    owner_id: str
+    thread: threading.Thread
+    last_heartbeat: float
+
+
+def _configured_worker_count() -> int:
+    raw = os.environ.get("XCAGI_AGENT_TASK_WORKERS", "4").strip()
+    try:
+        return max(1, min(16, int(raw)))
+    except ValueError:
+        return 4
+
+
+class AgentTaskDispatcher:
+    def __init__(
+        self,
+        *,
+        execution_repository: TaskExecutionRepository | None = None,
+        run_repository: AgentRunRepository | None = None,
+        max_workers: int | None = None,
+        poll_seconds: float = 0.2,
+        lease_seconds: float = 15.0,
+        heartbeat_seconds: float = 4.0,
+        orchestrator_factory: Callable[[AgentRunRepository], AgentOrchestrator] | None = None,
+    ) -> None:
+        self._execution_repo = execution_repository or get_task_execution_repository()
+        self._run_repo = run_repository or get_agent_run_repository()
+        self._max_workers = max(1, int(max_workers or _configured_worker_count()))
+        self._poll_seconds = max(0.02, float(poll_seconds))
+        self._lease_seconds = max(3.0, float(lease_seconds))
+        self._heartbeat_seconds = min(
+            max(0.5, float(heartbeat_seconds)),
+            self._lease_seconds / 2,
+        )
+        self._orchestrator_factory = orchestrator_factory or (
+            lambda repository: AgentOrchestrator(repository=repository)
+        )
+        self._instance_id = f"task-dispatcher-{uuid.uuid4().hex}"
+        self._active: dict[str, _ActiveWorker] = {}
+        self._active_lock = threading.RLock()
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._coordinator: threading.Thread | None = None
+
+    @property
+    def instance_id(self) -> str:
+        return self._instance_id
+
+    def start(self) -> None:
+        if self._coordinator is not None and self._coordinator.is_alive():
+            return
+        self._stop.clear()
+        self._coordinator = threading.Thread(
+            target=self._run_loop,
+            name=f"{self._instance_id}-coordinator",
+            daemon=True,
+        )
+        self._coordinator.start()
+
+    def stop(self, *, timeout: float = 5.0) -> None:
+        self._stop.set()
+        self._wake.set()
+        coordinator = self._coordinator
+        if coordinator is not None:
+            coordinator.join(timeout=max(0.0, float(timeout)))
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._active_lock:
+            workers = [item.thread for item in self._active.values()]
+        for worker in workers:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            worker.join(timeout=remaining)
+
+    def notify(self) -> None:
+        self._wake.set()
+
+    def snapshot(self) -> dict[str, object]:
+        with self._active_lock:
+            active = [
+                {
+                    "run_id": item.execution.run_id,
+                    "task_id": item.execution.task_id,
+                    "owner_id": item.owner_id,
+                }
+                for item in self._active.values()
+            ]
+        return {
+            "instance_id": self._instance_id,
+            "max_workers": self._max_workers,
+            "active_count": len(active),
+            "active": active,
+            "running": bool(self._coordinator and self._coordinator.is_alive()),
+        }
+
+    def _run_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._dispatch_available()
+            except RECOVERABLE_ERRORS:
+                # Database startup, migration, or a transient outage must not
+                # escape the daemon thread as an unhandled exception.
+                logger.exception("agent task dispatcher cycle failed; retrying")
+                self._wake.wait(timeout=max(1.0, self._poll_seconds))
+            else:
+                self._wake.wait(timeout=self._poll_seconds)
+            self._wake.clear()
+
+    def _dispatch_available(self) -> None:
+        self._prune_and_heartbeat()
+        while not self._stop.is_set() and self._active_count() < self._max_workers:
+            owner_id = f"{self._instance_id}:{uuid.uuid4().hex}"
+            execution = self._execution_repo.claim(
+                owner_id,
+                lease_seconds=self._lease_seconds,
+            )
+            if execution is None:
+                break
+            worker = threading.Thread(
+                target=self._execute_claim,
+                args=(execution, owner_id),
+                name=f"agent-task-{execution.run_id[-10:]}",
+                daemon=True,
+            )
+            with self._active_lock:
+                self._active[execution.run_id] = _ActiveWorker(
+                    execution=execution,
+                    owner_id=owner_id,
+                    thread=worker,
+                    last_heartbeat=time.monotonic(),
+                )
+            worker.start()
+
+    def _active_count(self) -> int:
+        with self._active_lock:
+            return len(self._active)
+
+    def _prune_and_heartbeat(self) -> None:
+        now = time.monotonic()
+        with self._active_lock:
+            active = list(self._active.items())
+        for run_id, item in active:
+            if not item.thread.is_alive():
+                with self._active_lock:
+                    self._active.pop(run_id, None)
+                continue
+            if now - item.last_heartbeat < self._heartbeat_seconds:
+                continue
+            renewed = self._execution_repo.heartbeat(
+                run_id,
+                item.owner_id,
+                lease_seconds=self._lease_seconds,
+            )
+            if renewed:
+                with self._active_lock:
+                    current = self._active.get(run_id)
+                    if current is not None:
+                        current.last_heartbeat = now
+
+    def _execute_claim(self, execution: AgentTaskExecution, owner_id: str) -> None:
+        from contextlib import nullcontext
+
+        from app.application.agent_orchestrator.business_write_guard import worker_claim_scope
+        from app.application.agent_orchestrator.run_sql_repository import (
+            SQLAlchemyAgentRunRepository,
+        )
+        from app.application.agent_orchestrator.worker_repository import (
+            ClaimedRunRepository,
+            WorkerLeaseLost,
+        )
+
+        repository = self._run_repo
+        if isinstance(repository, SQLAlchemyAgentRunRepository):
+            repository = ClaimedRunRepository(repository, execution, owner_id)
+        error_code = ""
+        state = "failed"
+        abandon = False
+        effect_token = _open_effect.set(self._execution_repo)
+        try:
+            orchestrator = self._orchestrator_factory(repository)
+            preview = self._run_repo.get(execution.run_id)
+            from app.application.agent_orchestrator.cross_module_chain import (
+                InjectedTransactionFault,
+                cross_module_ready,
+                execute_claimed_cross_module,
+            )
+
+            if preview is not None and cross_module_ready(preview):
+                try:
+                    request_id = str(preview.metadata.get("approval_request_id") or "")
+                    receipt = execute_claimed_cross_module(
+                        orchestrator,
+                        preview,
+                        owner=owner_id,
+                        queue=self._execution_repo,
+                        request_id=request_id,
+                        finish=False,
+                    )
+                    state = "succeeded" if receipt.get("success") else "failed"
+                    if state == "failed":
+                        error_code = "cross_module_failed"
+                except InjectedTransactionFault:
+                    abandon = True
+                    logger.warning(
+                        "cross-module transaction fault abandoned lease for %s",
+                        execution.run_id,
+                    )
+                return
+            scope = (
+                worker_claim_scope(self._run_repo, execution, owner_id)
+                if isinstance(self._run_repo, SQLAlchemyAgentRunRepository)
+                else nullcontext()
+            )
+            with scope:
+                run = orchestrator.execute_dispatched_run(
+                    execution.run_id,
+                    recovered=execution.recovery_count > 0,
+                )
+            if run is None:
+                error_code = "worker_run_unavailable"
+            else:
+                state = {
+                    "completed": "succeeded",
+                    "succeeded": "succeeded",
+                    "failed": "failed",
+                    "timed_out": "timed_out",
+                    "cancelled": "cancelled",
+                    "paused": "waiting_approval",
+                    "waiting_approval": "waiting_approval",
+                    "blocked": "failed",
+                    "waiting_user": "waiting_approval",
+                    "rejected": "rejected",
+                }.get(run.status, "failed")
+                if run.status == "blocked":
+                    error_code = "needs_verification"
+                elif state == "failed" and run.status != "failed":
+                    error_code = "worker_incomplete_state"
+        except InjectedTransactionFault:
+            abandon = True
+            logger.warning("transaction fault abandoned lease for %s", execution.run_id)
+        except WorkerLeaseLost:
+            error_code = "worker_lease_lost"
+            logger.info("worker stopped after lease loss for run %s", execution.run_id)
+        except TimeoutError:
+            error_code = "timeout"
+            logger.exception("agent task worker timed out for run %s", execution.run_id)
+        except (
+            RECOVERABLE_ERRORS
+        ):  # thread boundary: preserve the worker pool and persist safe evidence
+            logger.exception("agent task worker failed for run %s", execution.run_id)
+            error_code = "worker_execution_failed"
+            try:
+                self._orchestrator_factory(repository).fail_dispatched_run(execution.run_id)
+            except RECOVERABLE_ERRORS:
+                logger.exception("agent task failure receipt could not be persisted")
+        finally:
+            _open_effect.reset(effect_token)
+            if not abandon:
+                self._execution_repo.finish(
+                    execution.run_id,
+                    owner_id,
+                    state,
+                    error_code=error_code,
+                )
+            with self._active_lock:
+                self._active.pop(execution.run_id, None)
+            self._wake.set()
+
+
+_dispatcher: AgentTaskDispatcher | None = None
+_dispatcher_lock = threading.RLock()
+
+
+def get_agent_task_dispatcher() -> AgentTaskDispatcher:
+    global _dispatcher
+    with _dispatcher_lock:
+        if _dispatcher is None:
+            _dispatcher = AgentTaskDispatcher()
+        return _dispatcher
+
+
+def reconcile_interrupted_runs() -> int:
+    """启动对账：收敛上一进程遗留的 running 任务（M15）。
+
+    放在 dispatcher 启动前，保证在重新认领执行之前先把已经中断的 run 收敛为
+    failed；被动节点不启动 dispatcher，因此也不会误改运行状态。
+    """
+    from app.application.agent_orchestrator.stale_run_reconciler import (
+        reconcile_stale_running_runs,
+    )
+
+    try:
+        return reconcile_stale_running_runs()
+    except RECOVERABLE_ERRORS as exc:
+        logger.warning("agent run startup reconciliation skipped: %s", exc)
+        return 0
+
+
+def start_agent_task_dispatcher() -> AgentTaskDispatcher:
+    dispatcher = get_agent_task_dispatcher()
+    reconciled = reconcile_interrupted_runs()
+    if reconciled:
+        logger.info("agent run startup reconciliation converged %s run(s)", reconciled)
+    dispatcher.start()
+    return dispatcher
+
+
+def stop_agent_task_dispatcher(*, timeout: float = 5.0) -> None:
+    with _dispatcher_lock:
+        dispatcher = _dispatcher
+    if dispatcher is not None:
+        dispatcher.stop(timeout=timeout)
+
+
+def notify_agent_task_dispatcher() -> None:
+    get_agent_task_dispatcher().notify()
+
+
+def set_agent_task_dispatcher_for_tests(dispatcher: AgentTaskDispatcher | None) -> None:
+    global _dispatcher
+    with _dispatcher_lock:
+        _dispatcher = dispatcher
+
+
+__all__ = [
+    "AgentTaskDispatcher",
+    "get_agent_task_dispatcher",
+    "notify_agent_task_dispatcher",
+    "reconcile_interrupted_runs",
+    "set_agent_task_dispatcher_for_tests",
+    "start_agent_task_dispatcher",
+    "stop_agent_task_dispatcher",
+]

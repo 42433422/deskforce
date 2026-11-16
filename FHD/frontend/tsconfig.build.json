@@ -1,0 +1,8 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "strict": true,
+    "skipLibCheck": true
+  },
+  "exclude": ["src/constants/*.minimal.ts", "src/**/*.test.ts"]
+}

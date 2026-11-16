@@ -1,0 +1,144 @@
+"""COVERAGE_RAMP Phase 31: xcagi_compat_customer routes (mocked)."""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from app.fastapi_routes.domains.customer import routes as customer_compat
+from app.fastapi_routes.domains.customer import routes as customer_routes
+from tests.fixtures.backend_ci_isolation import trusted_actor as trusted_actor
+
+
+@pytest.fixture
+def compat_customer_client(monkeypatch: pytest.MonkeyPatch, request) -> TestClient:
+    actor = None
+    if "delete" in request.node.name:
+        actor = request.getfixturevalue("trusted_actor")(tenant_id=7, role="admin")
+        monkeypatch.setenv("XCAGI_PRODUCT_SKU", "enterprise")
+    monkeypatch.setattr(
+        customer_routes,
+        "_load_customers_rows",
+        lambda: [{"id": 1, "unit_name": "七彩乐园"}],
+    )
+    monkeypatch.setattr(customer_routes, "_business_mod_json_block", lambda: False)
+    monkeypatch.setattr(
+        "app.mod_sdk.erp_customers_facade.is_erp_customers_via_service_enabled",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        "app.mod_sdk.client_primary_erp.try_invoke_client_mod_customers_list",
+        lambda **_kw: None,
+    )
+    monkeypatch.setattr(
+        "app.mod_sdk.client_primary_erp.resolve_client_erp_mod_for_request",
+        lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(
+        "app.mod_sdk.erp_domain_dispatch.try_invoke_erp_domain_handler",
+        lambda *_a, **_k: None,
+    )
+    app = FastAPI()
+    app.include_router(customer_compat.router)
+    return TestClient(app, headers=actor.headers if actor else {}, raise_server_exceptions=False)
+
+
+def test_compat_customers_all_and_list(compat_customer_client: TestClient) -> None:
+    r1 = compat_customer_client.get("/customers", params={"keyword": "彩"})
+    assert r1.status_code == 200
+    assert r1.json()["success"] is True
+    assert len(r1.json()["data"]) == 1
+    r2 = compat_customer_client.get("/customers/list", params={"page": 1, "per_page": 10})
+    assert r2.status_code == 200
+
+
+def test_compat_customers_match_empty(compat_customer_client: TestClient) -> None:
+    r = compat_customer_client.get("/customers/match")
+    assert r.status_code == 200
+    assert r.json()["matched"] is None
+
+
+def test_compat_customers_match_with_extract(
+    compat_customer_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "app.infrastructure.products.customer_matching.extract_customer_name",
+        lambda s: "七彩" if "乐园" in s else None,
+    )
+    monkeypatch.setattr(
+        "app.infrastructure.products.customer_matching.find_matching_customer",
+        lambda s: "七彩乐园" if s else "",
+    )
+    r = compat_customer_client.get(
+        "/customers/match",
+        params={"customer_name": "去七彩乐园拿货"},
+    )
+    assert r.status_code == 200
+    assert r.json()["matched"] == "七彩乐园"
+
+
+def test_compat_customers_match_mod_block(
+    compat_customer_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(customer_routes, "_business_mod_json_block", lambda: True)
+    r = compat_customer_client.get("/customers/match", params={"customer_name": "X"})
+    assert r.json()["matched"] is None
+
+
+def test_compat_customer_get_one_and_create(
+    compat_customer_client: TestClient, local_tools
+) -> None:
+    row = MagicMock()
+    row.id = 2
+    with (
+        patch(
+            "app.mod_sdk.erp_customers_facade.is_erp_customers_via_service_enabled",
+            return_value=False,
+        ),
+        patch.object(customer_routes, "_customer_find_by_id", return_value=row),
+        patch.object(
+            customer_routes,
+            "_customer_row_for_api",
+            return_value={"id": 2, "unit_name": "A"},
+        ),
+        patch.object(customer_routes, "_customers_write_raise"),
+        patch.object(
+            customer_routes,
+            "_customer_pg_insert",
+            return_value={"id": 3, "unit_name": "B"},
+        ),
+        patch.object(
+            customer_routes, "_customer_body_name_contact", return_value=("B", "", "", "")
+        ),
+    ):
+        assert compat_customer_client.get("/customers/2").status_code == 200
+        created = compat_customer_client.post("/customers", json={"unit_name": "B"})
+        assert created.status_code == 200
+        assert created.json()["data"]["id"] == 3
+
+
+def test_compat_customer_batch_delete(
+    compat_customer_client: TestClient, local_tools, trusted_actor
+) -> None:
+    actor = trusted_actor(tenant_id=7, role="admin")
+    compat_customer_client.headers.update(actor.headers)
+    service = MagicMock()
+    service.batch_delete.return_value = {"success": True, "deleted_count": 2}
+    with (
+        patch.object(customer_routes, "_customers_write_raise"),
+        patch("app.application.get_customer_app_service", return_value=service),
+    ):
+        batch = compat_customer_client.post("/customers/batch-delete", json={"ids": [2, 3]})
+    assert batch.status_code == 200
+    assert batch.json()["deleted"] == 2
+    from app.infrastructure.auth.agent_mod_scope import validate_actor_context
+
+    service.batch_delete.assert_called_once()
+    assert service.batch_delete.call_args.args == ([2, 3],)
+    context = service.batch_delete.call_args.kwargs["runtime_context"]
+    assert str(context["tenant_id"]) == str(actor.tenant_id)
+    assert str(context["user_id"]) == str(actor.user_id)
+    assert validate_actor_context(context) is None

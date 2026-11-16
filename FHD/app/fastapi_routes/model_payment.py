@@ -1,0 +1,489 @@
+"""模型支付页（Vue ModelPaymentView）兼容 API：演示套餐与支付宝预下单。"""
+
+from __future__ import annotations
+
+import logging
+import uuid
+from typing import Any
+
+from fastapi import APIRouter, Body, Header, HTTPException, Request
+from fastapi.responses import JSONResponse, PlainTextResponse
+
+from app.errors import ErrorCode, PaymentError
+from app.fastapi_routes.model_payment_authorization import (
+    owned_payment_order,
+    require_local_payment_backend,
+)
+from app.fastapi_routes.model_payment_plans import DEMO_PLANS as _DEMO_PLANS
+from app.infrastructure.billing.saas_plans import (
+    list_saas_plans,
+    plan_by_id,
+    pricing_plans_for_budget,
+)
+from app.infrastructure.payment import alipay as mp_ali
+from app.infrastructure.payment import order_store as mp_orders
+from app.infrastructure.payment.payment_sot import (
+    MODEL_PAYMENT_JSON_DEPRECATED_AFTER,
+    is_fhd_postgres_payment_sot,
+    is_json_legacy_payment_sot,
+    is_local_model_payment_sot,
+    is_modstore_payment_sot,
+    model_payment_backend,
+    modstore_payment_hint,
+)
+from app.utils.operational_errors import INFRA_TRANSIENT
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/model-payment", tags=["model-payment"])
+
+
+def _integration_flags() -> dict[str, Any]:
+    """支付宝：APPID + 应用私钥 + 支付宝公钥 + 已安装 SDK 时为已开通。"""
+    return {
+        "alipay_configured": mp_ali.alipay_ui_ready(),
+        "market_sot": is_modstore_payment_sot(),
+        "postgres_sot": is_fhd_postgres_payment_sot(),
+        "backend": model_payment_backend(),
+    }
+
+
+def _all_plans() -> list[dict[str, Any]]:
+    return list(_DEMO_PLANS) + list_saas_plans()
+
+
+def _plan_by_id(plan_id: str) -> dict[str, Any] | None:
+    return plan_by_id(plan_id, extra_plans=_DEMO_PLANS)
+
+
+@router.get("/plans")
+def get_plans(budget_range: str = ""):
+    budget = (budget_range or "").strip()
+    saas_plans = pricing_plans_for_budget(budget if budget else None)
+    return JSONResponse(
+        {
+            "success": True,
+            "data": {
+                "plans": list(_DEMO_PLANS) + saas_plans,
+                "integration": _integration_flags(),
+                "budget_range": budget or None,
+            },
+        }
+    )
+
+
+@router.get("/wechat-redirect")
+def wechat_redirect(plan_id: str, market_user_id: int = 0):
+    """FHD 宿主微信支付：重定向至修茈市场统一收银台。"""
+    from app.infrastructure.payment.modstore_payment_proxy import wechat_checkout_redirect_url
+
+    url = wechat_checkout_redirect_url(plan_id, market_user_id=market_user_id)
+    if not url:
+        return JSONResponse(
+            {"success": False, "message": "请配置 XCAGI_MARKET_BASE_URL"},
+            status_code=503,
+        )
+    from fastapi.responses import RedirectResponse
+
+    return RedirectResponse(url=url, status_code=302)
+
+
+@router.post("/checkout")
+def checkout(
+    request: Request,
+    body: dict[str, Any] = Body(default_factory=dict),
+    user_agent: str | None = Header(default=None),
+):
+    from app.infrastructure.auth.dependencies import get_logged_in_user, session_id_from_request
+
+    checkout_user = get_logged_in_user(request)
+    local_user_id = int(checkout_user.id)
+    if is_modstore_payment_sot():
+        from app.infrastructure.payment.modstore_payment_proxy import checkout_session_token
+
+        market_token = checkout_session_token(session_id_from_request(request), local_user_id)
+        if not market_token:
+            raise HTTPException(status_code=401, detail="请先绑定当前会话的市场账号")
+        channel = str(body.get("channel") or "alipay").strip().lower()
+        plan_id = str(body.get("plan_id") or "").strip()
+        proxy_failed = False
+        if plan_id:
+            from app.infrastructure.payment.modstore_payment_proxy import proxy_checkout
+
+            proxied = proxy_checkout(plan_id=plan_id, channel=channel, auth_token=market_token)
+            if proxied.get("success"):
+                return JSONResponse({"success": True, "data": proxied.get("data")})
+            proxy_failed = True
+        return JSONResponse(
+            {
+                "success": False,
+                "message": modstore_payment_hint(),
+                "data": {
+                    "use_checkout": "/api/market/payment/checkout",
+                    "use_plans": "/api/market/payment/plans",
+                    "proxy_error": "market_checkout_unavailable" if proxy_failed else None,
+                },
+            },
+            status_code=409,
+        )
+    require_local_payment_backend()
+    if is_json_legacy_payment_sot():
+        import os
+
+        dbu = (os.environ.get("DATABASE_URL") or "").strip().lower()
+        if "postgresql" in dbu or "postgres://" in dbu:
+            return JSONResponse(
+                {
+                    "success": False,
+                    "message": (
+                        "检测到 PostgreSQL DATABASE_URL；本地 PostgreSQL 订单后端尚未实现，"
+                        "请使用已绑定账号的市场支付（MODEL_PAYMENT_BACKEND=modstore）。"
+                        f"JSON 订单存储将于 {MODEL_PAYMENT_JSON_DEPRECATED_AFTER} 后废弃。"
+                    ),
+                    "data": {
+                        "supported_backend": "modstore",
+                        "postgres_order_store_available": False,
+                    },
+                },
+                status_code=409,
+            )
+    plan_id = str(body.get("plan_id") or "").strip()
+    legacy_channel = str(body.get("channel") or "").strip().lower()
+    if legacy_channel and legacy_channel != "alipay":
+        return JSONResponse(
+            {"success": False, "message": "仅支持支付宝；请移除 channel 或传 channel=alipay"},
+            status_code=400,
+        )
+    plan = _plan_by_id(plan_id)
+    if not plan:
+        raise PaymentError(
+            ErrorCode.PAYMENT_ORDER_NOT_FOUND,
+            message=f"未知套餐: {plan_id}",
+            status_code=400,
+        )
+
+    order_id = f"mp-{uuid.uuid4().hex[:18]}"
+    channel = "alipay"
+    amount_yuan = f"{int(plan['amount_cents']) / 100:.2f}"
+    subject = f"模型套餐-{plan['title']}"
+
+    mp_ali.warn_notify_url_path_once()
+
+    if not mp_ali.alipay_ui_ready():
+        hint = (
+            "当前为演示模式：未满足支付宝真实下单条件（需 ALIPAY_APP_ID、ALIPAY_APP_PRIVATE_KEY 或 "
+            "ALIPAY_APP_PRIVATE_KEY_PATH、支付宝公钥（环境变量或默认 424/alipayPublicKey_RSA2.txt），"
+            "并安装 python-alipay-sdk；沙箱请加 ALIPAY_DEBUG=1）。"
+        )
+        if mp_ali.credentials_ready() and mp_ali.sdk_import_error():
+            hint = mp_ali.sdk_import_error() or hint
+        logger.info(
+            "[model-payment] demo checkout order_id=%s plan=%s (alipay not ready)",
+            order_id,
+            plan_id,
+        )
+        return JSONResponse(
+            {
+                "success": True,
+                "data": {
+                    "order_id": order_id,
+                    "channel": channel,
+                    "status": "demo_pending",
+                    "amount_cents": plan["amount_cents"],
+                    "plan_id": plan_id,
+                    "client_payload": {"demo": True},
+                    "redirect_url": None,
+                    "qr_code": None,
+                    "setup_hint": hint,
+                },
+            }
+        )
+
+    # 自动根据 User-Agent 选择 page.pay / wap.pay / 回退 precreate
+    pay_res = mp_ali.create_pay_order(
+        out_trade_no=order_id,
+        subject=subject,
+        total_amount=amount_yuan,
+        user_agent=user_agent or "",
+    )
+
+    if not pay_res["success"]:
+        logger.warning(
+            "[model-payment] pay_order failed order_id=%s message=%s raw=%s",
+            order_id,
+            pay_res.get("message"),
+            pay_res.get("raw"),
+        )
+        return JSONResponse(
+            {
+                "success": False,
+                "message": pay_res.get("message") or "支付宝下单失败",
+            }
+        )
+
+    logger.info(
+        "[model-payment] pay_order ok order_id=%s type=%s",
+        order_id,
+        pay_res.get("type"),
+    )
+    try:
+        mp_orders.record_checkout_pending(
+            out_trade_no=order_id,
+            plan_id=plan_id,
+            amount_cents=int(plan["amount_cents"]),
+            amount_yuan=amount_yuan,
+            local_user_id=local_user_id,
+            tenant_id=checkout_user.tenant_id,
+        )
+    except OSError as e:
+        logger.exception("[model-payment] 写入本地订单失败（notify 将无法幂等关联）: %s", e)
+
+    return JSONResponse(
+        {
+            "success": True,
+            "data": {
+                "order_id": order_id,
+                "channel": channel,
+                "status": "pending_payment",
+                "amount_cents": plan["amount_cents"],
+                "plan_id": plan_id,
+                "client_payload": pay_res.get("raw"),
+                "redirect_url": pay_res.get("redirect_url"),
+                "qr_code": pay_res.get("qr_code"),
+            },
+        }
+    )
+
+
+@router.post("/notify/alipay")
+async def alipay_trade_notify(request: Request):
+    """
+    支付宝异步通知（需在开放平台配置 notify_url 指向本地址的公网 URL）。
+    验签通过后返回纯文本 success；请勿在本接口中信任未验签参数做发货。
+    """
+    if is_fhd_postgres_payment_sot():
+        return PlainTextResponse("fail", status_code=503)
+    if not is_local_model_payment_sot():
+        return PlainTextResponse("fail", status_code=410)
+    try:
+        form = await request.form()
+    except INFRA_TRANSIENT as e:
+        logger.warning("alipay notify: bad form: %s", e)
+        return PlainTextResponse("fail", status_code=400)
+
+    data: dict[str, str] = {str(k): str(v) for k, v in form.items()}
+    signature = data.pop("sign", None)
+    if not signature:
+        return PlainTextResponse("fail", status_code=400)
+
+    if not mp_ali.credentials_ready():
+        logger.error("alipay notify: credentials not configured")
+        return PlainTextResponse("fail", status_code=503)
+
+    try:
+        ok = mp_ali.verify_notify(data, signature)
+    except INFRA_TRANSIENT as e:
+        logger.exception("alipay notify verify error: %s", e)
+        return PlainTextResponse("fail", status_code=500)
+
+    if not ok:
+        logger.warning("alipay notify: signature verification failed")
+        return PlainTextResponse("fail", status_code=400)
+
+    trade_status = data.get("trade_status", "")
+    if trade_status in ("TRADE_SUCCESS", "TRADE_FINISHED"):
+        out_trade_no = str(data.get("out_trade_no") or "")
+        trade_no = str(data.get("trade_no") or "")
+        total_amount = str(data.get("total_amount") or "")
+        reason, snap = mp_orders.apply_notify_paid(
+            out_trade_no=out_trade_no,
+            trade_no=trade_no,
+            total_amount=total_amount,
+        )
+        if reason == "amount_mismatch":
+            return PlainTextResponse("fail", status_code=400)
+        if reason == "unknown_order":
+            logger.warning(
+                "[model-payment] notify: 无本地订单仍返回 success，避免支付宝无限重试 out_trade_no=%s",
+                out_trade_no,
+            )
+        elif reason == "marked_paid" and snap:
+            ent = snap.get("entitlement") if isinstance(snap, dict) else None
+            logger.info(
+                "[model-payment] 权益已发放 plan_id=%s amount_cents=%s purchase_count=%s",
+                snap.get("plan_id"),
+                snap.get("amount_cents"),
+                (ent or {}).get("purchase_count") if isinstance(ent, dict) else None,
+            )
+    return PlainTextResponse("success")
+
+
+@router.get("/diagnostics")
+def diagnostics():
+    """只读诊断：返回支付宝配置是否就绪、各字段来源、notify URL 是否对齐等，不含密钥内容。"""
+    data = mp_ali.diagnostics_snapshot()
+    backend = model_payment_backend()
+    data["sot_backend"] = backend
+    data["store_path"] = str(mp_orders.order_store_path())
+    if is_fhd_postgres_payment_sot():
+        data["db_table"] = None
+        data["backend_available"] = False
+        data["backend_error"] = "postgres_order_store_not_implemented"
+    return JSONResponse({"success": True, "data": data})
+
+
+@router.get("/entitlements")
+def entitlements():
+    """已购权益列表（按 last_paid_at 倒序）。"""
+    if is_modstore_payment_sot():
+        return JSONResponse(
+            {
+                "success": False,
+                "message": modstore_payment_hint(),
+                "data": {"entitlements": []},
+            },
+            status_code=409,
+        )
+    require_local_payment_backend()
+    items = mp_orders.list_entitlements()
+    return JSONResponse(
+        {"success": True, "data": {"entitlements": items, "backend": model_payment_backend()}}
+    )
+
+
+@router.get("/usage")
+def usage(limit: int = 50, run_id: str = "", user_id: str = ""):
+    """AI 用量账本：AgentRun/XCauto/工具/员工成本审计与钱包扣费对账入口。"""
+    from app.infrastructure.billing.model_usage import (
+        get_model_wallet,
+        list_model_usage_entries,
+        model_usage_database_path,
+        model_usage_wallet_backend,
+    )
+
+    items = list_model_usage_entries(limit=limit, run_id=run_id, user_id=user_id)
+    wallet = get_model_wallet(user_id) if user_id else None
+    return JSONResponse(
+        {
+            "success": True,
+            "data": {
+                "entries": items,
+                "count": len(items),
+                "wallet": wallet,
+                "wallet_backend": model_usage_wallet_backend(),
+                "ledger_path": str(model_usage_database_path()),
+                "backend": model_payment_backend(),
+            },
+        }
+    )
+
+
+@router.get("/query/{out_trade_no}")
+def query_trade(request: Request, out_trade_no: str):
+    """alipay.trade.query：查询交易状态。同时返回本地订单快照。"""
+    local = owned_payment_order(request, out_trade_no)
+    res = mp_ali.query_order(out_trade_no=out_trade_no)
+    if not res["success"]:
+        return JSONResponse(
+            {
+                "success": False,
+                "message": res.get("message") or "查询失败",
+                "data": {"local": local},
+            }
+        )
+    return JSONResponse(
+        {
+            "success": True,
+            "data": {
+                "trade": res.get("raw"),
+                "local": local,
+            },
+        }
+    )
+
+
+@router.post("/refund")
+def refund_trade(request: Request, body: dict[str, Any] = Body(default_factory=dict)):
+    """alipay.trade.refund：发起退款。body: out_trade_no, refund_amount, out_request_no?, refund_reason?"""
+    out_trade_no = str(body.get("out_trade_no") or "").strip()
+    refund_amount = str(body.get("refund_amount") or "").strip()
+    out_request_no = str(body.get("out_request_no") or "").strip() or None
+    refund_reason = str(body.get("refund_reason") or "").strip() or None
+
+    if not out_trade_no:
+        return JSONResponse({"success": False, "message": "out_trade_no 必填"}, status_code=400)
+    if not refund_amount:
+        return JSONResponse(
+            {"success": False, "message": "refund_amount 必填（元）"}, status_code=400
+        )
+
+    owned_payment_order(request, out_trade_no, permission="model_payment.refund")
+    res = mp_ali.refund_order(
+        out_trade_no=out_trade_no,
+        refund_amount=refund_amount,
+        out_request_no=out_request_no,
+        refund_reason=refund_reason,
+    )
+    if not res["success"]:
+        logger.warning(
+            "[model-payment] refund failed out_trade_no=%s message=%s",
+            out_trade_no,
+            res.get("message"),
+        )
+        return JSONResponse({"success": False, "message": res.get("message") or "退款失败"})
+
+    try:
+        mp_orders.update_order_status(
+            out_trade_no=out_trade_no,
+            status="refunded",
+            extra={
+                "refund_amount": refund_amount,
+                "refund_request_no": out_request_no or out_trade_no,
+                "refund_reason": refund_reason,
+            },
+        )
+    except OSError as e:
+        logger.exception("[model-payment] 写入退款本地记录失败: %s", e)
+
+    logger.info("[model-payment] refund ok out_trade_no=%s amount=%s", out_trade_no, refund_amount)
+    return JSONResponse({"success": True, "data": res.get("raw")})
+
+
+@router.post("/close")
+def close_trade(request: Request, body: dict[str, Any] = Body(default_factory=dict)):
+    """alipay.trade.close：关闭未付款交易。body: out_trade_no 或 trade_no。"""
+    out_trade_no = str(body.get("out_trade_no") or "").strip() or None
+    trade_no = str(body.get("trade_no") or "").strip() or None
+    if not out_trade_no:
+        return JSONResponse(
+            {"success": False, "message": "out_trade_no 必填，不能仅按支付商交易号关闭"},
+            status_code=400,
+        )
+
+    local = owned_payment_order(request, out_trade_no)
+    if trade_no and trade_no != local.get("trade_no"):
+        raise HTTPException(status_code=404, detail="订单不存在")
+    res = mp_ali.close_order(out_trade_no=out_trade_no, trade_no=None)
+    if not res["success"]:
+        return JSONResponse({"success": False, "message": res.get("message") or "关闭交易失败"})
+
+    if out_trade_no:
+        try:
+            mp_orders.update_order_status(out_trade_no=out_trade_no, status="closed")
+        except OSError as e:
+            logger.exception("[model-payment] 写入关闭本地记录失败: %s", e)
+
+    logger.info("[model-payment] close ok out_trade_no=%s trade_no=%s", out_trade_no, trade_no)
+    return JSONResponse({"success": True, "data": res.get("raw")})
+
+
+@router.get("/refund/query")
+def refund_query(request: Request, out_trade_no: str, out_request_no: str | None = None):
+    """alipay.trade.fastpay.refund.query：退款查询。不传 out_request_no 则默认等于 out_trade_no。"""
+    if not out_trade_no:
+        return JSONResponse({"success": False, "message": "out_trade_no 必填"}, status_code=400)
+    owned_payment_order(request, out_trade_no)
+    res = mp_ali.query_refund(out_trade_no=out_trade_no, out_request_no=out_request_no)
+    if not res["success"]:
+        return JSONResponse({"success": False, "message": res.get("message") or "退款查询失败"})
+    return JSONResponse({"success": True, "data": res.get("raw")})

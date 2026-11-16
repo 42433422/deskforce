@@ -1,0 +1,330 @@
+# ============================================================================
+# Python
+# ============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+!desktop/build/
+!desktop/build/**
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+!scripts/deploy/lib/
+!scripts/deploy/lib/**
+!mobile-flutter-poc/lib/
+!mobile-flutter-poc/lib/**
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# ============================================================================
+# IDE / editor metadata
+# ============================================================================
+.idea/
+.vscode/
+.trae/
+.cursor/logs/
+*.swp
+*.swo
+*.bak
+*~
+mobile_relay_desktop.json
+mobile_relay_desktop.json.bak-*
+
+# ============================================================================
+# Testing & coverage caches (NOTE: do NOT ignore tests/ directory itself)
+# ============================================================================
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+coverage.xml
+coverage.json
+coverage/
+.tox/
+.vector_index/
+
+# 运行时端口文件（run_fastapi.py 自动写入，前端 Vite 读取联动）
+.runtime/
+
+# ============================================================================
+# Database files (runtime data - keep code references to schemas)
+# ============================================================================
+*.db
+*.db-shm
+*.db-wal
+*.db.backup*
+*.sqlite
+*.sqlite3
+data/dev-db/
+XCAGI/data/desktop-dev/
+XCAGI/data/enterprise-desktop/
+XCAGI/data/admin-web-dev/
+XCAGI/data/
+data/model_payment_orders.json
+customer_products_final_corrected.db
+
+# Stray local scratch (historical)
+XCAGI/dy
+login_out.json
+project.private.config.json
+**/secret.yaml
+!**/secret.yaml.example
+scripts/ai_agent_v0/demo.local.env
+
+# ============================================================================
+# Logs & temporary output
+# ============================================================================
+*.log
+# 例外：SSOT 引用的验收证据 log（evidence 目录内的实测日志必须入仓，链接不得悬空）
+!docs/evidence/**/*.log
+logs/
+# 例外：实测证据的日志目录（日志由 SSOT 引用并做哈希校验，必须入仓）
+!docs/evidence/e2e/**/logs/
+.agent-*.log
+.uvicorn.*.log
+uvicorn-smoke.log
+bartender_gui_automation.log
+test_ocr_modify.log
+test_trademark_files.log
+tsc-errors.txt
+cleanup_report.txt
+**/_fail*.txt
+_fail*.txt
+_full*.txt
+_pytest*.txt
+_sweep*.txt
+startup_output.txt
+test_image.*
+test_barcode*
+
+# ============================================================================
+# OS
+# ============================================================================
+.DS_Store
+Thumbs.db
+
+# ============================================================================
+# Secrets & payment keys
+# ============================================================================
+.env
+.env.*
+!.env.example
+!.env.*.example
+.env.fhd-docker
+**/payment_orders/
+!**/payment_orders/README.md
+**/payment_orders/order_*.json
+**/keys_staging/
+.env.local
+.env.*.local
+# Vite build-mode presets (no secrets; safe to track)
+!frontend/.env.generic
+!frontend/.env.minimal
+scripts/package/upload-release.env
+scripts/package/mac-signing.env
+.secrets/
+*.der
+**/chroma/
+**/chroma_db/
+**/login_out.json
+**/alipay_app_private.pem
+**/alipay_*_private*.pem
+**/应用私钥*.txt
+**/应用私钥*.pem
+.tmp_alipay_pkg/
+
+# ============================================================================
+# Runtime output / generated / user data
+# ============================================================================
+uploads/
+temp_excel/
+shipment_outputs/
+saved_analyses/
+user_memory/
+!app/services/user_memory/
+app/services/user_memory/*
+!app/services/user_memory/*.py
+!app/domain/user_memory/
+!app/domain/user_memory/*.py
+!app/application/user_memory/
+app/application/user_memory/*
+!app/application/user_memory/*.py
+!app/infrastructure/user_memory/
+app/infrastructure/user_memory/*
+!app/infrastructure/user_memory/*.py
+labels/
+test_labels/
+output/
+outputs/
+temp/
+
+# Excel temp artifacts
+~$*.xlsx
+~$*.xls
+
+# Label generator outputs
+labels/*.png
+labels/*.jpg
+
+# Resource exports (customer trademarks etc.)
+resources/ai_assistant/*.png
+resources/ai_assistant/*.jpg
+resources/ai_assistant/*.jpeg
+resources/ai_assistant/商标导出/
+
+# Wechat decrypt binary (build artifact)
+wechat-decrypt/bin/
+wechat-decrypt/build/
+
+# 微信同步代理密钥与运行时文件（本机专用，含 token/聊天数据，禁止入库；mutants/ 沙箱整体已忽略）
+tools/wechat_sync/wechat_db_key.json
+tools/wechat_sync/wechat_sync_config.json
+tools/wechat_sync/wechat_sync_state.json
+tools/wechat_sync/wechat_context_cache.json
+tools/wechat_sync/wechat_sync.log
+tools/wechat_sync/wechat_sync.log.1
+
+# ============================================================================
+# Frontend build artifacts
+# ============================================================================
+node_modules/
+frontend/node_modules/
+frontend/.nm-e2e/
+frontend/.nm-*/
+**/.nm-*/
+frontend/.vite/
+frontend/dist/
+templates/vue-dist/
+templates/admin-vue-dist/
+templates/sunbird-vue-dist/
+vue-dist/
+
+# Agent/Codex 本地 smoke 截图与 JSON（勿提交）
+**/.codex-artifacts/
+
+# release_train bump 运行时快照（SSOT 为 config/release_train.json）
+config/release_train_history/
+
+# ============================================================================
+# Model checkpoints (large binaries)
+# ============================================================================
+*.pt
+*.safetensors
+checkpoints/
+distillation/checkpoints/
+
+# ============================================================================
+# Python 32bit distribution
+# ============================================================================
+python32/
+
+# ============================================================================
+# Archive / backups
+# ============================================================================
+.archive/
+git-backup/
+release-bundle/
+_backup_icon_system/
+_tmp_*/
+_perf_*.json
+
+# ============================================================================
+# Misc
+# ============================================================================
+git-change-inventory.txt
+arch_violations.txt
+test_reports/intent_benchmark_latest.json
+*.spec
+!scripts/package/xcagi_backend.spec
+current_page.html
+custom_mode_test.html
+.accelerate/
+
+# ============================================================================
+# Large local data / release builds
+# ============================================================================
+/release/
+!/release/
+/release/*
+!/release/VERSION
+update-server/
+424/
+# Sunbird custom installer seed (tracked)
+!delivery/
+!delivery/sunbird-seed/
+!delivery/sunbird-seed/**
+ces/
+10.2.0
+sz-qsm-pro-1.0.0.xcmod
+data/exports/
+合同/
+_compare_convert_output.xlsx
+
+# Removed mods snapshot (restored from git; may contain large zips)
+_archived_removed_mods/
+
+# detect_migration_status.py 运行产物(CI artifact,勿提交)
+migration_metrics.json
+migration_status_report.txt
+
+# docs_triage.py report/apply 每次重写的清单（生成物，勿提交）
+metrics/docs-triage.json
+
+# mutmut 3.x 变异测试沙箱与缓存（运行时生成约80M，勿提交）
+mutants/
+.mutmut-cache
+
+# 稳定设备标识运行时文件（device_identity.get_stable_device_id 写入 app data dir；
+# dev 模式回落到仓库根，勿提交）
+device_id
+
+# AI 员工生成/自省运行时产物（勿提交）
+.xcagi/*
+!.xcagi/
+!.xcagi/employee-inputs/
+!.xcagi/employee-inputs/**
+resources/routing_policies/reflection_ledger.jsonl
+
+# scripts/deploy/lib 由 !scripts/deploy/lib/** 放行，需重新排除缓存
+scripts/deploy/lib/**/__pycache__/
+coverage-behavior.json
+
+# 测试产物（benchmark 运行输出；放行 main 已追踪的 2 个历史产物，避免 source-governance 误报）
+test_reports/*
+!test_reports/junit-full.xml
+!test_reports/pytest-full-last.txt
+
+# .NET build artifacts (IDE-generated; was misdetected as code changes by dispatch pipeline)
+tools/**/obj/
+tools/**/bin/
+
+# 运行时/可再生成产物（不入库）
+mods/.install-receipts/
+distillation/training_data.jsonl
+baselines/
+frontend/coverage*
+frontend/test-results/
+frontend/playwright-report/
+*.tsbuildinfo
+
+# 意图语义兜底模型：构建时用 scripts/dev/fetch_intent_semantic_model.py 下载，不入库
+assets/models/fastembed/

@@ -1,0 +1,456 @@
+# XCMAX SSOT 注册表 — 唯一真相源登记
+# 由 ssot_cli.py 读取；新增域在此声明后经 ssot enable 启用。
+# MVP 只跑 check（调用各域 check 命令）；sync 命令在对应 P 批次落地后才被调用。
+version: 1
+
+domains:
+  # ===== MVP enabled 域（包装现有 5 个脚本）=====
+  - name: mods
+    owner: FHD/mod_sdk
+    enabled: true
+    ssot: FHD/mods/
+    derived:
+      - FHD/XCAGI/mods/
+    mode: sync
+    check: python scripts/dev/mods_ssot.py check
+    sync: python scripts/dev/mods_ssot.py sync
+
+  - name: ci-workflows
+    owner: ci
+    enabled: true
+    ssot: FHD/.github/workflows/
+    derived:
+      - .github/workflows/
+    mode: generate
+    # publish 脚本无 --check 模式；check = 只读 header 检查（ci_workflows.py）
+    check: python scripts/dev/ssot_plugins/ci_workflows.py check
+    sync: python scripts/dev/publish_ci_workflows_to_root.py
+
+  - name: coverage
+    owner: qa
+    enabled: true
+    ssot: FHD/metrics/coverage_ratchet_baseline.json
+    derived:
+      - FHD/pyproject.toml#[tool.coverage.report]fail_under
+      - FHD/frontend/vitest.config.js#thresholds
+      - FHD/metrics/coverage-dual-summary.json
+    mode: ratchet+verify
+    check: python scripts/dev/coverage_ratchet.py --check
+    # --bump 会同步更新 vitest.config.js thresholds（除非 --no-vitest）
+    sync: python scripts/dev/coverage_ratchet.py --bump
+
+  - name: version
+    owner: release
+    enabled: true
+    ssot: FHD/VERSION.md
+    derived:
+      - FHD/pyproject.toml#[project]version
+      - FHD/XCAGI/pyproject.toml#[project]version
+      - FHD/frontend/package.json#version
+      - FHD/desktop/package.json#version
+      - FHD/package.json#version
+      - FHD/XCAGI/package.json#version
+      - FHD/admin-console/package.json#version
+      - FHD/sunbird-console/package.json#version
+      - FHD/app/fastapi_app/factory.py#FastAPI(version=)
+      - FHD/app/infrastructure/mods/manifest.py#current_version
+      - FHD/mobile-flutter-poc/android/app/build.gradle.kts#versionName
+      - FHD/mobile-flutter-poc/pubspec.yaml#version
+      - FHD/mobile-flutter-poc/ios/Flutter/Version.xcconfig#FLUTTER_BUILD_NAME
+      - FHD/desktop/resources/build-info.json#version
+      - FHD/mobile-flutter-poc/lib/src/api/mobile_api.dart#versionName
+      - FHD/config/download_release.json#marketing_version
+      - FHD/config/release_train.json#product_version
+      - 成都修茈科技有限公司/FHD/config/release_train.json#product_version
+      - FHD/assets/contracts/openapi.json#info.version
+      - FHD/setup.iss#MyAppVersion
+      - FHD/tools/XcagiDownloader/Models/AppSettings.cs#fallback-version
+      - FHD/scripts/package/build-installer.ps1#default-version
+      - FHD/release/VERSION
+      - FHD/.github/workflows/release-orchestrator.yml#product_version
+    mode: sync+verify
+    check: python scripts/dev/verify_version_anchors.py
+    # --apply 真写；ssot sync version 默认 dry-run，--apply 透传给脚本
+    sync: python scripts/dev/version_sync.py --apply
+
+  - name: docs-ssot
+    owner: docs
+    enabled: true
+    ssot: FHD/docs/SSOT_INDEX.md
+    derived:
+      - FHD/CHANGELOG.md
+      - FHD/docs/security/CREDENTIAL_INCIDENT_CLOSEOUT.md
+      - FHD/XCAGI/README.md
+      - FHD/XCAGI/FRONTEND.md
+      - FHD/assets/rasa/README.md
+    mode: lint
+    check: python scripts/dev/docs_ssot_lint.py
+    sync: null
+
+  - name: account-system
+    owner: product-platform
+    enabled: true
+    ssot: FHD/docs/account_system_ssot.md
+    derived:
+      - FHD/config/saas_plans.json
+      - FHD/config/industry_presets.json
+      - FHD/config/industry_baseline.json
+      - FHD/config/industry_mod_aliases.json
+      - FHD/app/application/account_tier_derivation.py
+      - FHD/frontend/src/api/auth.ts
+      - FHD/frontend/src/api/modelPayment.ts
+      - FHD/frontend/src/views/RegisterView.vue
+      - FHD/frontend/src/views/AdminEntitlementsView.vue
+      - 成都修茈科技有限公司/MODstore_deploy/docs/developer/README.md
+      - 成都修茈科技有限公司/MODstore_deploy/docs/developer/01-quickstart.md
+      - 成都修茈科技有限公司/MODstore_deploy/docs/developer/02-authentication.md
+      - 成都修茈科技有限公司/MODstore_deploy/docs/developer/05-sdk-examples.md
+      - 成都修茈科技有限公司/MODstore_deploy/docs/developer/08-key-export-desktop.md
+      - 成都修茈科技有限公司/MODstore_deploy/market/src/views/developer/DeveloperTokensPanel.vue
+      - 成都修茈科技有限公司/MODstore_deploy/market/src/views/developer/DeveloperDocsPanel.vue
+    mode: lint
+    check: python scripts/dev/ssot_plugins/account_system.py check
+    sync: null
+
+  - name: public-site
+    owner: marketing-site
+    enabled: true
+    ssot: FHD/config/public_cases.json
+    derived:
+      - 成都修茈科技有限公司/site/data/public-site.json
+      - 成都修茈科技有限公司/site/data/site-release-acceptance.json
+      - 成都修茈科技有限公司/scripts/build_public_site.py
+      - 成都修茈科技有限公司/scripts/site_acceptance.py
+    mode: verify
+    # fail-closed：SSOT（案例/版本/价格/证据）更新而官网数据未再生成 → 非 0 退出
+    check: python ../成都修茈科技有限公司/scripts/build_public_site.py --check
+    sync: python ../成都修茈科技有限公司/scripts/build_public_site.py
+
+  # ===== 已启用域（lint/verify；ssot_cli gate 全量阻断）=====
+  - name: test-files
+    owner: qa
+    enabled: true
+    ssot: FHD/tests/
+    derived: []
+    mode: lint
+    check: python scripts/dev/ssot_plugins/test_files.py check
+    sync: null
+
+  - name: deploy-scripts
+    owner: devops
+    enabled: true
+    ssot: FHD/scripts/deploy/
+    derived: []
+    mode: lint
+    check: python scripts/dev/ssot_plugins/deploy_scripts.py check
+    sync: null
+
+  - name: deps
+    owner: backend
+    enabled: true
+    ssot: FHD/pyproject.toml
+    derived:
+      - FHD/requirements.txt
+      - FHD/requirements-ml.txt
+    mode: sync+verify
+    check: python scripts/dev/ssot_plugins/deps.py check
+    sync: null
+
+  - name: error-codes
+    owner: backend
+    enabled: true
+    ssot: FHD/app/http/error_codes.py
+    derived: []
+    mode: lint
+    check: python scripts/dev/ssot_plugins/error_codes.py check
+    sync: null
+
+  - name: registry-crosscheck
+    owner: platform-governance
+    enabled: true
+    # L1：ssot.yaml ↔ SSOT_INDEX.md 机器注册表互校验，防止双脑漂移。
+    ssot: FHD/docs/SSOT_INDEX.md
+    derived:
+      - FHD/config/ssot.yaml
+    mode: verify
+    check: python scripts/dev/ssot_registry_crosscheck.py check
+    sync: null
+
+  # k8s-manifests 域已随假 k8s 路径整体退役（2026-07-01 运维根治）：清单从未指向
+  # 真实集群，生产 = 单 CVM（FHD/scripts/deploy 发布链 + 仓库根 ops/）。恢复看 git 历史。
+
+  # ===== 此前游离于注册表外的真相源（2026-06-23 补登记）=====
+  - name: employee-roster
+    owner: hr-platform
+    enabled: true
+    # 员工/部门花名册 SSOT；生成器在仓库根 scripts/dev/（非 FHD/scripts/）。
+    # check 脚本以 Path(__file__) 自解析路径，cwd=FHD 时用 ../ 引用即可。
+    ssot: FHD/config/duty_roster.json
+    derived:
+      - 成都修茈科技有限公司/MODstore_deploy/modstore_server/duty_roster.py
+      - FHD/app/mod_sdk/duty_roster.py
+      - FHD/frontend/src/domain/yuangonDutyRoster.ts
+      - 成都修茈科技有限公司/MODstore_deploy/market/src/domain/yuangonDutyRoster.ts
+      - FHD/app/infrastructure/mods/catalog_visibility.py
+      - FHD/frontend/src/constants/enterpriseWorkflowEstablishment.ts
+      - FHD/mobile-flutter-poc/lib/src/data/duty_roster_ssot.dart
+    mode: sync
+    check: python ../scripts/dev/sync_duty_roster.py --check
+    sync: python ../scripts/dev/sync_duty_roster.py --generate
+
+  - name: db-schema
+    owner: backend
+    enabled: true
+    # DB schema：alembic 为唯一演进真相源；ensure_* 仅允许回填 ORM 已声明列（冻结守卫）。
+    # 此处 check = 纯 stdlib 结构守卫（单 head / 无悬挂 down_revision）。
+    # ORM-parity（alembic upgrade head == models）由 fhd-alembic-ssot.yml 的
+    # ssot-parity-sqlite job 阻断；PG parity 见 SCHEMA_DIALECT_NOTES（方言假阳性）。
+    ssot: FHD/alembic/versions/
+    derived:
+      - FHD/app/db/
+    mode: verify
+    check: python ../scripts/guard_alembic_single_head.py
+    sync: null
+
+  - name: service-topology
+    owner: devops
+    enabled: true
+    # 服务拓扑 SSOT（第 11 域）：把散落的服务器事实（xiu-ci.com 硬编码 71 文件 / 端口散 100+ 文件）
+    # 收口成单一真相源 FHD/config/service_topology.yaml；派生后端、前端、Flutter 常量与健康探针 JSON。
+    ssot: FHD/config/service_topology.yaml
+    derived:
+      - FHD/app/infrastructure/topology.py
+      - FHD/frontend/src/constants/topology.ts
+      - FHD/mobile-flutter-poc/lib/src/data/service_topology_ssot.dart
+      - FHD/config/topology.generated.json
+    mode: sync+verify
+    check: python scripts/dev/service_topology_ssot.py check
+    sync: python scripts/dev/service_topology_ssot.py generate --apply
+
+  - name: deployment-modes
+    owner: platform-runtime
+    enabled: true
+    # AI 部署模式 SSOT：统一内网/外网、手机局域网直连、性能模式三档策略。
+    ssot: FHD/config/deployment_modes.yaml
+    derived:
+      - FHD/config/deployment_modes.generated.json
+      - FHD/frontend/src/constants/deploymentModes.generated.ts
+      - FHD/mobile-flutter-poc/lib/src/data/deployment_modes_ssot.dart
+    mode: sync+verify
+    check: python3 scripts/dev/deployment_modes_ssot.py check
+    sync: python3 scripts/dev/deployment_modes_ssot.py generate --apply
+
+  - name: database-storage
+    owner: platform-runtime
+    enabled: true
+    # 数据库存储 SSOT：SQLite/PG 模式、SQLite -> PG 同步计划、桌面 database.json profile 策略。
+    ssot: FHD/config/database_storage_modes.yaml
+    derived:
+      - FHD/config/database_storage_modes.generated.json
+      - FHD/frontend/src/constants/databaseStorageModes.generated.ts
+    mode: sync+verify
+    check: python3 scripts/dev/database_storage_ssot.py check
+    sync: python3 scripts/dev/database_storage_ssot.py generate --apply
+
+  - name: mobile-tri-platform
+    owner: mobile-platform
+    enabled: true
+    # 移动统一 SSOT：Flutter 前端、OpenAPI 契约、FastAPI 后端业务、设计 token、端侧性能监控。
+    ssot: FHD/docs/mobile_tri_platform_ssot.md
+    derived:
+      - FHD/config/mobile_design_tokens.json
+      - FHD/assets/contracts/openapi.json
+      - FHD/app/fastapi_routes/mobile_api.py
+      - FHD/app/fastapi_routes/mobile_api_extensions.py
+      - FHD/app/fastapi_routes/mobile_extensions/routes_ai_groups.py
+      - FHD/mobile-flutter-poc/README.md
+      - FHD/mobile-flutter-poc/FLUTTER_UNIFICATION.md
+      - FHD/mobile-flutter-poc/lib/src/api/mobile_api.dart
+      - FHD/mobile-flutter-poc/lib/src/api/mobile_models.dart
+      - FHD/mobile-flutter-poc/lib/src/data/mobile_repository.dart
+      - FHD/mobile-flutter-poc/lib/src/theme/app_theme.dart
+    mode: lint
+    check: python scripts/dev/ssot_plugins/mobile_tri_platform.py check
+    sync: null
+
+  - name: neuro-bus-events
+    owner: neuro-platform
+    enabled: true
+    # NeuroBus 事件契约 SSOT:统一三流(NeuroBus 域事件 + AgentRun 事件 + 应用桥接)。
+    # canonical 命名 = code 中实际 emit 的字符串(dataclass 默认值即 canonical);
+    # 派生 Python 常量(非 Enum,字节级零破坏 string-equality 调用) + TS 类型 + OpenAPI schema。
+    # check 含 4 道校验:派生一致 + dataclass 默认值在 SSOT + orchestrator 字符串在 SSOT + OpenAPI schema 一致。
+    ssot: FHD/config/neuro_bus_events.yaml
+    derived:
+      - FHD/app/neuro_bus/event_types_generated.py
+      - FHD/frontend/src/types/agentRunEvents.generated.ts
+      - FHD/assets/contracts/openapi.json#components.schemas.AgentRunEvent
+    mode: generate+verify
+    check: python scripts/dev/neuro_bus_events_ssot.py check
+    sync: python scripts/dev/neuro_bus_events_ssot.py generate --apply
+
+  - name: runtime-inventory
+    owner: devops
+    enabled: true
+    # 运行时真相 SSOT：desired（拓扑）× actual（端口/进程/systemd/health）→ 单一可消费清单。
+    # check 校验拓扑声明完整 + 派生 schema；live 探针由 scripts/ops/runtime_inventory.py probe。
+    ssot: FHD/config/service_topology.yaml
+    derived:
+      - FHD/config/topology.generated.json
+      - FHD/scripts/ops/runtime_inventory.py
+    mode: verify
+    check: python scripts/ops/runtime_inventory.py check
+    sync: null
+
+  - name: desktop-platform-parity
+    owner: desktop-platform
+    enabled: true
+    # 桌面双端平级 SSOT（2026-09-09 生效）：Windows 与 macOS 平级发布（同版本/同 release_sha/双端齐备），
+    # 功能双端验证通过才算完成；平台差异收口 FHD/desktop/platform/ 适配层，
+    # 业务模块禁止散落 process.platform 判断，不再让 Windows 追着 Mac 改。
+    ssot: FHD/docs/desktop_platform_parity_ssot.md
+    derived:
+      - FHD/.github/workflows/release-desktop.yml
+    mode: lint
+    check: python scripts/dev/ssot_plugins/desktop_platform_parity.py check
+    sync: null
+
+  - name: macos-release
+    owner: desktop-platform
+    enabled: true
+    # macOS 发布交付事实快照（人工维护）：版本/产物/SHA256/Gate 状态/偏差登记/实机任务/发版 runbook。
+    # check 只校验文档结构与 Gate 状态值合法性；真机证据无法自动校验，按 §9 runbook 回填。
+    ssot: FHD/docs/MACOS_RELEASE_SSOT.md
+    derived: []
+    mode: lint
+    check: python scripts/dev/ssot_plugins/macos_release.py check
+    sync: null
+
+  - name: windows-release
+    owner: desktop-platform
+    enabled: true
+    # Windows 发布交付事实快照（人工维护）：版本/产物/SHA256/下载与更新地址/测试机/Gate 状态/阻断登记/实机任务/runbook。
+    # check 同时约束新版 WPF 出包入口；真机证据按 §8 runbook 回填。
+    ssot: FHD/docs/WINDOWS_RELEASE_SSOT.md
+    derived:
+      - FHD/scripts/package/build-installer.ps1
+      - FHD/scripts/package/build-all-skus.ps1
+    mode: lint
+    check: python scripts/dev/ssot_plugins/windows_release.py check
+    sync: null
+
+  - name: repository-ssot
+    owner: backend
+    enabled: true
+    # 仓储实现唯一真相源：禁止同一 <Entity>Repository port 重复实现（保新建删/DDD 演进）。
+    # 唯一规范目录 = app/infrastructure/repositories/；persistence/ 仅保留非 domain 仓储实现。
+    ssot: FHD/app/infrastructure/repositories/
+    derived:
+      - FHD/app/infrastructure/persistence/
+      - FHD/app/application/ports/
+    mode: lint
+    check: python scripts/dev/ssot_plugins/repository_ssot.py check
+    sync: null
+
+  - name: structure-gates
+    owner: platform-governance
+    enabled: true
+    # Neuro-DDD 结构门禁 G1–G6（阶段二列车 A）：棘轮恶化即失败。
+    ssot: FHD/scripts/ci/check_structure_gates.py
+    derived:
+      - FHD/scripts/ci/structure-gate-exemptions.yml
+    mode: lint
+    check: python scripts/ci/check_structure_gates.py --repo ../ --fail-on-warn
+    sync: null
+
+  - name: dev-inventory
+    owner: devops
+    enabled: true
+    # 开发工具盘点：把分散在 scripts/dev|ci|scripts 的规范性守卫/棘轮/校验脚本统一登记，
+    # 防止新"轮子"游离于 SSOT 工程外。棘轮模式：只拦新增未登记脚本。
+    ssot: FHD/scripts/dev/
+    derived:
+      - FHD/docs/DEV_TOOLS_INVENTORY.md
+    mode: lint
+    check: python scripts/dev/ssot_inventory.py --check
+    sync: null
+
+  - name: dev-guards
+    owner: devops
+    enabled: true
+    # 开发守卫统一入口：串行聚合游离的规范性守卫/棘轮脚本，纳入 ssot_cli gate 硬门禁。
+    # 命令参数与 fhd-ci-cd.yml backend-test 一致；依赖覆盖率数据的守卫不进本聚合。
+    ssot: FHD/scripts/dev/
+    derived: []
+    mode: lint
+    check: python scripts/dev/dev_guards.py check
+    sync: null
+
+  - name: net-deletion
+    owner: platform-governance
+    enabled: true
+    # 净删除棘轮 SSOT：全仓「人工维护代码 + 文档」总行数基线，只减不增（棘轮）。
+    # 口径与排除项（生成物/第三方/dump/锁文件）见 scripts/dev/check_net_deletion.py；
+    # 已独立成域，故不进 dev-guards 聚合，避免同一门禁重复执行。
+    ssot: FHD/metrics/line_baseline.json
+    derived: []
+    mode: ratchet
+    check: python scripts/dev/check_net_deletion.py
+    sync: python scripts/dev/check_net_deletion.py --update
+
+  - name: audit-benchmark
+    owner: audit-quality
+    enabled: true
+    ssot: FHD/config/audit_benchmark_ssot.json
+    derived:
+      - FHD/docs/AUDIT_BENCHMARK_SSOT.md
+    mode: generate
+    check: python scripts/dev/audit_benchmark_ssot.py check
+    sync: python scripts/dev/audit_benchmark_ssot.py generate
+
+  - name: capability-center
+    owner: marketing-site
+    enabled: true
+    # 官网产品能力中心：目录为唯一事实源，页面/公开数据由生成器产出。
+    # No Evidence, No Claim：check 会逐项校验证据并拒绝目录与页面漂移。
+    ssot: 成都修茈科技有限公司/data/capabilities/catalog.json
+    derived:
+      - 成都修茈科技有限公司/capabilities/
+      - 成都修茈科技有限公司/data/capabilities.json
+    mode: generate
+    check: python "../成都修茈科技有限公司/scripts/build_capability_center.py" --check
+    sync: python "../成都修茈科技有限公司/scripts/build_capability_center.py"
+
+  - name: business-contracts
+    owner: quality
+    enabled: true
+    # 业务契约目录。必跑场景写在检查器的 MINIMUM_REQUIRED 里，目录删掉必跑项会失败。
+    ssot: FHD/config/business_contracts.json
+    derived: []
+    mode: lint
+    check: python scripts/dev/check_business_contract_evidence.py catalog
+    sync: null
+
+  - name: release-scope-evidence
+    owner: release
+    enabled: true
+    # 发布候选制品与必跑范围。BLOCKED 和 NOT RUN 不能记成通过。
+    ssot: FHD/config/release_scope_evidence.json
+    derived: []
+    mode: lint
+    check: python scripts/dev/check_release_scope_evidence.py --self-check
+    sync: null
+
+  - name: product-lines
+    owner: release
+    enabled: true
+    # 三产品线统一控制面：声明式输入无数字，版本/发布/能力/覆盖率/门禁结论
+    # 全部从各自权威源现算；阻断硬编码版本、未声明副本与生成物漂移。
+    ssot: FHD/config/product_lines.yaml
+    derived:
+      - 成都修茈科技有限公司/data/release-history.json
+      - FHD/metrics/product_lines_status.generated.json
+      - FHD/docs/PRODUCT_LINES_STATUS.md
+    mode: generate
+    check: python scripts/dev/product_lines_status.py check
+    sync: python scripts/dev/product_lines_status.py generate

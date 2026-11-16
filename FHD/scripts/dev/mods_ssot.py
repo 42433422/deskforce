@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+"""Mod SSOT 统一派发入口（唯一源 = FHD/mods）。
+
+SSOT: FHD/mods（唯一编辑源）
+下游唯一副本: FHD/XCAGI/mods（后端运行时 / 打包路径），由本脚本单向派发。
+
+历史双副本 mods-admin-runtime 已移除（前端统一只读 mods/，见
+frontend/src/constants/mod{Route,PhysicalView}Glob.*、router/registerModRoutes.ts、
+router/modViews.ts）；冲突渠道 sync-admin-mod-runtime.sh /
+sync-enterprise-mod-seeds.sh 已删除。
+
+用法:
+  python scripts/dev/mods_ssot.py sync              # 全量同步 SSOT → XCAGI/mods
+  python scripts/dev/mods_ssot.py sync --dry-run
+  python scripts/dev/mods_ssot.py sync --mod xcagi-erp-domain-bridge
+  python scripts/dev/mods_ssot.py check             # 检查漂移（CI / 发版前）
+"""
+
+from __future__ import annotations
+
+import argparse
+import filecmp
+import hashlib
+import shutil
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+SSOT_ROOT = ROOT / "mods"
+EXPORT_ROOT = ROOT / "XCAGI" / "mods"
+
+SKIP_DIR_NAMES = frozenset({"__pycache__", "node_modules", ".git", "docs"})
+SKIP_FILE_NAMES = frozenset({".DS_Store"})
+# Binary data files ignored by XCAGI/.gitignore (*.xlsx, etc.) — skip in diff check
+SKIP_SUFFIXES = frozenset({".xlsx", ".xls", ".csv.gz"})
+
+# 仅存在于 EXPORT_ROOT（FHD/XCAGI/mods/）的 mod 白名单。
+# 这些 mod 是"运行时副本 SSOT"——有意不放在编辑源 SSOT_ROOT（FHD/mods/），
+# 避免双份漂移。见 commit 6804159c3（attendance-industry 迁移）。
+# 治理工具必须跟上代码意图：双路径查找（a34114a0a）+ 导出副本 SSOT 模型。
+EXPORT_ONLY_MODS = frozenset({"attendance-industry"})
+SOURCE_ONLY_MODS = frozenset({"sunbird-attendance-custom"})
+
+# debt19 (#2631): XCAGI dual-tree shrink — SSOT remains FHD/mods; these mods intentionally
+# have no FHD/XCAGI/mods export (avoids blueprints.py / dual-copy growth).
+NO_XCAGI_EXPORT_MODS = frozenset(
+    {
+        "accessories-packaging-industry",
+        "coating-industry",
+        "lan-gate-ai-employee",
+        "sz-qsm-pro",
+        "taiyangniao-pro",
+        "xcagi-approval-bridge",
+        "xcagi-core-workflow-employees",
+        "xcagi-customer-service-bridge",
+        "xcagi-erp-domain-bridge",
+        "xcagi-lan-license-bridge",
+        "xcagi-model-payment-bridge",
+        "xcagi-neuro-bus-bridge",
+        "xcagi-office-employee-pack-bridge",
+        "xcagi-planner-bridge",
+        "xcagi-planner-excel-tools",
+        "xcagi-workflow-visualization-bridge",
+    }
+)
+
+
+def _skip_path(rel: Path) -> bool:
+    if rel.name in SKIP_FILE_NAMES:
+        return True
+    if rel.suffix in (".pyc", *SKIP_SUFFIXES):
+        return True
+    return any(part in SKIP_DIR_NAMES for part in rel.parts)
+
+
+def list_mod_ids(root: Path) -> list[str]:
+    """列出 Mod id。
+
+    编辑源按 ``industry/ bridge/ employees/ tools/`` 分层，导出目录保持平铺，
+    两种布局都要能枚举（id 仍是 Mod 目录名）。
+    """
+    if not root.is_dir():
+        return []
+    out: list[str] = []
+    for entry in sorted(root.iterdir()):
+        if not entry.is_dir() or entry.name.startswith(("_", ".")):
+            continue
+        if (entry / "manifest.json").is_file():
+            out.append(entry.name)
+            continue
+        for sub in sorted(entry.iterdir()):
+            if (
+                sub.is_dir()
+                and not sub.name.startswith(("_", "."))
+                and (sub / "manifest.json").is_file()
+            ):
+                out.append(sub.name)
+    return out
+
+
+def find_source_dir(mod_id: str) -> Path | None:
+    """在编辑源中定位 Mod 目录（平铺或分层容器下一层）。"""
+    direct = SSOT_ROOT / mod_id
+    if (direct / "manifest.json").is_file():
+        return direct
+    if not SSOT_ROOT.is_dir():
+        return None
+    for entry in sorted(SSOT_ROOT.iterdir()):
+        if not entry.is_dir() or entry.name.startswith(("_", ".")):
+            continue
+        candidate = entry / mod_id
+        if (candidate / "manifest.json").is_file():
+            return candidate
+    return None
+
+
+def iter_relative_files(root: Path) -> dict[str, Path]:
+    files: dict[str, Path] = {}
+    if not root.is_dir():
+        return files
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(root)
+        if _skip_path(rel):
+            continue
+        files[rel.as_posix()] = path
+    return files
+
+
+def file_digest(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def compare_mod(mod_id: str) -> list[str]:
+    src = find_source_dir(mod_id)
+    dst = EXPORT_ROOT / mod_id
+    issues: list[str] = []
+    if src is None or not src.is_dir():
+        issues.append(f"{mod_id}: SSOT 目录不存在")
+        return issues
+    if mod_id in SOURCE_ONLY_MODS:
+        if dst.exists():
+            issues.append(f"{mod_id}: 私有源码不得导出到 XCAGI/mods")
+        return issues
+    if mod_id in NO_XCAGI_EXPORT_MODS:
+        if dst.exists():
+            issues.append(
+                f"{mod_id}: debt19 禁止导出到 XCAGI/mods（请删除导出副本，SSOT 仅 FHD/mods）"
+            )
+        return issues
+    if not dst.is_dir():
+        issues.append(f"{mod_id}: 导出副本缺失（请运行 sync）")
+        return issues
+
+    src_files = iter_relative_files(src)
+    dst_files = iter_relative_files(dst)
+
+    for rel in sorted(set(src_files) - set(dst_files)):
+        issues.append(f"{mod_id}: 导出副本缺少 {rel}")
+    for rel in sorted(set(dst_files) - set(src_files)):
+        issues.append(f"{mod_id}: 导出副本多余 {rel}")
+    for rel in sorted(set(src_files) & set(dst_files)):
+        if file_digest(src_files[rel]) != file_digest(dst_files[rel]):
+            issues.append(f"{mod_id}: 内容不一致 {rel}")
+    return issues
+
+
+def sync_mod(mod_id: str, *, dry_run: bool, prune: bool) -> None:
+    if mod_id in SOURCE_ONLY_MODS:
+        raise SystemExit(f"私有 Mod 不允许导出到 XCAGI/mods: {mod_id}")
+    if mod_id in NO_XCAGI_EXPORT_MODS:
+        raise SystemExit(f"debt19: Mod 不允许导出到 XCAGI/mods: {mod_id}")
+    src = find_source_dir(mod_id)
+    dst = EXPORT_ROOT / mod_id
+    if src is None or not src.is_dir():
+        raise SystemExit(f"SSOT 中无 Mod 目录: {mod_id}")
+    if not (src / "manifest.json").is_file():
+        raise SystemExit(f"缺少 manifest.json: {src / 'manifest.json'}")
+
+    EXPORT_ROOT.mkdir(parents=True, exist_ok=True)
+    if dry_run:
+        print(f"[dry-run] sync {src} -> {dst}")
+    else:
+        dst.mkdir(parents=True, exist_ok=True)
+
+    src_files = iter_relative_files(src)
+    dst_files = iter_relative_files(dst) if dst.is_dir() else {}
+
+    for rel, src_path in sorted(src_files.items()):
+        target = dst / rel
+        if dry_run:
+            if rel not in dst_files:
+                print(f"[dry-run] + {mod_id}/{rel}")
+            elif file_digest(src_path) != file_digest(dst_files[rel]):
+                print(f"[dry-run] ~ {mod_id}/{rel}")
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.is_file() or not filecmp.cmp(src_path, target, shallow=False):
+            shutil.copy2(src_path, target)
+
+    if prune:
+        for rel in sorted(set(dst_files) - set(src_files)):
+            extra = dst / rel
+            if dry_run:
+                print(f"[dry-run] - {mod_id}/{rel}")
+            elif extra.is_file():
+                extra.unlink()
+
+
+def cmd_check(mod_ids: list[str]) -> int:
+    if not SSOT_ROOT.is_dir():
+        print(f"SSOT 根目录不存在: {SSOT_ROOT}", file=sys.stderr)
+        return 2
+    targets = mod_ids or list_mod_ids(SSOT_ROOT)
+    issues: list[str] = []
+    for mod_id in targets:
+        issues.extend(compare_mod(mod_id))
+
+    export_only = sorted(
+        set(list_mod_ids(EXPORT_ROOT)) - set(list_mod_ids(SSOT_ROOT)) - EXPORT_ONLY_MODS
+    )
+    for mod_id in export_only:
+        issues.append(f"{mod_id}: 仅存在于 XCAGI/mods（SSOT 中无此 Mod，应删除或移回 mods/）")
+
+    if issues:
+        print("Mod SSOT 漂移（请改 FHD/mods 后运行 mods_ssot.py sync）：", file=sys.stderr)
+        for line in issues:
+            print(f"  - {line}", file=sys.stderr)
+        return 1
+
+    print(
+        f"Mod SSOT 一致：{len(targets)} 个 Mod（{SSOT_ROOT.name} → {EXPORT_ROOT.relative_to(ROOT)}）"
+    )
+    return 0
+
+
+def cmd_sync(mod_ids: list[str], *, dry_run: bool, prune: bool) -> int:
+    if not SSOT_ROOT.is_dir():
+        print(f"SSOT 根目录不存在: {SSOT_ROOT}", file=sys.stderr)
+        return 2
+    targets = mod_ids or [mid for mid in list_mod_ids(SSOT_ROOT) if mid not in SOURCE_ONLY_MODS and mid not in NO_XCAGI_EXPORT_MODS]
+    if not targets:
+        print("SSOT 下未发现带 manifest.json 的 Mod", file=sys.stderr)
+        return 2
+
+    for mod_id in targets:
+        sync_mod(mod_id, dry_run=dry_run, prune=prune)
+
+    if dry_run:
+        print(f"[dry-run] 将同步 {len(targets)} 个 Mod")
+    else:
+        print(f"已同步 {len(targets)} 个 Mod: {SSOT_ROOT.name} → {EXPORT_ROOT.relative_to(ROOT)}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="FHD Mod SSOT：mods/ 为唯一编辑源，XCAGI/mods 为导出副本。"
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    check_p = sub.add_parser("check", help="检查 SSOT 与导出副本是否一致")
+    check_p.add_argument(
+        "--mod", action="append", dest="mods", metavar="MOD_ID", help="仅检查指定 Mod"
+    )
+
+    sync_p = sub.add_parser("sync", help="将 FHD/mods 同步到 FHD/XCAGI/mods")
+    sync_p.add_argument(
+        "--mod", action="append", dest="mods", metavar="MOD_ID", help="仅同步指定 Mod"
+    )
+    sync_p.add_argument("--dry-run", action="store_true", help="只打印将变更的文件")
+    sync_p.add_argument(
+        "--prune",
+        action="store_true",
+        help="删除导出副本中 SSOT 已不存在的文件（默认只增改不删）",
+    )
+
+    args = parser.parse_args(argv)
+    mod_ids = list(args.mods or [])
+
+    if args.command == "check":
+        return cmd_check(mod_ids)
+    if args.command == "sync":
+        return cmd_sync(mod_ids, dry_run=args.dry_run, prune=args.prune)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

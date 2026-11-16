@@ -1,0 +1,517 @@
+"""AI 助手兼容接口，仅承接其他兼容路由未覆盖的端点。
+
+GET /api/purchase_units 由 xcagi_compat 提供，此处不重复注册。
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from fastapi import APIRouter, Body, Depends, Query
+from fastapi.responses import JSONResponse
+
+from app.build_identity import build_identity
+from app.domain.shipment.shipment_quantities import shipment_quantity_hint
+from app.fastapi_routes.ai_assistant_responses import fail as _fail
+from app.fastapi_routes.ai_assistant_responses import ok as _ok
+from app.fastapi_routes.ai_assistant_responses import shipment_failure
+from app.fastapi_routes.ai_assistant_tts import router as tts_router
+from app.infrastructure.auth.business_scope_gate import require_print_permission as _print_gate
+from app.infrastructure.auth.business_scope_gate import require_scoped_business_permission
+from app.utils.operational_errors import RECOVERABLE_ERRORS
+from app.utils.security.safe_download_path import (
+    UnsafeDownloadPathError,
+    resolve_under_allowed_dirs,
+)
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(tags=["ai-assistant-compat"])
+router.include_router(tts_router)
+_shipment_access = [Depends(require_scoped_business_permission("shipment.view", "shipment.edit"))]
+_print_access = [Depends(_print_gate())]
+_product_access = [Depends(require_scoped_business_permission("product.view", "product.edit"))]
+
+_TRACE_MAX_STRING = 500
+_TRACE_SECRET_KEYS = {"audiobase64", "audio_base64", "key", "token", "password", "secret"}
+
+
+def _trace_safe_value(value: Any, *, key: str = "", depth: int = 0) -> Any:
+    lowered = key.lower()
+    if lowered in _TRACE_SECRET_KEYS:
+        text = str(value or "")
+        return {"redacted": True, "length": len(text)}
+    if depth >= 4:
+        return str(value)[:_TRACE_MAX_STRING]
+    if isinstance(value, str):
+        if len(value) <= _TRACE_MAX_STRING:
+            return value
+        return value[:_TRACE_MAX_STRING] + "...[truncated]"
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    if isinstance(value, dict):
+        return {
+            str(k): _trace_safe_value(v, key=str(k), depth=depth + 1)
+            for k, v in list(value.items())[:40]
+        }
+    if isinstance(value, (list, tuple)):
+        return [_trace_safe_value(item, depth=depth + 1) for item in list(value)[:20]]
+    return str(value)[:_TRACE_MAX_STRING]
+
+
+def _trace_ai_assistant_route(
+    payload: dict[str, Any],
+    *,
+    route: str,
+    action: str,
+    body: dict[str, Any] | None = None,
+    channel: str = "ai_assistant_compat",
+) -> dict[str, Any]:
+    if not isinstance(payload, dict) or payload.get("run_id") or payload.get("agent_run_id"):
+        return payload
+    try:
+        from app.application.agent_orchestrator.chat_trace import create_chat_trace_run
+
+        message = str(payload.get("message") or action)
+        safe_payload = _trace_safe_value(payload)
+        safe_body = _trace_safe_value(body or {})
+        run = create_chat_trace_run(
+            {
+                "success": bool(payload.get("success", False)),
+                "response": message,
+                "data": {"text": message, "route_result": safe_payload},
+            },
+            message=f"AI assistant compat {action}",
+            runtime_context={
+                "route": route,
+                "source": "ai_assistant_compat",
+                "action": action,
+                "request": safe_body,
+            },
+            user_id=str(
+                (body or {}).get("user_id") or (body or {}).get("userId") or "ai-assistant"
+            ),
+            source="ai_assistant_compat",
+            channel=channel,
+            intent="ai_assistant_compat_route",
+        )
+        traced = dict(payload)
+        traced["run_id"] = run.run_id
+        traced["agent_run_id"] = run.run_id
+        return traced
+    except RECOVERABLE_ERRORS:
+        logger.exception("failed to attach AgentRun trace to ai_assistant compat route")
+        return payload
+
+
+def _shipment_svc():
+    from app.bootstrap import get_shipment_application_service_core
+
+    return get_shipment_application_service_core()
+
+
+def _printer_svc():
+    """
+    打印机服务需保持“轻量可用”：即便 AI/意图引擎等依赖未就绪，也应可查询打印机列表。
+
+    注意：不要从 `app.services` 导入（其 __init__ 会拉起大量服务/依赖，可能导致启动慢或卡死），
+    直接引用打印服务模块内的单例即可。
+    """
+    from app.application.facades.print_facade import printer_service
+
+    return printer_service
+
+
+def _distinct_product_names(keyword: str | None = None) -> list[str]:
+    from app.application.facades.query_facade import get_product_names
+
+    return get_product_names(keyword=keyword)
+
+
+# ``/api/health`` 只由 ``register_health_routes`` 注册。这里只保留 ``/health``。
+@router.get("/health", include_in_schema=False)
+def compat_health():
+    identity = build_identity()
+    return _ok(
+        {
+            "status": "ok",
+            "timestamp": datetime.now().isoformat(),
+            "build": identity,
+        },
+        build=identity,
+    )
+
+
+@router.post("/api/generate", dependencies=_shipment_access)
+def compat_ai_generate(payload: dict[str, Any] = Body(default_factory=dict)):
+    order_text = str(payload.get("order_text") or "").strip()
+    preferred_template = payload.get("preferred_template") or payload.get("template")
+
+    if not order_text:
+        return _fail("请输入订单信息", 400)
+
+    try:
+        from app.application.facades.tools_facade import _parse_order_text
+
+        parsed = _parse_order_text(order_text)
+        if not parsed.get("success"):
+            return _fail(
+                shipment_quantity_hint(str(parsed.get("error_code") or ""))
+                or "订单解析失败，请检查输入内容",
+                400,
+            )
+
+        unit_name = str(parsed.get("unit_name") or "").strip()
+        products = parsed.get("products") or []
+        if not unit_name or not products:
+            return _fail("订单解析结果为空", 400)
+
+        app_service = _shipment_svc()
+        result = app_service.generate_shipment_document(
+            unit_name=unit_name,
+            products=products,
+            template_name=payload.get("template_name"),
+            template_id=payload.get("template_id"),
+            preferred_template=preferred_template,
+            intent="shipment_generate",
+            raw_text=order_text,
+        )
+
+        if not result.get("success"):
+            safe_fail, failure_status = shipment_failure(result)
+            traced = _trace_ai_assistant_route(
+                safe_fail,
+                route="/api/generate",
+                action="generate_shipment_document",
+                body=payload,
+            )
+            return JSONResponse(traced, status_code=failure_status)
+
+        file_path = result.get("file_path")
+        doc_name = result.get("doc_name") or (os.path.basename(file_path) if file_path else None)
+        download_url = f"/api/shipment/download/{doc_name}" if doc_name else None
+
+        return _trace_ai_assistant_route(
+            _ok(
+                {
+                    "doc_name": doc_name,
+                    "file_path": file_path,
+                    "download_url": download_url,
+                    "order_number": result.get("order_number"),
+                    "total_amount": result.get("total_amount"),
+                    "total_quantity": result.get("total_quantity"),
+                    "template_resolution": result.get("template_resolution"),
+                    "products_source": result.get("products_source"),
+                },
+                message="发货单生成成功",
+                filename=doc_name,
+                file_path=file_path,
+            ),
+            route="/api/generate",
+            action="generate_shipment_document",
+            body=payload,
+        )
+    except RECOVERABLE_ERRORS as e:
+        logger.error("兼容 /api/generate 失败: %s", e, exc_info=True)
+        return _fail("生成失败", 500)
+
+
+@router.get("/api/shipment-records/units", dependencies=_shipment_access)
+def compat_shipment_records_units():
+    app_service = _shipment_svc()
+    units = app_service.get_purchase_units()
+    return _ok(units, count=len(units))
+
+
+@router.get("/api/shipment-records/records", dependencies=_shipment_access)
+def compat_shipment_records_records(unit: str | None = Query(default=None)):
+    app_service = _shipment_svc()
+    rows = app_service.get_shipment_records(unit_name=unit)
+    return _ok(rows, count=len(rows))
+
+
+@router.get("/api/units", dependencies=_shipment_access)
+def compat_units_alias():
+    from app.application.facades.query_facade import get_purchase_units
+
+    data = get_purchase_units()
+    return _ok(data, count=len(data))
+
+
+@router.post("/api/purchase_units", dependencies=_shipment_access)
+def compat_purchase_units_create(payload: dict[str, Any] = Body(default_factory=dict)):
+    from app.application.facades.query_facade import find_purchase_unit
+    from app.db.models import PurchaseUnit
+    from app.db.session import get_db
+
+    unit_name = str(payload.get("unit_name") or payload.get("name") or "").strip()
+    if not unit_name:
+        return _fail("单位名称不能为空", 400)
+
+    exists = find_purchase_unit(unit_name=unit_name)
+    if exists:
+        return _trace_ai_assistant_route(
+            _ok(
+                {"id": exists["id"], "unit_name": exists["unit_name"]},
+                message="已存在",
+            ),
+            route="/api/purchase_units",
+            action="purchase_unit_create",
+            body=payload,
+        )
+
+    with get_db() as db:
+        unit = PurchaseUnit(
+            unit_name=unit_name,
+            contact_person=payload.get("contact_person") or "",
+            contact_phone=payload.get("contact_phone") or "",
+            address=payload.get("address") or "",
+        )
+        db.add(unit)
+        db.commit()
+        return _trace_ai_assistant_route(
+            _ok({"id": unit.id, "unit_name": unit.unit_name}, message="添加成功"),
+            route="/api/purchase_units",
+            action="purchase_unit_create",
+            body=payload,
+        )
+
+
+@router.put("/api/purchase_units/{unit_id}", dependencies=_shipment_access)
+def compat_purchase_units_update(
+    unit_id: int, payload: dict[str, Any] = Body(default_factory=dict)
+):
+    from app.db.models import PurchaseUnit
+    from app.db.session import get_db
+
+    with get_db() as db:
+        unit = db.query(PurchaseUnit).filter(PurchaseUnit.id == unit_id).first()
+        if not unit:
+            return _fail("购买单位不存在", 404)
+        if "unit_name" in payload and str(payload.get("unit_name") or "").strip():
+            unit.unit_name = str(payload["unit_name"]).strip()
+        for k in ("contact_person", "contact_phone"):
+            if k in payload:
+                setattr(unit, k, payload.get(k))
+        if "address" in payload:
+            unit.address = payload.get("address") or ""
+        db.commit()
+        return _trace_ai_assistant_route(
+            _ok({"id": unit.id, "unit_name": unit.unit_name}, message="更新成功"),
+            route="/api/purchase_units/{unit_id}",
+            action="purchase_unit_update",
+            body={"unit_id": unit_id, **dict(payload or {})},
+        )
+
+
+@router.delete("/api/purchase_units/{unit_id}", dependencies=_shipment_access)
+def compat_purchase_units_delete(unit_id: int):
+    from app.application.facades.query_facade import query_service
+    from app.db.models import PurchaseUnit
+
+    deleted = query_service.delete(PurchaseUnit, id=unit_id)
+    if deleted == 0:
+        return _fail("购买单位不存在", 404)
+    return _trace_ai_assistant_route(
+        _ok(message="删除成功"),
+        route="/api/purchase_units/{unit_id}",
+        action="purchase_unit_delete",
+        body={"unit_id": unit_id},
+    )
+
+
+@router.get("/api/purchase_units/by_name/{unit_name}", dependencies=_shipment_access)
+def compat_purchase_units_by_name(unit_name: str):
+    from app.application.facades.query_facade import find_purchase_unit
+
+    name = (unit_name or "").strip()
+    unit = find_purchase_unit(unit_name=name)
+    if not unit:
+        return _fail("购买单位不存在", 404)
+    return _ok(unit)
+
+
+@router.get("/api/product_names", dependencies=_product_access)
+def compat_product_names():
+    names = _distinct_product_names()
+    return _ok(names, count=len(names))
+
+
+@router.get("/api/product_names/search", dependencies=_product_access)
+def compat_product_names_search(keyword: str = Query(default="")):
+    names = _distinct_product_names(keyword=keyword or None)
+    return _ok(names, count=len(names))
+
+
+@router.get("/api/product_names/by_unit/{unit_id}", dependencies=_product_access)
+def compat_product_names_by_unit(unit_id: int):
+    names = _distinct_product_names()
+    return _ok(names, count=len(names), unit_id=unit_id)
+
+
+@router.get("/api/product_names/by_unit_and_name", dependencies=_product_access)
+def compat_product_by_unit_and_name(name: str = Query(default="")):
+    from app.application.facades.query_facade import find_product
+
+    n = (name or "").strip()
+    if not n:
+        return _fail("缺少参数：name", 400)
+    product = find_product(name=n)
+    if not product:
+        return _fail("产品不存在", 404)
+    return _ok(product)
+
+
+@router.get("/api/printers", dependencies=_print_access)
+def compat_printers():
+    base = _printer_svc().get_printers()
+    return JSONResponse(
+        {
+            "success": base.get("success", True),
+            "printers": base.get("printers") or [],
+            "count": base.get("count", 0),
+            "classified": base.get("classified") or {},
+            "summary": base.get("summary") or {},
+            "selection": base.get("selection") or {},
+        }
+    )
+
+
+@router.get("/api/print/diagnose", dependencies=_print_access)
+def compat_print_diagnose():
+    try:
+        base = _printer_svc().get_printers()
+        return JSONResponse({"success": True, "diagnostic": base})
+    except RECOVERABLE_ERRORS as e:
+        logger.error("打印机诊断失败: %s", e, exc_info=True)
+        return _fail("打印机诊断失败", 500)
+
+
+@router.post(
+    "/api/print-last",
+    dependencies=_print_access,
+    deprecated=True,
+    status_code=501,
+    description="兼容入口已停用；请通过 /api/print/{filename} 指定要打印的文件。",
+)
+def compat_print_last():
+    return _fail(
+        "XCAGI 未实现 print-last（请通过 /api/print/<filename> 打印指定文件）",
+        501,
+        error_code="PRINT_LAST_RETIRED",
+        replacement="/api/print/{filename}",
+    )
+
+
+@router.post(
+    "/api/print/pdf_labels",
+    dependencies=_print_access,
+    deprecated=True,
+    status_code=501,
+    description="批量 PDF 标签兼容入口未实现；单张标签请使用 /api/print/single_label。",
+)
+def compat_print_pdf_labels():
+    return _fail(
+        "XCAGI 暂未实现 pdf_labels（单张标签请使用 /api/print/single_label）",
+        501,
+        error_code="PDF_LABELS_UNAVAILABLE",
+        replacement="/api/print/single_label",
+    )
+
+
+@router.post("/api/print/single_label", dependencies=_print_access)
+def compat_print_single_label(payload: dict[str, Any] = Body(default_factory=dict)):
+    """打印单张标签：根据型号查找产品信息后发送到标签打印机。"""
+    model_number = str(payload.get("model_number") or "").strip()
+    quantity = int(payload.get("quantity") or 1)
+    if quantity < 1 or quantity > 100:
+        quantity = 1
+
+    product_name = model_number
+    specification: str | None = None
+    unit = "个"
+
+    if model_number:
+        try:
+            from app.application import get_product_app_service
+
+            svc = get_product_app_service()
+            products_result = svc.search_products(keyword=model_number, filters={"per_page": 1})
+            products = (
+                products_result.get("data") or []
+                if isinstance(products_result, dict)
+                else products_result
+            )
+            if isinstance(products, list) and products and isinstance(products[0], dict):
+                product = products[0]
+                product_name = str(
+                    product.get("name") or product.get("product_name") or model_number
+                )
+                specification = (
+                    str(product.get("specification") or product.get("spec") or "") or None
+                )
+                unit = str(product.get("unit") or "个")
+        except RECOVERABLE_ERRORS:
+            logger.warning("single_label: 查询产品失败，使用型号作为名称", exc_info=True)
+
+    try:
+        from app.application.print_app_service import get_print_application_service
+
+        result = get_print_application_service().print_single_label(
+            product_name=product_name,
+            model_number=model_number or None,
+            specification=specification,
+            unit=unit,
+            quantity=quantity,
+        )
+        status = 200 if result.get("success") else 400
+        traced = _trace_ai_assistant_route(
+            dict(result),
+            route="/api/print/single_label",
+            action="print_single_label",
+            body=payload,
+        )
+        return JSONResponse(traced, status_code=status)
+    except RECOVERABLE_ERRORS:
+        logger.exception("single_label 打印失败")
+        traced = _trace_ai_assistant_route(
+            {"success": False, "message": "打印服务暂时不可用，请稍后重试"},
+            route="/api/print/single_label",
+            action="print_single_label",
+            body=payload,
+        )
+        return JSONResponse(traced, status_code=500)
+
+
+# Fixed print operations must precede the filename catch-all.
+@router.post("/api/print/{filename:path}", dependencies=_print_access)
+def compat_print_shipment_file(filename: str, payload: dict[str, Any] = Body(default_factory=dict)):
+    from app.utils.path_io.path_utils import get_app_data_dir
+
+    printer_name = payload.get("printer_name") or payload.get("printer")
+    output_dir = Path(get_app_data_dir()).resolve() / "shipment_outputs"
+    try:
+        file_path = resolve_under_allowed_dirs(filename, [output_dir])
+    except UnsafeDownloadPathError:
+        return _fail("文件路径无效", 400)
+    if not file_path.is_file():  # lgtm[py/path-injection] -- resolved under shipment_outputs
+        return _fail("文件不存在", 404)
+
+    result = _printer_svc().print_document(str(file_path), printer_name=printer_name)
+    ok = bool(result.get("success"))
+    status = 200 if ok else 400
+    public_result = {
+        "success": ok,
+        "message": "打印任务已提交" if ok else "打印服务暂时不可用，请稍后重试",
+    }
+    traced = _trace_ai_assistant_route(
+        public_result,
+        route="/api/print/{filename}",
+        action="print_shipment_file",
+        body={"filename": filename, **dict(payload or {})},
+    )
+    return JSONResponse(traced, status_code=status)

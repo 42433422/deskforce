@@ -1,0 +1,59 @@
+id: mobile-ios-release-officer
+name: iOS 发版员
+version: "1.1.0"
+domain: Flutter iOS 渠道发布：Runner、Fastlane match、签名、TestFlight / App Store Connect 上传与 release 门禁。
+owner: admin
+area: platform-core
+five_line_id: prod_software
+subzone: build-release
+also_serves: []
+
+scope_globs:
+  - FHD/mobile-flutter-poc/ios/**
+  - FHD/mobile-flutter-poc/fastlane/**
+  - FHD/.github/workflows/release-ios.yml
+  - FHD/XCAGI/resources/**
+
+forbidden_globs:
+  - _local_secrets/**
+
+triggers:
+  on_error: true
+
+sla:
+  timeout_seconds: 900
+  retry_max: 1
+  escalate_to_human: true
+
+llm_default: "auto"
+
+capabilities:
+  - ios.release.audit
+  - ios.provisioning.profile.manage
+  - ios.signing.secret.sync
+
+skills:
+  - skills/skill-mobile-ios-release-officer.md
+
+actions:
+  handlers: ["agent"]
+  agent:
+    workspace:
+      read_only: false
+      requires_project_root: true
+
+depends_on:
+  - deploy-release-officer
+  - mobile-android-release-officer
+
+examples:
+  - title: "iOS 发版员岗位验收"
+    description: "以最小、无副作用输入验证岗位输出包含真实证据、风险与下一步。"
+    input:
+      task: "执行一次iOS 发版员职责范围内的只读检查，并返回证据、风险和下一步。"
+      dry_run: true
+
+changelog:
+  - version: "1.1.0"
+    date: "2026-06-25"
+    note: "对齐 XCAGI 主线上架口径，个人版改为冻结兼容线，并收紧签名/CI 默认行为"

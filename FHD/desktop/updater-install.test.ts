@@ -1,0 +1,171 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { app } from 'electron'
+
+// 每次测试运行使用唯一临时目录，避免并行测试进程共享固定 /tmp 路径
+// 互相清写（2026-09-05 审计 R07：沙箱下固定 /tmp 写入 EPERM）。
+const mockUserDataDir = vi.hoisted(() => ({ current: '' }))
+
+const mocks = vi.hoisted(() => {
+  const handlers = new Map<string, (payload: Record<string, unknown>) => void>()
+  const autoUpdater = {
+    autoDownload: true,
+    autoInstallOnAppQuit: true,
+    setFeedURL: vi.fn(),
+    on: vi.fn((name: string, handler: (payload: Record<string, unknown>) => void) => {
+      handlers.set(name, handler)
+    }),
+    checkForUpdates: vi.fn(),
+    downloadUpdate: vi.fn(),
+    quitAndInstall: vi.fn(),
+  }
+  return { autoUpdater, handlers }
+})
+
+vi.mock('electron-updater', () => ({ autoUpdater: mocks.autoUpdater }))
+vi.mock('electron', () => ({
+  app: {
+    isPackaged: true,
+    isQuitting: false,
+    getVersion: vi.fn(() => '1.0.0'),
+    getPath: vi.fn(() => mockUserDataDir.current),
+  },
+  net: {},
+  session: {
+    defaultSession: {
+      resolveProxy: vi.fn(async () => 'DIRECT'),
+      setProxy: vi.fn(async () => undefined),
+    },
+  },
+}))
+
+describe('updater install rollback contract', () => {
+  beforeEach(async () => {
+    vi.useFakeTimers()
+    vi.resetModules()
+    const { app } = await import('electron')
+    app.isQuitting = false
+    mockUserDataDir.current = fs.mkdtempSync(path.join(os.tmpdir(), 'xcagi-updater-install-test-'))
+    mocks.handlers.clear()
+    mocks.autoUpdater.on.mockClear()
+    mocks.autoUpdater.quitAndInstall.mockReset()
+    const { desktopRuntime } = await import('./runtime-state.js')
+    desktopRuntime.backendShutdownComplete = false
+    delete process.env.XCAGI_UPDATE_URL
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    if (mockUserDataDir.current) {
+      fs.rmSync(mockUserDataDir.current, { recursive: true, force: true })
+      mockUserDataDir.current = ''
+    }
+  })
+
+  async function markDownloaded(version: string, buildSha = '') {
+    const updater = await import('./updater.js')
+    updater.configureUpdater({
+      isDestroyed: () => false,
+      webContents: { send: vi.fn() },
+    } as never)
+    const handler = mocks.handlers.get('update-downloaded')
+    expect(handler).toBeTypeOf('function')
+    handler?.({ version, buildSha, files: [] })
+    // installUpdate 已拆至 desktop-install-update.ts（源治理 600 行上限），
+    // 它通过 getDownloadedUpdateState() 读取本模块状态，两个真实模块联动。
+    const { installUpdate } = await import('./desktop-install-update.js')
+    return { ...updater, installUpdate }
+  }
+
+  it('passes the downloaded version to rollback preparation', async () => {
+    const updater = await markDownloaded('1.0.0', 'abcdef1234567890')
+    const beforeInstall = vi.fn(async () => undefined)
+    await updater.installUpdate(beforeInstall)
+    expect(beforeInstall).toHaveBeenCalledWith('1.0.0+abcdef123456')
+    expect(mocks.autoUpdater.quitAndInstall).toHaveBeenCalledWith(false, true)
+  })
+
+  it('blocks quitAndInstall and cleans the marker when preparation fails', async () => {
+    const updater = await markDownloaded('1.0.0.0')
+    const cleanup = vi.fn(async () => undefined)
+    await expect(
+      updater.installUpdate(
+        async () => {
+          throw new Error('rollback backup failed')
+        },
+        cleanup,
+      ),
+    ).rejects.toThrow('rollback backup failed')
+    expect(cleanup).toHaveBeenCalledOnce()
+    expect(mocks.autoUpdater.quitAndInstall).not.toHaveBeenCalled()
+  })
+
+  it('cleans the marker when quitAndInstall throws synchronously', async () => {
+    const updater = await markDownloaded('1.0.0.0')
+    mocks.autoUpdater.quitAndInstall.mockImplementationOnce(() => {
+      throw new Error('installer launch failed')
+    })
+    const cleanup = vi.fn()
+    await expect(updater.installUpdate(async () => undefined, cleanup, async () => undefined)).rejects.toThrow(
+      'installer launch failed',
+    )
+    const { app } = await import('electron')
+    const { desktopRuntime } = await import('./runtime-state.js')
+    expect(app.isQuitting).toBe(false)
+    expect(desktopRuntime.backendShutdownComplete).toBe(false)
+    expect(cleanup).toHaveBeenCalledOnce()
+  })
+
+  it('stops the backend via prepareQuit before quitAndInstall', async () => {
+    const updater = await markDownloaded('1.0.0.1')
+    const callOrder: string[] = []
+    const prepareQuit = vi.fn(async () => {
+      const { app } = await import('electron')
+      expect(app.isQuitting).toBe(true)
+      callOrder.push('prepareQuit')
+    })
+    mocks.autoUpdater.quitAndInstall.mockImplementationOnce(() => {
+      callOrder.push('quitAndInstall')
+    })
+
+    await updater.installUpdate(undefined, undefined, prepareQuit)
+
+    // 原生 quitAndInstall 的 terminate 路径下 will-quit 异步关闭后端不可靠，
+    // 必须在交出退出控制权前完成后端停止。
+    expect(callOrder).toEqual(['prepareQuit', 'quitAndInstall'])
+    const { desktopRuntime } = await import('./runtime-state.js')
+    expect(desktopRuntime.backendShutdownComplete).toBe(true)
+  })
+
+  it('sets app.isQuitting before quitAndInstall (Squirrel terminate path)', async () => {
+    const updater = await markDownloaded('1.0.0.3')
+    let quittingAtInstall: unknown
+    mocks.autoUpdater.quitAndInstall.mockImplementationOnce(() => {
+      quittingAtInstall = app.isQuitting
+    })
+
+    await updater.installUpdate()
+
+    // [NSApp terminate] 路径不触发 before-quit；close 拦截依赖 isQuitting 放行，
+    // 否则 terminate 被取消、应用不退出、ShipIt 无限等待。
+    expect(quittingAtInstall).toBe(true)
+  })
+
+  it('blocks quitAndInstall when prepareQuit fails and runs cleanup', async () => {
+    const updater = await markDownloaded('1.0.0.1')
+    const cleanup = vi.fn(async () => undefined)
+    const prepareQuit = vi.fn(async () => {
+      throw new Error('backend stop failed')
+    })
+
+    await expect(
+      updater.installUpdate(undefined, cleanup, prepareQuit),
+    ).rejects.toThrow('backend stop failed')
+    const { app } = await import('electron')
+    expect(app.isQuitting).toBe(false)
+    expect(cleanup).toHaveBeenCalledOnce()
+    expect(mocks.autoUpdater.quitAndInstall).not.toHaveBeenCalled()
+  })
+})

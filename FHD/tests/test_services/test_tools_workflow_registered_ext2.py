@@ -1,0 +1,803 @@
+"""扩展覆盖：tools_workflow_registered 缺失分支（update/delete/batch_delete 等）。"""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from app.domain.shared_services.tools_workflow_registered import (
+    _registered_router_customers,
+    _registered_router_inventory,
+    _registered_router_materials,
+    _registered_router_products,
+    _registered_router_purchase,
+    _registered_router_shipment_orders,
+    _registered_router_shipment_records,
+)
+from app.infrastructure.tenant_scope import tenant_scope
+from tests.fixtures.backend_ci_isolation import trusted_actor as trusted_actor
+from tests.test_application.test_customer_cascade_authority import deletion as deletion
+from tests.test_application.test_customer_cascade_authority import snapshot
+
+
+class TestCustomersRouterMissingBranches:
+    def _mock_svc(self):
+        return MagicMock()
+
+    def test_update_success(self):
+        svc = self._mock_svc()
+        svc.update.return_value = {"success": True, "data": {"id": 5}}
+        with patch("app.application.get_customer_app_service", return_value=svc):
+            result = _registered_router_customers(
+                "update", {"id": 5, "unit_name": "AcmeCo"}, {}, "admin", ""
+            )
+        assert result["success"] is True
+        assert result["data"] == {"id": 5}
+
+    def test_update_failure(self):
+        svc = self._mock_svc()
+        svc.update.return_value = {"success": False, "message": "not found"}
+        with patch("app.application.get_customer_app_service", return_value=svc):
+            result = _registered_router_customers(
+                "update", {"id": 5, "unit_name": "AcmeCo"}, {}, "admin", ""
+            )
+        assert result["success"] is False
+        assert "not found" in result["message"]
+
+    def test_update_missing_id(self):
+        result = _registered_router_customers("update", {"unit_name": "X"}, {}, "admin", "")
+        assert result["success"] is False
+        assert "id" in result["message"]
+
+    def test_update_zero_id(self):
+        result = _registered_router_customers("update", {"id": 0}, {}, "admin", "")
+        assert result["success"] is False
+
+    def test_update_uses_customer_id_alias(self):
+        svc = self._mock_svc()
+        svc.update.return_value = {"success": True, "data": {}}
+        with patch("app.application.get_customer_app_service", return_value=svc):
+            result = _registered_router_customers(
+                "update", {"customer_id": 7, "unit_name": "X"}, {}, "admin", ""
+            )
+        assert result["success"] is True
+        svc.update.assert_called_once_with(7, {"customer_name": "X"})
+
+    def test_delete_success(self):
+        svc = self._mock_svc()
+        svc.delete.return_value = {"success": True, "deleted": True}
+        with patch("app.application.get_customer_app_service", return_value=svc):
+            result = _registered_router_customers("delete", {"id": 3}, {}, "admin", "")
+        assert result["success"] is True
+
+    def test_delete_with_force(self, deletion):
+        _, actor, svc = deletion
+        with patch("app.application.get_customer_app_service", return_value=svc), tenant_scope(7):
+            result = _registered_router_customers(
+                "delete", {"id": 1, "force": True}, actor.context, "admin", ""
+            )
+        assert result["success"] is True
+        remaining = snapshot(actor)
+        assert remaining[0] == [(2,), (3,), (101,), (102,), (103,)]
+        assert remaining[1] == [(2,), (101,), (102,)]
+        assert remaining[2] == [(2,), (101,), (102,)]
+        assert len(remaining[3]) == 1
+
+    def test_delete_missing_id(self):
+        result = _registered_router_customers("delete", {}, {}, "admin", "")
+        assert result["success"] is False
+        assert "id" in result["message"]
+
+    def test_delete_uses_customer_id_alias(self, deletion):
+        _, actor, svc = deletion
+        before = snapshot(actor)
+        with patch("app.application.get_customer_app_service", return_value=svc), tenant_scope(7):
+            result = _registered_router_customers(
+                "delete", {"customer_id": 3}, actor.context, "admin", ""
+            )
+        assert result["success"] is True
+        remaining = snapshot(actor)
+        assert remaining[0] == [(1,), (2,), (101,), (102,), (103,)]
+        assert remaining[1:] == before[1:]
+
+    def test_batch_delete_success(self):
+        svc = self._mock_svc()
+        svc.batch_delete.return_value = {"success": True, "deleted": 2}
+        with patch("app.application.get_customer_app_service", return_value=svc):
+            result = _registered_router_customers("batch_delete", {"ids": [1, 2]}, {}, "admin", "")
+        assert result["success"] is True
+
+    def test_batch_delete_uses_customer_ids_alias(self, deletion):
+        _, actor, svc = deletion
+        with patch("app.application.get_customer_app_service", return_value=svc), tenant_scope(7):
+            result = _registered_router_customers(
+                "batch_delete", {"customer_ids": [1, 2], "force": True}, actor.context, "admin", ""
+            )
+        assert result["success"] is True
+        assert result["deleted_count"] == 2
+        remaining = snapshot(actor)
+        assert remaining[0] == [(3,), (101,), (102,), (103,)]
+        assert remaining[1] == [(101,), (102,)]
+        assert remaining[2] == [(101,), (102,)]
+        assert len(remaining[3]) == 1
+
+    def test_batch_delete_empty_list(self):
+        result = _registered_router_customers("batch_delete", {"ids": []}, {}, "admin", "")
+        assert result["success"] is False
+        assert "非空" in result["message"]
+
+    def test_batch_delete_not_list(self):
+        result = _registered_router_customers("batch_delete", {"ids": "1,2"}, {}, "admin", "")
+        assert result["success"] is False
+
+    def test_batch_delete_all_invalid(self, deletion):
+        _, actor, svc = deletion
+        before = snapshot(actor)
+        with patch("app.application.get_customer_app_service", return_value=svc), tenant_scope(7):
+            result = _registered_router_customers(
+                "batch_delete", {"ids": ["abc", "xyz"]}, actor.context, "admin", ""
+            )
+        assert result["success"] is False
+        assert result["deleted_count"] == 0
+        assert "非空正整数列表" in result["message"]
+        assert snapshot(actor) == before
+
+    @pytest.mark.parametrize("ids", [[3, "bad", 1], [3, 101], [3, 999]])
+    def test_batch_delete_mixed_valid_invalid(self, deletion, ids):
+        _, actor, svc = deletion
+        before = snapshot(actor)
+        with patch("app.application.get_customer_app_service", return_value=svc), tenant_scope(7):
+            result = _registered_router_customers(
+                "batch_delete", {"ids": ids, "force": True}, actor.context, "admin", ""
+            )
+        assert result["success"] is False
+        assert result["deleted_count"] == 0
+        assert "skipped" not in result
+        assert snapshot(actor) == before
+
+    def test_batch_delete_with_force(self):
+        svc = self._mock_svc()
+        svc.batch_delete.return_value = {"success": True}
+        with patch("app.application.get_customer_app_service", return_value=svc):
+            _registered_router_customers("batch_delete", {"ids": [1]}, {"force": True}, "admin", "")
+        svc.batch_delete.assert_called_once()
+
+    def test_clear_collects_and_deletes_all_customers(self):
+        svc = self._mock_svc()
+        svc.get_all.return_value = {
+            "success": True,
+            "data": [{"id": 1}, {"id": 2}],
+            "total": 2,
+        }
+        svc.batch_delete.return_value = {"success": True, "deleted_count": 2}
+        with patch("app.application.get_customer_app_service", return_value=svc):
+            result = _registered_router_customers("clear", {}, {}, "admin", "")
+        svc.batch_delete.assert_called_once()
+        assert svc.batch_delete.call_args.args[0] == [1, 2]
+        assert result["success"] is True
+        assert result["deleted_count"] == 2
+
+    def test_clear_with_empty_library(self):
+        svc = self._mock_svc()
+        svc.get_all.return_value = {"success": True, "data": [], "total": 0}
+        with patch("app.application.get_customer_app_service", return_value=svc):
+            result = _registered_router_customers("clear", {}, {}, "admin", "")
+        svc.batch_delete.assert_not_called()
+        assert result["deleted_count"] == 0
+
+    def test_unknown_action(self):
+        result = _registered_router_customers("fly", {}, {}, "admin", "")
+        assert result["success"] is False
+        assert "customers" in result["message"]
+
+    def test_fastapi_customer_route_delegate(self):
+        # Patch the function directly on the module: `from pkg import routes` uses
+        # getattr(pkg, 'routes') which bypasses sys.modules when the module is
+        # already cached as a parent-package attribute.
+        with patch(
+            "app.fastapi_routes.domains.customer.customer_routes._execute_customers_route_action",
+            return_value={"success": True},
+        ):
+            result = _registered_router_customers(
+                "query",
+                {},
+                {"service_source": "fastapi_customer_route"},
+                "admin",
+                "",
+            )
+        assert result["success"] is True
+
+
+class TestProductsRouterMissingBranches:
+    def _svc(self):
+        return MagicMock()
+
+    def test_create_via_fastapi_product_route(self):
+        svc = self._svc()
+        svc.create_product.return_value = {"success": True}
+        # Patch _svc directly on the module: `from pkg import routes` uses
+        # getattr(pkg, 'routes') which bypasses sys.modules when already cached.
+        with patch("app.fastapi_routes.domains.product.product_routes._svc", return_value=svc):
+            result = _registered_router_products(
+                "create",
+                {"name": "P1", "unit_price": 5.0},
+                {"service_source": "fastapi_product_route"},
+                "admin",
+                "",
+            )
+        assert result["success"] is True
+
+    def test_create_product_failure(self):
+        svc = self._svc()
+        svc.create_product.return_value = {"success": False, "message": "dup"}
+        with patch("app.services.get_products_service", return_value=svc):
+            result = _registered_router_products(
+                "create",
+                {"name_or_model": "P1", "unit_name": "U1"},
+                {},
+                "admin",
+                "",
+            )
+        assert result["success"] is False
+        assert "dup" in result["message"]
+
+    def test_update_product(self):
+        svc = self._svc()
+        svc.update_product.return_value = {"success": True}
+        with patch("app.services.get_products_service", return_value=svc):
+            result = _registered_router_products(
+                "update",
+                {"id": 10, "unit_price": 9.9},
+                {},
+                "admin",
+                "",
+            )
+        svc.update_product.assert_called_once_with(10, {"price": 9.9})
+        assert result["success"] is True
+
+    def test_delete_product(self):
+        svc = self._svc()
+        svc.delete_product.return_value = {"success": True}
+        with patch("app.services.get_products_service", return_value=svc):
+            result = _registered_router_products("delete", {"id": 7}, {}, "admin", "")
+        svc.delete_product.assert_called_once_with(7)
+        assert result["success"] is True
+
+    def test_batch_create_success(self):
+        svc = self._svc()
+        svc.batch_add_products.return_value = {"success": True, "created": 2}
+        with patch("app.services.get_products_service", return_value=svc):
+            result = _registered_router_products(
+                "batch_create",
+                {"products": [{"name": "A"}, {"name": "B"}]},
+                {},
+                "admin",
+                "",
+            )
+        assert result["success"] is True
+
+    def test_batch_create_empty(self):
+        result = _registered_router_products("batch_create", {"products": []}, {}, "admin", "")
+        assert result["success"] is False
+        assert "非空" in result["message"]
+
+    def test_batch_create_not_list(self):
+        result = _registered_router_products("batch_create", {"products": "abc"}, {}, "admin", "")
+        assert result["success"] is False
+
+    def test_batch_delete_products_success(self):
+        svc = self._svc()
+        svc.batch_delete_products.return_value = {"success": True}
+        with patch("app.services.get_products_service", return_value=svc):
+            result = _registered_router_products("batch_delete", {"ids": [1, 2]}, {}, "admin", "")
+        assert result["success"] is True
+
+    def test_batch_delete_products_fallback_to_batch_delete(self):
+        svc = self._svc()
+        del svc.batch_delete_products  # ensure not callable via getattr
+        svc.batch_delete = MagicMock(return_value={"success": True})
+        with patch("app.services.get_products_service", return_value=svc):
+            result = _registered_router_products("batch_delete", {"ids": [3]}, {}, "admin", "")
+        assert result["success"] is True
+
+    def test_batch_delete_products_empty(self):
+        result = _registered_router_products("batch_delete", {"ids": []}, {}, "admin", "")
+        assert result["success"] is False
+
+    def test_batch_delete_products_all_invalid(self):
+        result = _registered_router_products(
+            "batch_delete", {"ids": ["bad", "nope"]}, {}, "admin", ""
+        )
+        assert result["success"] is False
+        assert "有效数字" in result["message"]
+
+    def test_batch_delete_products_mixed(self):
+        svc = self._svc()
+        svc.batch_delete_products.return_value = {"success": True}
+        with patch("app.services.get_products_service", return_value=svc):
+            result = _registered_router_products(
+                "batch_delete", {"ids": [1, "bad"]}, {}, "admin", ""
+            )
+        assert result["success"] is True
+        assert "skipped" in result
+
+    def test_batch_delete_product_ids_alias(self):
+        svc = self._svc()
+        svc.batch_delete_products.return_value = {"success": True}
+        with patch("app.services.get_products_service", return_value=svc):
+            _registered_router_products("batch_delete", {"product_ids": [5]}, {}, "admin", "")
+        svc.batch_delete_products.assert_called_once_with([5])
+
+    def test_clear_collects_and_deletes_all_products(self):
+        svc = self._svc()
+        svc.get_products.return_value = {"success": True, "data": [{"id": 3}, {"id": 4}]}
+        svc.batch_delete_products.return_value = {"success": True}
+        with patch("app.services.get_products_service", return_value=svc):
+            result = _registered_router_products("clear", {}, {}, "admin", "")
+        svc.batch_delete_products.assert_called_once_with([3, 4])
+        assert result["success"] is True
+        assert result["deleted_count"] == 2
+
+    def test_exists_model_in_list_but_name_matches(self):
+        svc = self._svc()
+        svc.get_products.return_value = {
+            "success": True,
+            "data": [{"name": "Widget Pro", "model_number": "ZZZZ"}],
+        }
+        with patch("app.services.get_products_service", return_value=svc):
+            result = _registered_router_products(
+                "exists",
+                {"product_name": "Widget Pro", "model_number": ""},
+                {},
+                "admin",
+                "",
+            )
+        assert result["exists"] is True
+
+    def test_exists_loop_continues_without_match(self):
+        svc = self._svc()
+        svc.get_products.return_value = {
+            "success": True,
+            "data": [
+                {"name": "A", "model_number": "X1"},
+                {"name": "B", "model_number": "X2"},
+            ],
+        }
+        with patch("app.services.get_products_service", return_value=svc):
+            result = _registered_router_products(
+                "exists",
+                {"product_name": "C", "model_number": "X3"},
+                {},
+                "admin",
+                "",
+            )
+        assert result["exists"] is False
+        assert result["matched_count"] == 2
+
+    def test_unknown_action(self):
+        result = _registered_router_products("unknown", {}, {}, "admin", "")
+        assert result["success"] is False
+
+
+class TestShipmentRecordsRouterCreate:
+    def test_unknown_action(self):
+        result = _registered_router_shipment_records("fly", {}, {}, "admin", "")
+        assert result["success"] is False
+
+    def test_clear_deletes_every_shipment_record(self):
+        svc = MagicMock()
+        svc.get_shipment_records.return_value = {
+            "success": True,
+            "data": [{"id": 11}, {"id": 12}],
+        }
+        svc.delete_shipment_record.return_value = {"success": True}
+        with patch("app.bootstrap.get_shipment_app_service", return_value=svc):
+            result = _registered_router_shipment_records("clear", {}, {}, "admin", "")
+        assert svc.delete_shipment_record.call_count == 2
+        assert result["success"] is True
+        assert result["deleted_count"] == 2
+
+
+class TestShipmentOrdersRouterBranches:
+    def _svc(self):
+        return MagicMock()
+
+    def test_generate_success(self):
+        svc = self._svc()
+        svc.generate_shipment_document.return_value = {"success": True, "file_path": "/tmp/s.pdf"}
+        with patch("app.bootstrap.get_shipment_app_service", return_value=svc):
+            result = _registered_router_shipment_orders(
+                "generate",
+                {"unit_name": "Co", "products": [{"id": 1}]},
+                {},
+                "admin",
+                "",
+            )
+        assert result["success"] is True
+
+    def test_generate_missing_unit_name(self):
+        result = _registered_router_shipment_orders(
+            "generate", {"products": [{"id": 1}]}, {}, "admin", ""
+        )
+        assert result["success"] is False
+        assert "unit_name" in result["message"]
+
+    def test_generate_empty_products(self):
+        result = _registered_router_shipment_orders(
+            "generate", {"unit_name": "Co", "products": []}, {}, "admin", ""
+        )
+        assert result["success"] is False
+        assert "products" in result["message"]
+
+    def test_generate_batch_success(self):
+        svc = self._svc()
+        svc.generate_shipment_document.return_value = {"success": True}
+        with patch("app.bootstrap.get_shipment_app_service", return_value=svc):
+            result = _registered_router_shipment_orders(
+                "generate_batch",
+                {
+                    "shipments": [
+                        {"unit_name": "Co", "products": [{"id": 1}]},
+                    ]
+                },
+                {},
+                "admin",
+                "",
+            )
+        assert result["success"] is True
+        assert result["data"]["processed"] == 1
+
+    def test_generate_batch_empty(self):
+        result = _registered_router_shipment_orders(
+            "generate_batch", {"shipments": []}, {}, "admin", ""
+        )
+        assert result["success"] is False
+
+    def test_generate_batch_non_dict_item(self):
+        result = _registered_router_shipment_orders(
+            "generate_batch", {"shipments": ["not-a-dict"]}, {}, "admin", ""
+        )
+        assert result["data"]["errors"][0]["error"] == "条目必须是对象"
+
+    def test_generate_batch_missing_unit(self):
+        result = _registered_router_shipment_orders(
+            "generate_batch",
+            {"shipments": [{"products": [1]}]},
+            {},
+            "admin",
+            "",
+        )
+        assert result["data"]["errors"][0]["error"] == "单位名称不能为空"
+
+    def test_generate_batch_empty_products(self):
+        result = _registered_router_shipment_orders(
+            "generate_batch",
+            {"shipments": [{"unit_name": "Co", "products": []}]},
+            {},
+            "admin",
+            "",
+        )
+        assert result["data"]["errors"][0]["error"] == "产品列表不能为空"
+
+    def test_generate_batch_service_failure(self):
+        svc = self._svc()
+        svc.generate_shipment_document.return_value = {"success": False, "message": "err"}
+        with patch("app.bootstrap.get_shipment_app_service", return_value=svc):
+            result = _registered_router_shipment_orders(
+                "generate_batch",
+                {"shipments": [{"unit_name": "Co", "products": [1]}]},
+                {},
+                "admin",
+                "",
+            )
+        assert result["data"]["errors"][0]["error"] == "err"
+
+    def test_generate_batch_service_exception(self):
+        svc = self._svc()
+        svc.generate_shipment_document.side_effect = RuntimeError("boom")
+        with patch("app.bootstrap.get_shipment_app_service", return_value=svc):
+            result = _registered_router_shipment_orders(
+                "generate_batch",
+                {"shipments": [{"unit_name": "Co", "products": [1]}]},
+                {},
+                "admin",
+                "",
+            )
+        assert "boom" in result["data"]["errors"][0]["error"]
+
+    def test_print_with_order_id(self):
+        svc = self._svc()
+        svc.mark_as_printed.return_value = {"success": True}
+        with patch("app.bootstrap.get_shipment_app_service", return_value=svc):
+            result = _registered_router_shipment_orders(
+                "print",
+                {"file_path": "/tmp/s.pdf", "order_id": 42, "printer_name": "HP"},
+                {},
+                "admin",
+                "",
+            )
+        assert result["file_path"] == "/tmp/s.pdf"
+        assert "updated" in result
+
+    def test_print_without_order_id(self):
+        with patch("app.bootstrap.get_shipment_app_service", return_value=MagicMock()):
+            result = _registered_router_shipment_orders(
+                "print", {"file_path": "/tmp/s.pdf"}, {}, "admin", ""
+            )
+        assert result["success"] is True
+        assert result["updated"] is False
+
+    def test_print_missing_file_path(self):
+        result = _registered_router_shipment_orders("print", {}, {}, "admin", "")
+        assert result["success"] is False
+
+    def test_clear_shipment(self):
+        svc = self._svc()
+        svc.clear_shipment_by_unit.return_value = {"success": True}
+        with patch("app.bootstrap.get_shipment_app_service", return_value=svc):
+            result = _registered_router_shipment_orders(
+                "clear_shipment", {"purchase_unit": "Co"}, {}, "admin", ""
+            )
+        assert result["purchase_unit"] == "Co"
+
+    def test_clear_shipment_missing_unit(self):
+        result = _registered_router_shipment_orders("clear_shipment", {}, {}, "admin", "")
+        assert result["success"] is False
+
+    def test_set_sequence(self):
+        svc = self._svc()
+        svc.set_order_sequence.return_value = {"success": True}
+        with patch("app.bootstrap.get_shipment_app_service", return_value=svc):
+            result = _registered_router_shipment_orders(
+                "set_sequence", {"sequence": 5}, {}, "admin", ""
+            )
+        assert result["sequence"] == 5
+
+    def test_reset_sequence(self):
+        svc = self._svc()
+        svc.reset_order_sequence.return_value = {"success": True}
+        with patch("app.bootstrap.get_shipment_app_service", return_value=svc):
+            result = _registered_router_shipment_orders("reset_sequence", {}, {}, "admin", "")
+        assert result["success"] is True
+
+    def test_clear_all(self):
+        svc = self._svc()
+        svc.clear_all_orders.return_value = {"success": True}
+        with patch("app.bootstrap.get_shipment_app_service", return_value=svc):
+            result = _registered_router_shipment_orders("clear_all", {}, {}, "admin", "")
+        assert result["success"] is True
+
+    def test_delete_shipment(self):
+        svc = self._svc()
+        svc.delete_shipment.return_value = {"success": True}
+        with patch("app.bootstrap.get_shipment_app_service", return_value=svc):
+            result = _registered_router_shipment_orders("delete", {"id": 3}, {}, "admin", "")
+        assert result["deleted_id"] == 3
+
+    def test_unknown_action(self):
+        result = _registered_router_shipment_orders("fly", {}, {}, "admin", "")
+        assert result["success"] is False
+
+
+class TestInventoryRouterBranches:
+    def _svc(self):
+        return MagicMock()
+
+    def test_create_storage_location(self):
+        svc = self._svc()
+        svc.create_storage_location.return_value = {"success": True}
+        with patch("app.application.inventory_app_service.InventoryAppService", return_value=svc):
+            result = _registered_router_inventory(
+                "create_storage_location", {"name": "A-01"}, {}, "admin", ""
+            )
+        assert result["success"] is True
+
+    def test_update_storage_location(self):
+        svc = self._svc()
+        svc.update_storage_location.return_value = {"success": True}
+        with patch("app.application.inventory_app_service.InventoryAppService", return_value=svc):
+            result = _registered_router_inventory(
+                "update_storage_location", {"location_id": 1, "name": "B"}, {}, "admin", ""
+            )
+        assert result["success"] is True
+
+    def test_create_warehouse(self):
+        svc = self._svc()
+        svc.create_warehouse.return_value = {"success": True}
+        with patch("app.application.inventory_app_service.InventoryAppService", return_value=svc):
+            result = _registered_router_inventory(
+                "create_warehouse", {"name": "WH-1"}, {}, "admin", ""
+            )
+        assert result["success"] is True
+
+    def test_update_warehouse(self):
+        svc = self._svc()
+        svc.update_warehouse.return_value = {"success": True}
+        with patch("app.application.inventory_app_service.InventoryAppService", return_value=svc):
+            result = _registered_router_inventory(
+                "update_warehouse", {"warehouse_id": 2, "name": "WH-2"}, {}, "admin", ""
+            )
+        assert result["success"] is True
+
+    def test_delete_warehouse(self):
+        svc = self._svc()
+        svc.delete_warehouse.return_value = {"success": True}
+        with patch("app.application.inventory_app_service.InventoryAppService", return_value=svc):
+            result = _registered_router_inventory(
+                "delete_warehouse", {"warehouse_id": 2}, {}, "admin", ""
+            )
+        assert result["success"] is True
+
+    def test_stock_in(self):
+        svc = self._svc()
+        svc.inventory_in.return_value = {"success": True}
+        with patch("app.application.inventory_app_service.InventoryAppService", return_value=svc):
+            result = _registered_router_inventory(
+                "stock_in", {"product_id": 1, "quantity": 10}, {}, "admin", ""
+            )
+        assert result["success"] is True
+
+    def test_stock_out(self):
+        svc = self._svc()
+        svc.inventory_out.return_value = {"success": True}
+        with patch("app.application.inventory_app_service.InventoryAppService", return_value=svc):
+            result = _registered_router_inventory(
+                "stock_out", {"product_id": 1, "quantity": 5}, {}, "admin", ""
+            )
+        assert result["success"] is True
+
+    def test_transfer(self):
+        svc = self._svc()
+        svc.inventory_transfer.return_value = {"success": True}
+        with patch("app.application.inventory_app_service.InventoryAppService", return_value=svc):
+            result = _registered_router_inventory(
+                "transfer",
+                {"product_id": 1, "from_warehouse_id": 1, "to_warehouse_id": 2, "quantity": 3},
+                {},
+                "admin",
+                "",
+            )
+        assert result["success"] is True
+
+    def test_unknown_action(self):
+        with patch(
+            "app.application.inventory_app_service.InventoryAppService", return_value=self._svc()
+        ):
+            result = _registered_router_inventory("fly", {}, {}, "admin", "")
+        assert result["success"] is False
+
+
+class TestPurchaseRouterBranches:
+    def _svc(self):
+        return MagicMock()
+
+    def test_create_supplier(self):
+        svc = self._svc()
+        svc.create_supplier.return_value = {"success": True}
+        with patch("app.application.facades.inventory_facade.PurchaseService", return_value=svc):
+            result = _registered_router_purchase(
+                "create_supplier", {"name": "VendorA"}, {}, "admin", ""
+            )
+        assert result["success"] is True
+
+    def test_update_supplier(self):
+        svc = self._svc()
+        svc.update_supplier.return_value = {"success": True}
+        with patch("app.application.facades.inventory_facade.PurchaseService", return_value=svc):
+            result = _registered_router_purchase(
+                "update_supplier", {"supplier_id": 1, "name": "V"}, {}, "admin", ""
+            )
+        assert result["success"] is True
+
+    def test_delete_supplier(self):
+        svc = self._svc()
+        svc.delete_supplier.return_value = {"success": True}
+        with patch("app.application.facades.inventory_facade.PurchaseService", return_value=svc):
+            result = _registered_router_purchase(
+                "delete_supplier", {"supplier_id": 2}, {}, "admin", ""
+            )
+        assert result["success"] is True
+
+    def test_create_order(self):
+        svc = self._svc()
+        svc.create_purchase_order.return_value = {"success": True}
+        with patch("app.application.facades.inventory_facade.PurchaseService", return_value=svc):
+            result = _registered_router_purchase(
+                "create_order", {"supplier_id": 1}, {}, "admin", ""
+            )
+        assert result["success"] is True
+
+    def test_update_order(self):
+        svc = self._svc()
+        svc.update_purchase_order.return_value = {"success": True}
+        with patch("app.application.facades.inventory_facade.PurchaseService", return_value=svc):
+            result = _registered_router_purchase(
+                "update_order", {"order_id": 3, "status": "confirmed"}, {}, "admin", ""
+            )
+        assert result["success"] is True
+
+    def test_approve_order(self):
+        svc = self._svc()
+        svc.approve_purchase_order.return_value = {"success": True}
+        with patch("app.application.facades.inventory_facade.PurchaseService", return_value=svc):
+            result = _registered_router_purchase(
+                "approve_order", {"order_id": 3, "approver": "boss"}, {}, "admin", ""
+            )
+        assert result["success"] is True
+
+    def test_cancel_order(self):
+        svc = self._svc()
+        svc.cancel_purchase_order.return_value = {"success": True}
+        with patch("app.application.facades.inventory_facade.PurchaseService", return_value=svc):
+            result = _registered_router_purchase("cancel_order", {"order_id": 3}, {}, "admin", "")
+        assert result["success"] is True
+
+    def test_create_inbound(self):
+        svc = self._svc()
+        svc.create_purchase_inbound.return_value = {"success": True}
+        with patch("app.application.facades.inventory_facade.PurchaseService", return_value=svc):
+            result = _registered_router_purchase("create_inbound", {"order_id": 3}, {}, "admin", "")
+        assert result["success"] is True
+
+    def test_unknown_action(self):
+        with patch(
+            "app.application.facades.inventory_facade.PurchaseService", return_value=self._svc()
+        ):
+            result = _registered_router_purchase("fly", {}, {}, "admin", "")
+        assert result["success"] is False
+
+
+class TestMaterialsRouterBranches:
+    def test_update_non_dict_result(self):
+        svc = MagicMock()
+        svc.update_material.return_value = True  # non-dict
+        with patch("app.application.get_material_application_service", return_value=svc):
+            result = _registered_router_materials("update", {"id": 1, "name": "X"}, {}, "admin", "")
+        assert result["success"] is True
+        assert result["message"] == "更新成功"
+
+    def test_delete_non_dict_result(self):
+        svc = MagicMock()
+        svc.delete_material.return_value = True  # non-dict
+        with patch("app.application.get_material_application_service", return_value=svc):
+            result = _registered_router_materials("delete", {"id": 2}, {}, "admin", "")
+        assert result["success"] is True
+        assert result["message"] == "删除成功"
+
+    def test_delete_dict_sets_default_message(self):
+        svc = MagicMock()
+        svc.delete_material.return_value = {"success": True}
+        with patch("app.application.get_material_application_service", return_value=svc):
+            result = _registered_router_materials("delete", {"id": 3}, {}, "admin", "")
+        assert result["message"] == "删除成功"
+
+    def test_batch_delete_service_exception(self):
+        svc = MagicMock()
+        svc.batch_delete_materials.side_effect = RuntimeError("db error")
+        with patch("app.application.get_material_application_service", return_value=svc):
+            result = _registered_router_materials("batch_delete", {"ids": [1]}, {}, "admin", "")
+        assert result["success"] is True
+        assert "db error" in result["warning"]
+
+    def test_batch_delete_non_dict_result(self):
+        svc = MagicMock()
+        svc.batch_delete_materials.return_value = None
+        with patch("app.application.get_material_application_service", return_value=svc):
+            result = _registered_router_materials("batch_delete", {"ids": [1, 2]}, {}, "admin", "")
+        assert result["success"] is True
+        assert result["deleted_count"] == 2
+
+    def test_clear_collects_and_deletes_all_materials(self):
+        svc = MagicMock()
+        svc.get_all_materials.return_value = {
+            "success": True,
+            "data": [{"id": 8}, {"id": 9}],
+            "total": 2,
+        }
+        svc.batch_delete_materials.return_value = {"success": True}
+        with patch("app.application.get_material_application_service", return_value=svc):
+            result = _registered_router_materials("clear", {}, {}, "admin", "")
+        svc.batch_delete_materials.assert_called_once_with([8, 9])
+        assert result["success"] is True
+        assert result["deleted_count"] == 2

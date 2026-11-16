@@ -1,0 +1,51 @@
+{
+  "created_receipts": [],
+  "evidence": {
+    "api": "GitHub REST issues comments",
+    "base_ref": "main",
+    "degradation": "write_attempt_denied_no_comment_created",
+    "degradation_artifact": {
+      "kind": "permission_denied_publish_attempt",
+      "next_step": "request_write_token_or_export_review_payload",
+      "target": "The-PR-Agent/pr-agent#2479",
+      "write_attempt_status": 401
+    },
+    "head_ref": "fix/azure-devops-url-encoded-spaces",
+    "real_network": true,
+    "required_permission": "issues:write or pull_requests:write",
+    "target_is_pull_request": true,
+    "token_redacted": true,
+    "transport": "github_rest_public_read_then_unauthorized_write"
+  },
+  "pr_url": "https://github.com/The-PR-Agent/pr-agent/pull/2479",
+  "rollback_receipts": [
+    {
+      "created": false,
+      "response": {
+        "documentation_url": "https://docs.github.com/rest",
+        "message": "Bad credentials",
+        "status": "401"
+      },
+      "status_code": 401
+    }
+  ],
+  "status": "permission_denied_degraded",
+  "summary": {
+    "created_comment_count": 0,
+    "degraded_without_write": true,
+    "duration_sec": 2.77,
+    "live_github_write": false,
+    "permission_admin": false,
+    "permission_denied": true,
+    "permission_maintain": false,
+    "permission_push": false,
+    "pull_number": 2479,
+    "pull_status": 200,
+    "repo_status": 200,
+    "rollback_verified": true,
+    "rolled_back_comment_count": 0,
+    "target_repo": "The-PR-Agent/pr-agent",
+    "token_present": false,
+    "write_attempt_status": 401
+  }
+}

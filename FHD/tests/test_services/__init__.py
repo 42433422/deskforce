@@ -1,0 +1,48 @@
+"""
+服务层测试 - 最简化版
+"""
+
+import pytest
+
+
+class TestProductsService:
+    """产品服务测试"""
+
+    def test_service_import(self):
+        """测试服务类可以导入"""
+        from app.domain.shared_services.products_service import ProductsService
+
+        service = ProductsService()
+        assert service is not None
+
+
+class TestShipmentService:
+    """发货单服务测试"""
+
+    def test_service_import(self):
+        """测试应用服务类可以导入"""
+        from app.application.shipment_app_service import ShipmentApplicationService
+
+        assert ShipmentApplicationService is not None
+
+
+class TestOCRService:
+    """OCR服务测试"""
+
+    def test_service_import(self):
+        """测试服务类可以导入"""
+        from app.domain.shared_services.ocr_service import OCRService
+
+        service = OCRService()
+        assert service is not None
+
+
+class TestPrinterService:
+    """打印服务测试"""
+
+    def test_service_import(self):
+        """测试服务类可以导入"""
+        from app.domain.shared_services.printer_service import PrinterService
+
+        service = PrinterService()
+        assert service is not None

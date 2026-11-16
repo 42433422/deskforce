@@ -1,0 +1,171 @@
+"""Configuration, result value and outage circuit for ETL LLM assistance."""
+
+from __future__ import annotations
+
+import os
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+from app.utils.operational_errors import RECOVERABLE_ERRORS
+
+_CIRCUIT_LOCK = threading.Lock()
+_CIRCUIT_OPEN_UNTIL: dict[str, tuple[float, str]] = {}
+_OWNER_CALL_LOCKS: dict[str, threading.BoundedSemaphore] = {}
+
+
+@dataclass(slots=True)
+class LlmAssistResult:
+    used_llm: bool = False
+    degraded: bool = False
+    degradation_code: str = ""
+    model: str = ""
+    billing: dict[str, Any] = field(default_factory=dict)
+    data: dict[str, Any] = field(default_factory=dict)
+    provider: str = ""
+    # Raw model text, kept in memory only so a repair round can show it back.
+    answer: str = field(default="", repr=False)
+
+    def public_metadata(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "used_llm": self.used_llm,
+            "advisory_only": True,
+            "degraded": self.degraded,
+        }
+        if self.degradation_code:
+            result["degradation_code"] = self.degradation_code
+        if self.model:
+            result["model"] = self.model
+        if self.billing:
+            result["billing"] = dict(self.billing)
+        return result
+
+
+def etl_llm_mode() -> str:
+    raw = str(os.environ.get("FHD_ETL_LLM") or "auto").strip().lower()
+    if raw in {"0", "false", "no", "off", "disabled"}:
+        return "off"
+    if raw in {"1", "true", "yes", "on", "enabled"}:
+        return "on"
+    return "auto"
+
+
+_ETL_LLM_TIMEOUT_CAP = 180.0
+
+
+def etl_llm_timeout_seconds(*, full_sheet: bool = False) -> float:
+    """Probe calls stay short. A full archived sheet uses the template-analysis ceiling.
+
+    ``FHD_ETL_LLM_TIMEOUT`` defaults to 6 seconds and cannot exceed 180.
+    ``FHD_ETL_IMPORT_LLM_TIMEOUT`` bounds each database unit or knowledge import,
+    default 180, same ceiling. The old 12-second clamp cut a real delivery
+    note off while the remote model was still writing rows.
+    """
+    if full_sheet:
+        raw = str(os.environ.get("FHD_ETL_IMPORT_LLM_TIMEOUT") or "180").strip()
+        fallback = _ETL_LLM_TIMEOUT_CAP
+    else:
+        raw = str(os.environ.get("FHD_ETL_LLM_TIMEOUT") or "6").strip()
+        fallback = 6.0
+    try:
+        return min(_ETL_LLM_TIMEOUT_CAP, max(1.0, float(raw)))
+    except ValueError:
+        return fallback
+
+
+def etl_row_advice_limit() -> int:
+    raw = str(os.environ.get("FHD_ETL_LLM_ROW_ADVICE_LIMIT") or "20").strip()
+    try:
+        return min(100, max(0, int(raw)))
+    except ValueError:
+        return 20
+
+
+def degradation_code(exc: BaseException) -> str:
+    message = str(exc).lower()
+    if "quota exhausted" in message or "额度" in message or "429" in message:
+        return "ELT_LLM_QUOTA_EXHAUSTED"
+    if (
+        isinstance(exc, TimeoutError)
+        or "structured completion timeout" in message
+        or "sync bridge timeout" in message
+    ):
+        return "ELT_LLM_TIMEOUT"
+    return "ELT_LLM_UNAVAILABLE"
+
+
+def log_etl_llm_degradation(logger, *, code: str, lane: str, exc: BaseException) -> None:
+    """Log the failure class without writing workbook content to application logs."""
+    logger.info(
+        "general etl llm assist degraded (%s lane=%s): %s response_received=%s",
+        code,
+        lane or "shared",
+        type(exc).__name__,
+        bool(getattr(exc, "last_raw", "")),
+    )
+
+
+def circuit_key(lane: str = "") -> str:
+    """Template, database, and knowledge calls do not share one outage."""
+    try:
+        from app.application.elt.llm_session_provider import current_etl_llm_owner
+
+        owner_user_id = current_etl_llm_owner()
+    except RECOVERABLE_ERRORS:
+        owner_user_id = None
+    base = f"owner:{owner_user_id}" if owner_user_id is not None else "process"
+    lane_name = str(lane or "").strip()
+    return f"{base}:{lane_name}" if lane_name else base
+
+
+def circuit_cooldown_seconds(code: str) -> float:
+    env_name = (
+        "FHD_ETL_LLM_QUOTA_COOLDOWN_SECONDS"
+        if code == "ELT_LLM_QUOTA_EXHAUSTED"
+        else "FHD_ETL_LLM_FAILURE_COOLDOWN_SECONDS"
+    )
+    default = 300.0 if code == "ELT_LLM_QUOTA_EXHAUSTED" else 30.0
+    raw = str(os.environ.get(env_name) or default).strip()
+    try:
+        return min(3600.0, max(1.0, float(raw)))
+    except ValueError:
+        return default
+
+
+def circuit_degradation(key: str) -> str:
+    now = time.monotonic()
+    with _CIRCUIT_LOCK:
+        state = _CIRCUIT_OPEN_UNTIL.get(key)
+        if state is None:
+            return ""
+        expires_at, code = state
+        if expires_at <= now:
+            _CIRCUIT_OPEN_UNTIL.pop(key, None)
+            return ""
+        return code
+
+
+def open_circuit(key: str, code: str) -> None:
+    with _CIRCUIT_LOCK:
+        _CIRCUIT_OPEN_UNTIL[key] = (
+            time.monotonic() + circuit_cooldown_seconds(code),
+            code,
+        )
+
+
+def owner_call_lock(key: str) -> threading.BoundedSemaphore:
+    with _CIRCUIT_LOCK:
+        lock = _OWNER_CALL_LOCKS.get(key)
+        if lock is None:
+            # Independent saved documents may preview concurrently. Keep a
+            # bounded per-account, per-lane cap without forcing all three
+            # documents to spend their model deadline waiting behind one call.
+            lock = threading.BoundedSemaphore(3)
+            _OWNER_CALL_LOCKS[key] = lock
+        return lock
+
+
+def clear_etl_llm_circuit() -> None:
+    with _CIRCUIT_LOCK:
+        _CIRCUIT_OPEN_UNTIL.clear()

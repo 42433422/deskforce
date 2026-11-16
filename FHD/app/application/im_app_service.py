@@ -1,0 +1,580 @@
+"""IM V0 应用服务。"""
+
+from __future__ import annotations
+
+import base64
+import json
+import logging
+from datetime import datetime
+from typing import Any, cast
+
+from sqlalchemy import and_, desc, func, or_, select
+from sqlalchemy.orm import Session
+
+from app.application.im_employee_mixin import ImEmployeeMixin
+from app.application.im_employee_peer import EmployeePeerMixin
+from app.db.models.im import ImConversation, ImConversationMember, ImMessage
+from app.db.models.user import User
+from app.domain.app_pure.im_read_state_mixin import ImReadStateMixin
+from app.utils.operational_errors import RECOVERABLE_ERRORS
+from app.utils.time import utc_now_naive
+
+logger = logging.getLogger(__name__)
+
+ENTERPRISE_DEDICATED_CS_USERNAME = "enterprise-cs"
+ENTERPRISE_DEDICATED_CS_DISPLAY_NAME = "企业专属客服"
+
+
+def ensure_im_tables(engine) -> None:
+    from app.db.init_db import init_im_tables
+
+    init_im_tables(engine)
+
+
+class ImApplicationService(ImReadStateMixin, ImEmployeeMixin, EmployeePeerMixin):
+    def __init__(self, db: Session):
+        self._db = db
+
+    def _display_name(self, user_id: int) -> str:
+        user = self._db.get(User, int(user_id))
+        if not user:
+            return f"用户{user_id}"
+        name = str(user.display_name or "").strip() or str(user.username or "").strip()
+        return name or f"用户{user_id}"
+
+    def _display_name_map(self, user_ids: list[int]) -> dict[int, str]:
+        ids = [int(u) for u in set(user_ids)]
+        if not ids:
+            return {}
+        rows = self._db.execute(select(User).where(User.id.in_(ids))).scalars().all()
+        out: dict[int, str] = {}
+        for u in rows:
+            name = str(u.display_name or "").strip() or str(u.username or "").strip()
+            out[int(u.id)] = name or f"用户{u.id}"
+        return out
+
+    @staticmethod
+    def _is_enterprise_dedicated_cs_user(user: User | None) -> bool:
+        return (
+            user is not None
+            and str(getattr(user, "username", "") or "").strip().lower()
+            == ENTERPRISE_DEDICATED_CS_USERNAME
+        )
+
+    def _ensure_enterprise_dedicated_cs_user(self) -> User | None:
+        row = (
+            self._db.execute(
+                select(User).where(User.username == ENTERPRISE_DEDICATED_CS_USERNAME).limit(1)
+            )
+            .scalars()
+            .first()
+        )
+        if row is None:
+            row = User(
+                username=ENTERPRISE_DEDICATED_CS_USERNAME,
+                password="!",
+                display_name=ENTERPRISE_DEDICATED_CS_DISPLAY_NAME,
+                email="",
+                role="support",
+                is_active=True,
+                created_at=utc_now_naive(),
+            )
+            self._db.add(row)
+            self._db.commit()
+            self._db.refresh(row)
+            return row
+
+        changed = False
+        if str(row.display_name or "").strip() != ENTERPRISE_DEDICATED_CS_DISPLAY_NAME:
+            row.display_name = ENTERPRISE_DEDICATED_CS_DISPLAY_NAME
+            changed = True
+        if not bool(row.is_active):
+            row.is_active = True
+            changed = True
+        if changed:
+            self._db.commit()
+            self._db.refresh(row)
+        return cast("User | None", row)
+
+    @staticmethod
+    def _contact_dict(user: User, *, dedicated_cs: bool = False) -> dict[str, Any]:
+        name = str(user.display_name or "").strip() or str(user.username or "").strip()
+        out: dict[str, Any] = {
+            "id": int(user.id),
+            "display_name": name or f"用户{user.id}",
+            "username": str(user.username or "").strip(),
+        }
+        if dedicated_cs:
+            out["is_enterprise_dedicated_cs"] = True
+        return out
+
+    def _direct_peer_id(self, conversation_id: int, user_id: int) -> int | None:
+        row = self._db.execute(
+            select(ImConversationMember.user_id).where(
+                ImConversationMember.conversation_id == conversation_id,
+                ImConversationMember.user_id != user_id,
+            )
+        ).first()
+        return int(row[0]) if row else None
+
+    def list_conversations(
+        self, user_id: int, *, include_enterprise_dedicated_cs: bool = True
+    ) -> list[dict[str, Any]]:
+        """Preserve the legacy complete-list API, with bounded batch queries."""
+        return self.list_conversations_page(
+            user_id, include_enterprise_dedicated_cs=include_enterprise_dedicated_cs
+        )[0]
+
+    def list_conversations_page(
+        self,
+        user_id: int,
+        *,
+        include_enterprise_dedicated_cs: bool = True,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        query = (
+            select(ImConversation)
+            .join(ImConversationMember, ImConversationMember.conversation_id == ImConversation.id)
+            .where(ImConversationMember.user_id == user_id)
+            .order_by(desc(ImConversation.last_message_at).nulls_last(), desc(ImConversation.id))
+        )
+        if not include_enterprise_dedicated_cs:
+            cs_peer = (
+                select(ImConversationMember.id)
+                .join(User, User.id == ImConversationMember.user_id)
+                .where(
+                    ImConversationMember.conversation_id == ImConversation.id,
+                    ImConversationMember.user_id != user_id,
+                    func.lower(func.trim(User.username)) == ENTERPRISE_DEDICATED_CS_USERNAME,
+                )
+                .correlate(ImConversation)
+                .exists()
+            )
+            query = query.where(~and_(ImConversation.is_direct.is_(True), cs_peer))
+        if cursor:
+            try:
+                if len(cursor) > 256:
+                    raise ValueError
+                stamp, last_id = json.loads(
+                    base64.b64decode(
+                        cursor + "=" * (-len(cursor) % 4), altchars=b"-_", validate=True
+                    )
+                )
+                if type(last_id) is not int or last_id <= 0:
+                    raise ValueError
+                if stamp is None:
+                    before = and_(
+                        ImConversation.last_message_at.is_(None), ImConversation.id < last_id
+                    )
+                else:
+                    stamp = datetime.fromisoformat(stamp)
+                    before = or_(
+                        ImConversation.last_message_at < stamp,
+                        and_(ImConversation.last_message_at == stamp, ImConversation.id < last_id),
+                        ImConversation.last_message_at.is_(None),
+                    )
+                query = query.where(before)
+            except (ValueError, TypeError, UnicodeError) as exc:
+                raise ValueError("会话分页游标无效") from exc
+        if limit is not None:
+            limit = max(1, min(int(limit), 200))
+            query = query.limit(limit + 1)
+        rows = self._db.execute(query).scalars().all()
+        more = limit is not None and len(rows) > limit
+        rows = rows[:limit] if more else rows
+        items = []
+        for start in range(0, len(rows), 200):
+            items.extend(self._conversation_batch(rows[start : start + 200], user_id))
+        next_cursor = None
+        if more:
+            last = rows[-1]
+            stamp = last.last_message_at.isoformat() if last.last_message_at else None
+            next_cursor = (
+                base64.urlsafe_b64encode(json.dumps([stamp, last.id]).encode()).decode().rstrip("=")
+            )
+        return items, next_cursor
+
+    def _conversation_batch(self, conversations, user_id: int) -> list[dict[str, Any]]:
+        ids = [conv.id for conv in conversations]
+        latest = (
+            select(func.max(ImMessage.id).label("id"))
+            .where(ImMessage.conversation_id.in_(ids))
+            .group_by(ImMessage.conversation_id)
+            .subquery()
+        )
+        previews = dict(
+            self._db.execute(
+                select(ImMessage.conversation_id, func.substr(ImMessage.body, 1, 120)).join(
+                    latest, latest.c.id == ImMessage.id
+                )
+            ).all()
+        )
+        unread = dict(
+            self._db.execute(
+                select(ImMessage.conversation_id, func.count(ImMessage.id))
+                .join(
+                    ImConversationMember,
+                    ImConversationMember.conversation_id == ImMessage.conversation_id,
+                )
+                .where(
+                    ImMessage.conversation_id.in_(ids),
+                    ImConversationMember.user_id == user_id,
+                    ImMessage.id > func.coalesce(ImConversationMember.last_read_message_id, 0),
+                    ImMessage.sender_user_id != user_id,
+                )
+                .group_by(ImMessage.conversation_id)
+            ).all()
+        )
+        direct_ids = [conv.id for conv in conversations if conv.is_direct]
+        peers: dict[int, int] = {}
+        if direct_ids:
+            for conversation_id, peer_id in self._db.execute(
+                select(ImConversationMember.conversation_id, ImConversationMember.user_id)
+                .where(
+                    ImConversationMember.conversation_id.in_(direct_ids),
+                    ImConversationMember.user_id != user_id,
+                )
+                .order_by(ImConversationMember.id)
+            ):
+                peers.setdefault(conversation_id, peer_id)
+        users = (
+            {
+                user.id: user
+                for user in self._db.execute(
+                    select(User).where(User.id.in_(set(peers.values())))
+                ).scalars()
+            }
+            if peers
+            else {}
+        )
+        result = []
+        for conv in conversations:
+            peer_id = peers.get(conv.id)
+            peer = users.get(peer_id)
+            title = (
+                (
+                    (str(peer.display_name or "").strip() or str(peer.username or "").strip())
+                    if peer
+                    else f"用户{peer_id}"
+                )
+                if peer_id
+                else (conv.title or f"会话 #{conv.id}")
+            )
+            title = title or f"用户{peer_id}"
+            username = str(peer.username or "") if peer else ""
+            item = {
+                "id": conv.id,
+                "title": title,
+                "is_direct": conv.is_direct,
+                "last_message_at": conv.last_message_at.isoformat()
+                if conv.last_message_at
+                else None,
+                "last_message_preview": previews.get(conv.id) or "",
+                "unread_count": unread.get(conv.id, 0),
+                "peer_username": username,
+                "employee_id": username[len("emp:") :] if username.startswith("emp:") else "",
+            }
+            if conv.is_direct and self._is_enterprise_dedicated_cs_user(peer):
+                item["is_enterprise_dedicated_cs"] = True
+            result.append(item)
+        return result
+
+    def list_contacts(
+        self, user_id: int, *, include_enterprise_dedicated_cs: bool = True
+    ) -> list[dict[str, Any]]:
+        me = self._db.get(User, int(user_id))
+        my_tenant = getattr(me, "tenant_id", None) if me else None
+        dedicated_cs = (
+            self._ensure_enterprise_dedicated_cs_user() if include_enterprise_dedicated_cs else None
+        )
+        dedicated_cs_id = (
+            int(dedicated_cs.id) if dedicated_cs is not None and dedicated_cs.id else None
+        )
+        q = select(User).where(User.id != int(user_id), User.is_active.is_(True))
+        if dedicated_cs_id is not None:
+            q = q.where(User.id != dedicated_cs_id)
+        elif not include_enterprise_dedicated_cs:
+            q = q.where(User.username != ENTERPRISE_DEDICATED_CS_USERNAME)
+        if my_tenant is not None:
+            q = q.where(User.tenant_id == my_tenant)
+        rows = self._db.execute(q.order_by(User.display_name, User.username)).scalars().all()
+        out: list[dict[str, Any]] = []
+        if dedicated_cs is not None and dedicated_cs_id != int(user_id):
+            out.append(self._contact_dict(dedicated_cs, dedicated_cs=True))
+        for u in rows:
+            out.append(self._contact_dict(u))
+        return out
+
+    def _count_unread(self, conversation_id: int, user_id: int) -> int:
+        member = self._get_member(conversation_id, user_id)
+        last_read = int(member.last_read_message_id or 0) if member else 0
+        return int(
+            self._db.execute(
+                select(func.count())
+                .select_from(ImMessage)
+                .where(
+                    ImMessage.conversation_id == conversation_id,
+                    ImMessage.id > last_read,
+                    ImMessage.sender_user_id != user_id,
+                )
+            ).scalar()
+            or 0
+        )
+
+    def _get_member(self, conversation_id: int, user_id: int) -> ImConversationMember | None:
+        return cast(
+            "ImConversationMember | None",
+            self._db.execute(
+                select(ImConversationMember).where(
+                    ImConversationMember.conversation_id == conversation_id,
+                    ImConversationMember.user_id == user_id,
+                )
+            ).scalar_one_or_none(),
+        )
+
+    def get_or_create_direct(self, user_id: int, peer_user_id: int) -> dict[str, Any]:
+        if user_id == peer_user_id:
+            raise ValueError("不能与自己创建会话")
+        conv_id = self._find_direct_conversation(user_id, peer_user_id)
+        if conv_id:
+            conv = self._db.get(ImConversation, conv_id)
+            return {"id": conv.id, "title": conv.title, "created": False}
+        conv = ImConversation(
+            title=f"用户{user_id} ↔ 用户{peer_user_id}",
+            is_direct=True,
+        )
+        self._db.add(conv)
+        self._db.flush()
+        for uid in (user_id, peer_user_id):
+            self._db.add(ImConversationMember(conversation_id=conv.id, user_id=uid))
+        self._db.commit()
+        self._db.refresh(conv)
+        return {"id": conv.id, "title": conv.title, "created": True}
+
+    def _find_direct_conversation(self, a: int, b: int) -> int | None:
+        sub_a = select(ImConversationMember.conversation_id).where(
+            ImConversationMember.user_id == a
+        )
+        sub_b = select(ImConversationMember.conversation_id).where(
+            ImConversationMember.user_id == b
+        )
+        row = self._db.execute(
+            select(ImConversation.id)
+            .where(
+                ImConversation.is_direct.is_(True),
+                ImConversation.id.in_(sub_a),
+                ImConversation.id.in_(sub_b),
+            )
+            .limit(1)
+        ).first()
+        return int(row[0]) if row else None
+
+    def list_messages(
+        self,
+        conversation_id: int,
+        user_id: int,
+        *,
+        limit: int = 50,
+        before_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        if not self._get_member(conversation_id, user_id):
+            raise PermissionError("非会话成员")
+        q = select(ImMessage).where(ImMessage.conversation_id == conversation_id)
+        if before_id:
+            q = q.where(ImMessage.id < before_id)
+        rows = (
+            self._db.execute(q.order_by(desc(ImMessage.id)).limit(min(limit, 100))).scalars().all()
+        )
+        rows = list(reversed(rows))
+        names = self._display_name_map([m.sender_user_id for m in rows])
+        out: list[dict[str, Any]] = []
+        for m in rows:
+            d = self._message_dict(m, names.get(int(m.sender_user_id)))
+            # 标记是否本人发出，供前端把消息映射成「我(右) / 员工(左)」气泡。
+            d["is_self"] = int(m.sender_user_id) == int(user_id)
+            out.append(d)
+        return out
+
+    def send_message(
+        self,
+        conversation_id: int,
+        sender_user_id: int,
+        body: str,
+        *,
+        origin: str = "user",
+        operator_user_id: int | None = None,
+        record_sync: bool = True,
+    ) -> dict[str, Any]:
+        if not self._get_member(conversation_id, sender_user_id):
+            raise PermissionError("非会话成员")
+        text = (body or "").strip()
+        if not text:
+            raise ValueError("消息不能为空")
+        msg = ImMessage(
+            conversation_id=conversation_id,
+            sender_user_id=sender_user_id,
+            body=text[:4000],
+            origin=(origin or "user")[:32],
+            operator_user_id=(int(operator_user_id) if operator_user_id else None),
+        )
+        self._db.add(msg)
+        conv = self._db.get(ImConversation, conversation_id)
+        if conv:
+            conv.last_message_at = utc_now_naive()
+        self._db.commit()
+        self._db.refresh(msg)
+        try:
+            from app.neuro_bus.application_neuro_bridge import (
+                neuro_notify_im_message_sent,
+            )
+
+            neuro_notify_im_message_sent(
+                conversation_id=msg.conversation_id,
+                sender_id=str(msg.sender_user_id),
+                message_type="text",
+            )
+        except RECOVERABLE_ERRORS:
+            logger.debug("neuro_notify_im_message_sent skipped", exc_info=True)
+        member_ids = self._member_user_ids(conversation_id)
+        message = self._message_dict(msg, self._display_name(sender_user_id))
+        updated_at_ms = (
+            self._record_im_message_change(message, actor=str(sender_user_id))
+            if record_sync
+            else None
+        )
+        try:
+            self._maybe_push_cs_message(conversation_id, sender_user_id, text, member_ids)
+        except RECOVERABLE_ERRORS:
+            logger.debug("cs push skipped", exc_info=True)
+        return {
+            "message": message,
+            "member_user_ids": member_ids,
+            "updated_at_ms": updated_at_ms,
+        }
+
+    def _query_admin_user_ids(self) -> list[int]:
+        rows = self._db.execute(
+            select(User.id).where(
+                User.is_active.is_(True),
+                User.role.in_(["admin", "super_admin", "owner"]),
+            )
+        ).all()
+        return [int(r[0]) for r in rows]
+
+    def _maybe_push_cs_message(
+        self,
+        conversation_id: int,
+        sender_user_id: int,
+        text: str,
+        member_ids: list[int],
+    ) -> None:
+        """专属客服会话消息推送:客户发→推所有运营者(admin);客服回→推客户。
+
+        CS 端点直接调 send_message(绕过会做推送的 im_send_message 路由),故在此统一补推。
+        非客服会话(enterprise-cs 不在会话成员里)直接跳过,不影响普通 IM。
+        """
+        cs_id = self.enterprise_cs_user_id()
+        if cs_id is None or int(cs_id) not in [int(m) for m in member_ids]:
+            return
+        try:
+            from app.domain.shared_services.mobile_push import notify_user
+        except ImportError:
+            return
+        preview = (text or "").strip()[:120]
+        if int(sender_user_id) == int(cs_id):
+            # 运营者以企业专属客服身份回复 → 推给客户
+            customer_id = self._direct_peer_id(conversation_id, int(cs_id))
+            if customer_id:
+                try:
+                    notify_user(
+                        int(customer_id),
+                        "专属客服回复",
+                        preview,
+                        {
+                            "type": "cs_reply",
+                            "conversation_id": str(conversation_id),
+                            "route": "cs_chat",
+                        },
+                    )
+                except RECOVERABLE_ERRORS:
+                    logger.debug("cs reply push failed", exc_info=True)
+        else:
+            # 客户发消息 → 推给所有运营者(admin),进管理端「客户客服」收件箱
+            sender_name = self._display_name(sender_user_id)
+            for admin_id in self._query_admin_user_ids():
+                if int(admin_id) == int(sender_user_id):
+                    continue
+                try:
+                    notify_user(
+                        int(admin_id),
+                        f"客户咨询 · {sender_name}",
+                        preview,
+                        {
+                            "type": "cs_inbox",
+                            "conversation_id": str(conversation_id),
+                            "route": "admin_cs_console",
+                        },
+                    )
+                except RECOVERABLE_ERRORS:
+                    logger.debug("cs inbox push failed", exc_info=True)
+
+    @staticmethod
+    def _record_im_message_change(message: dict[str, Any], *, actor: str) -> int:
+        from app.domain.shared_services.xcmax_sync_service import record_change, utc_now_ms
+
+        updated_at_ms = utc_now_ms()
+        record_change(
+            "im_message",
+            str(message["id"]),
+            "insert",
+            {**message, "meta": {"updated_at_ms": updated_at_ms}},
+            actor=actor,
+        )
+        return updated_at_ms
+
+    @staticmethod
+    def _record_im_read_change(
+        conversation_id: int,
+        user_id: int,
+        last_read_message_id: int,
+        *,
+        actor: str,
+    ) -> int:
+        from app.domain.shared_services.xcmax_sync_service import record_change, utc_now_ms
+
+        updated_at_ms = utc_now_ms()
+        record_change(
+            "im_read_state",
+            f"{conversation_id}:{user_id}",
+            "update",
+            {
+                "conversation_id": conversation_id,
+                "user_id": user_id,
+                "last_read_message_id": last_read_message_id,
+                "meta": {"updated_at_ms": updated_at_ms},
+            },
+            actor=actor,
+        )
+        return updated_at_ms
+
+    def _member_user_ids(self, conversation_id: int) -> list[int]:
+        rows = self._db.execute(
+            select(ImConversationMember.user_id).where(
+                ImConversationMember.conversation_id == conversation_id
+            )
+        ).all()
+        return [int(r[0]) for r in rows]
+
+    @staticmethod
+    def _message_dict(m: ImMessage, sender_name: str | None = None) -> dict[str, Any]:
+        return {
+            "id": m.id,
+            "conversation_id": m.conversation_id,
+            "sender_user_id": m.sender_user_id,
+            "sender_display_name": sender_name or f"用户{m.sender_user_id}",
+            "body": m.body,
+            "origin": str(getattr(m, "origin", "user") or "user"),
+            "operator_user_id": getattr(m, "operator_user_id", None),
+            "created_at": m.created_at.isoformat() if m.created_at else None,
+        }

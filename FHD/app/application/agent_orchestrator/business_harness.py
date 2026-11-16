@@ -1,0 +1,626 @@
+"""XCAGI Business Harness protocol helpers.
+
+The harness keeps a business conversation (thread), one user turn, one durable
+task, one or more execution attempts, approval gates, events, and the terminal
+business result as separate identities.  The helpers in this module are pure so
+all execution entry points can share the same contract.
+"""
+
+from __future__ import annotations
+
+import re
+import uuid
+from typing import Any
+
+from app.application.agent_orchestrator.public_step_errors import public_run_error
+
+BUSINESS_HARNESS_PROTOCOL = "xcagi.business-harness.v1"
+TERMINAL_RUN_STATUSES = frozenset({"completed", "failed", "cancelled"})
+ERP_ORDER_TOOL_NAME = "execute_erp_capability"
+UNEXECUTED_ORDER_ERROR = "业务动作未执行：没有工具调用或有效写入回执，未确认任何数据变更"
+_ORDER_WRITE_RE = re.compile(r"开单|开一张|创建销售订单|新建订单|生成.{0,12}单据")
+_ORDER_NEGATED_RE = re.compile(
+    r"(?:不要|别|勿|无需|不用).{0,6}(?:开单|开一张|创建销售订单|新建订单|生成单据)"
+)
+
+_FACT_KEYS = (
+    "id",
+    "customer_id",
+    "product_id",
+    "material_id",
+    "order_id",
+    "record_id",
+    "request_id",
+    "request_no",
+    "order_number",
+    "document_id",
+    "doc_name",
+    "name",
+    "created",
+    "updated",
+    "deleted",
+    "count",
+    "total",
+    "row_count",
+)
+
+
+def _text(value: Any, *, limit: int = 512) -> str:
+    return str(value or "").strip()[:limit]
+
+
+def ensure_business_harness_context(
+    context: dict[str, Any] | None,
+    *,
+    message: str = "",
+) -> dict[str, Any]:
+    """Return a context with stable turn/task IDs without conflating the thread."""
+    normalized = dict(context or {})
+    conversation_id = _text(
+        normalized.get("conversation_id") or normalized.get("session_id"), limit=160
+    )
+    turn_id = _text(normalized.get("turn_id"), limit=160) or f"turn_{uuid.uuid4().hex}"
+    task_id = _text(normalized.get("task_id"), limit=160) or f"task_{uuid.uuid4().hex}"
+    normalized.update(
+        {
+            "business_harness_protocol": BUSINESS_HARNESS_PROTOCOL,
+            "turn_id": turn_id,
+            "task_id": task_id,
+        }
+    )
+    if conversation_id:
+        normalized["conversation_id"] = conversation_id
+        normalized.setdefault("session_id", conversation_id)
+    if message and not _text(normalized.get("task_title"), limit=80):
+        normalized["task_title"] = _text(message, limit=80)
+    return normalized
+
+
+def harness_event_context(run: Any) -> dict[str, Any]:
+    """Build the identity envelope attached to every durable run event."""
+    metadata = getattr(run, "metadata", {})
+    metadata = metadata if isinstance(metadata, dict) else {}
+    task = metadata.get("task_context")
+    task = task if isinstance(task, dict) else {}
+    runtime = metadata.get("runtime_context")
+    runtime = runtime if isinstance(runtime, dict) else {}
+    try:
+        attempt = max(1, int(task.get("attempt") or 1))
+    except (TypeError, ValueError):
+        attempt = 1
+    return {
+        "protocol": BUSINESS_HARNESS_PROTOCOL,
+        "task_id": _text(
+            task.get("task_id") or runtime.get("task_id") or getattr(run, "run_id", ""), limit=160
+        ),
+        "turn_id": _text(task.get("turn_id") or runtime.get("turn_id"), limit=160),
+        "conversation_id": _text(
+            task.get("conversation_id")
+            or runtime.get("conversation_id")
+            or runtime.get("session_id"),
+            limit=160,
+        ),
+        "run_id": _text(getattr(run, "run_id", ""), limit=96),
+        "attempt": attempt,
+    }
+
+
+def _iter_result_payloads(run: Any) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    final_output = getattr(run, "final_output", {})
+    final_output = final_output if isinstance(final_output, dict) else {}
+    node_outputs = final_output.get("node_outputs")
+    if isinstance(node_outputs, dict):
+        payloads.extend(value for value in node_outputs.values() if isinstance(value, dict))
+    for step in getattr(run, "steps", []) or []:
+        output = getattr(step, "output", {})
+        if isinstance(output, dict) and output not in payloads:
+            payloads.append(output)
+    chat_payload = final_output.get("chat_payload")
+    if isinstance(chat_payload, dict):
+        payloads.append(chat_payload)
+    return payloads
+
+
+def _catalog_historical_summary(run: Any) -> str:
+    steps = list(getattr(run, "steps", []) or [])
+    if len(steps) != 1 or getattr(steps[0], "tool_id", "") != "catalog_products_v1":
+        return ""
+    output = getattr(steps[0], "output", {}) or {}
+    projected = ((getattr(run, "final_output", {}) or {}).get("node_outputs") or {}).get(
+        steps[0].node_id
+    )
+    if (
+        isinstance(projected, dict)
+        and projected.get("outcome") == "historical_saved"
+        and projected.get("business_action_id") == f"agent:{run.run_id}:{steps[0].step_id}"
+        and projected.get("data") == output.get("data")
+        and projected.get("business_verification") == output.get("business_verification")
+    ):
+        output = projected
+    if (
+        output.get("outcome") == "historical_saved"
+        and output.get("success") is False
+        and output.get("historical_effect_verified") is True
+        and output.get("current_matches") is False
+        and output.get("fresh_save") is False
+        and not output.get("reconciliation_required")
+        and (output.get("business_verification") or {}).get("verified") is True
+        and (output.get("business_verification") or {}).get("method") == "catalog_price_receipt_v1"
+    ):
+        return "原修改已核验，但当前已有后续变更；本次未保存"
+    return ""
+
+
+def _catalog_rejection_summary(run: Any) -> str:
+    steps = list(getattr(run, "steps", []) or [])
+    if len(steps) != 1 or getattr(steps[0], "tool_id", "") != "catalog_products_v1":
+        return ""
+    step = steps[0]
+    output = getattr(step, "output", {}) or {}
+    verification = output.get("business_verification")
+    if (
+        getattr(run, "status", "") == "completed"
+        and step.action in {"append_price", "correct_price"}
+        and output.get("outcome") == "rejected_no_effect"
+        and output.get("operation_outcome") == "rejected_no_effect"
+        and output.get("success") is False
+        and output.get("historical_effect_verified") is False
+        and output.get("current_matches") is False
+        and output.get("fresh_save") is False
+        and output.get("retryable") is False
+        and not output.get("reconciliation_required")
+        and output.get("business_action_id") == f"agent:{run.run_id}:{step.step_id}"
+        and isinstance(verification, dict)
+        and verification.get("verified") is True
+        and verification.get("source_binding_verified") is True
+        and verification.get("method") == "catalog_price_receipt_v1"
+    ):
+        return "未保存：审核前态已变化；原操作已核验无副作用"
+    return ""
+
+
+def _result_summary(run: Any, payloads: list[dict[str, Any]]) -> str:
+    status = _text(getattr(run, "status", ""), limit=32)
+    metadata = getattr(run, "metadata", {}) or {}
+    terminal_catalog = _catalog_historical_summary(run) or _catalog_rejection_summary(run)
+    if terminal_catalog:
+        return terminal_catalog
+    if status in {"failed", "cancelled", "blocked", "paused"} and (
+        metadata.get("non_retryable")
+        or (metadata.get("recovery") or {}).get("state") == "manual_reconciliation_required"
+    ):
+        warning = "任务已停止后续执行；已有调用的结果待核对，请勿重复提交"
+        error = public_run_error(run) if status == "failed" else ""
+        return f"{error}\n{warning}" if error else warning
+    if status == "failed":
+        return public_run_error(run) or "业务任务执行失败，详细信息已记录"
+    if status == "cancelled":
+        return "业务任务已取消，未继续执行"
+    if status == "blocked":
+        return public_run_error(run) or "业务任务已被安全校验阻止，未确认执行完成"
+    if status == "paused":
+        return "业务任务已暂停，等待处理；尚未确认完成"
+    for payload in reversed(payloads):
+        raw_nested = payload.get("data")
+        nested: dict[str, Any] = raw_nested if isinstance(raw_nested, dict) else {}
+        for candidate in (
+            payload.get("response"),
+            payload.get("message"),
+            nested.get("message"),
+            nested.get("summary"),
+        ):
+            text = _text(candidate, limit=800)
+            if text:
+                return text
+    return "业务任务已完成"
+
+
+def _result_facts(payloads: list[dict[str, Any]]) -> dict[str, Any]:
+    facts: dict[str, Any] = {}
+    for payload in payloads:
+        numeric = payload.get("numeric_summary")
+        amount = numeric.get("total_amount") if isinstance(numeric, dict) else None
+        if isinstance(amount, dict) and isinstance(amount.get("sum"), (int, float)):
+            facts["amount_total"] = amount["sum"]
+        raw_nested = payload.get("data")
+        nested: dict[str, Any] = raw_nested if isinstance(raw_nested, dict) else {}
+        for source in (payload, nested):
+            for key in _FACT_KEYS:
+                value = source.get(key)
+                if isinstance(value, (str, int, float, bool)) and value not in ("", None):
+                    facts[key] = value
+    return facts
+
+
+def _pending_approval_signal(payloads: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Return approval facts when any result payload reports a pending approval.
+
+    A pending approval means the business action was NOT executed: the run must not
+    be reported as a success just because the chat turn finished normally.
+    """
+    for payload in reversed(payloads):
+        raw_nested = payload.get("data")
+        nested: dict[str, Any] = raw_nested if isinstance(raw_nested, dict) else {}
+        for source in (payload, nested):
+            if source.get("pending_approval") is True:
+                approval = source.get("approval")
+                approval = approval if isinstance(approval, dict) else {}
+                ids = approval.get("approval_request_ids")
+                return {
+                    "message": _text(source.get("message"), limit=512),
+                    "approval_request_ids": [
+                        _text(item, limit=96) for item in (ids if isinstance(ids, list) else [])
+                    ],
+                }
+    return None
+
+
+def _pending_approval_summary(pending: dict[str, Any]) -> str:
+    return (
+        _text(pending.get("message"), limit=512) or "该业务操作已创建审批请求，审批通过后才会执行"
+    )
+
+
+def order_write_requested(message: str) -> bool:
+    """True when the user asked to create an order or a downloadable document."""
+    text = str(message or "")
+    if _ORDER_NEGATED_RE.search(text):
+        return False
+    return _ORDER_WRITE_RE.search(text) is not None
+
+
+def forced_order_tool_choice(message: str, tools: list[Any] | None) -> dict[str, Any] | None:
+    """Force the registered ERP tool so an order request cannot end as plain text."""
+    if not order_write_requested(message):
+        return None
+    names = {
+        str((tool.get("function") or {}).get("name") or "").strip()
+        for tool in tools or []
+        if isinstance(tool, dict)
+    }
+    if ERP_ORDER_TOOL_NAME not in names:
+        return None
+    return {"type": "function", "function": {"name": ERP_ORDER_TOOL_NAME}}
+
+
+def business_write_requested(message: str) -> bool:
+    from app.domain.conversation.services.chat_tool_intent import looks_like_business_db_write
+
+    explicit_mutation = bool(
+        re.search(
+            r"新增|添加|创建|新建|修改|更新|删除|移除|写入|入库|\b(?:add|create|insert|upsert|update|delete|remove)\b",
+            str(message or ""),
+            re.IGNORECASE,
+        )
+    )
+    return order_write_requested(message) or (
+        explicit_mutation and looks_like_business_db_write(message)
+    )
+
+
+def mark_unexecuted_order_run(run: Any, message: str) -> bool:
+    """Downgrade a text-only mutation without a verified write receipt."""
+    if str(getattr(run, "status", "")) != "completed" or not business_write_requested(message):
+        return False
+    calls = list(getattr(run, "tool_calls", []) or [])
+    from app.domain.task_lifecycle.results import execution_result_requires_reconciliation
+
+    if any(
+        isinstance(getattr(call, "output", None), dict)
+        and execution_result_requires_reconciliation(call.output)
+        for call in calls
+    ):
+        return False
+    read_only = {
+        "read",
+        "query",
+        "list",
+        "get",
+        "search",
+        "inspect",
+        "describe",
+        "export",
+        "fetch",
+        "lookup",
+        "view",
+        "select",
+        "count",
+        "preview",
+        "download",
+        "verify",
+    }
+
+    def is_potential_write(call: Any) -> bool:
+        action = str(getattr(call, "action", "") or "").strip().lower()
+        params = getattr(call, "params", None)
+        if action in {"execute", "exec", "run"} and isinstance(params, dict):
+            action = str(params.get("action") or action).strip().lower()
+        return action not in read_only
+
+    if any(
+        is_potential_write(call)
+        and str(getattr(call, "status", "") or "").lower() == "completed"
+        and not (
+            isinstance(getattr(call, "output", None), dict) and call.output.get("success") is False
+        )
+        for call in calls
+    ):
+        return False
+    order_creation = bool(re.search(r"开单|开一张|创建销售订单|新建订单", str(message or "")))
+    if (
+        not order_creation
+        and order_write_requested(message)
+        and list(getattr(run, "artifacts", []) or [])
+        and any(
+            str(getattr(call, "action", "") or "").lower() == "export"
+            and str(getattr(call, "status", "") or "") == "completed"
+            for call in calls
+        )
+    ):
+        return False
+    if _pending_approval_signal(_iter_result_payloads(run)):
+        return False
+    run.status = "failed"
+    run.error = UNEXECUTED_ORDER_ERROR
+    return True
+
+
+def guard_unexecuted_payload(run: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    """Do not expose a model's claimed write as a successful business receipt."""
+    if getattr(run, "error", "") != UNEXECUTED_ORDER_ERROR:
+        return payload
+    data = dict(payload.get("data") or {}) if isinstance(payload.get("data"), dict) else {}
+    data.update(text=UNEXECUTED_ORDER_ERROR, action="business_action_not_executed")
+    return {
+        **payload,
+        "success": False,
+        "execution_state": "failed",
+        "message": UNEXECUTED_ORDER_ERROR,
+        "response": UNEXECUTED_ORDER_ERROR,
+        "data": data,
+    }
+
+
+def ensure_terminal_business_result(run: Any) -> dict[str, Any]:
+    """Attach a bounded, user-readable terminal result to a completed run."""
+    status = _text(getattr(run, "status", ""), limit=32)
+    if status not in TERMINAL_RUN_STATUSES:
+        return {}
+    final_output = getattr(run, "final_output", {})
+    final_output = dict(final_output) if isinstance(final_output, dict) else {}
+    terminal_catalog = _catalog_historical_summary(run) or _catalog_rejection_summary(run)
+    if terminal_catalog:
+        status = "failed"  # Workflow completion is not success of a rejected/historical save.
+    existing = final_output.get("business_result")
+    if (
+        not terminal_catalog
+        and isinstance(existing, dict)
+        and existing.get("protocol") == BUSINESS_HARNESS_PROTOCOL
+    ):
+        return dict(existing)
+    payloads = _iter_result_payloads(run)
+    identity = harness_event_context(run)
+    artifacts = getattr(run, "artifacts", []) or []
+    pending = _pending_approval_signal(payloads)
+    # 审批门后的业务动作**未执行**：此处报 success=true 正是界面谎称
+    # 「智能任务执行完成」的来源。终态以审批事实为准，而非外层对话是否正常结束。
+    unexecuted = (
+        mark_unexecuted_order_run(run, str(getattr(run, "message", "") or ""))
+        or str(getattr(run, "error", "") or "") == UNEXECUTED_ORDER_ERROR
+    )
+    if unexecuted:
+        status = "failed"
+    result_status = "pending_approval" if pending else status
+    if pending:
+        summary = _pending_approval_summary(pending)
+    elif unexecuted:
+        summary = UNEXECUTED_ORDER_ERROR
+    else:
+        summary = _result_summary(run, payloads)
+    result = {
+        "protocol": BUSINESS_HARNESS_PROTOCOL,
+        "status": result_status,
+        "success": result_status == "completed",
+        "pending_approval": bool(pending),
+        "summary": summary,
+        "facts": _result_facts(payloads),
+        "task_id": identity["task_id"],
+        "turn_id": identity["turn_id"],
+        "conversation_id": identity["conversation_id"],
+        "run_id": identity["run_id"],
+        "attempt": identity["attempt"],
+        "evidence": {
+            "event_count": len(getattr(run, "events", []) or []),
+            "completed_tool_count": sum(
+                str(getattr(call, "status", "")) == "completed"
+                for call in (getattr(run, "tool_calls", []) or [])
+            ),
+            "pending_approval": bool(pending),
+            "approval_request_ids": (list(pending["approval_request_ids"]) if pending else []),
+            "artifact_ids": [
+                _text(getattr(artifact, "artifact_id", ""), limit=96)
+                for artifact in artifacts
+                if _text(getattr(artifact, "artifact_id", ""), limit=96)
+            ],
+        },
+        "projection_key": f"{BUSINESS_HARNESS_PROTOCOL}:{identity['run_id']}:{result_status}",
+    }
+    final_output["business_result"] = result
+    run.final_output = final_output
+    return result
+
+
+_VISIBLE_BUSINESS_RESULT_STATUSES = {
+    "failed",
+    "cancelled",
+    "blocked",
+    "unknown",
+    "pending_approval",
+    "waiting_user",
+    "waiting_approval",
+}
+
+
+def _has_visible_business_facts(facts: Any) -> bool:
+    if not isinstance(facts, dict):
+        return False
+    return any(value not in (None, "", [], {}) for value in facts.values())
+
+
+def _result_evidence(result: dict[str, Any]) -> dict[str, Any]:
+    evidence = result.get("evidence")
+    if isinstance(evidence, dict):
+        return evidence
+    return {}
+
+
+def _has_visible_business_artifacts(result: dict[str, Any]) -> bool:
+    artifact_ids = _result_evidence(result).get("artifact_ids")
+    if isinstance(artifact_ids, list) and any(str(item).strip() for item in artifact_ids):
+        return True
+    return bool(result.get("artifacts"))
+
+
+def _completed_tool_count(result: dict[str, Any]) -> int:
+    raw = _result_evidence(result).get("completed_tool_count")
+    try:
+        return int(raw or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _payload_has_business_execution(payload: Any) -> bool:
+    """True when the chat envelope itself recorded a tool or business action."""
+    if not isinstance(payload, dict):
+        return False
+    tool = payload.get("toolCall")
+    if isinstance(tool, dict) and any(
+        str(value).strip() for value in tool.values() if value is not None
+    ):
+        return True
+    return False
+
+
+def visible_chat_business_result(
+    result: Any, *, payload: Any | None = None
+) -> dict[str, Any] | None:
+    """Return a UI-visible business result; hide completed casual turns with no facts."""
+    if not isinstance(result, dict) or not result:
+        return None
+    status = _text(result.get("status"), limit=32)
+    if (
+        _has_visible_business_facts(result.get("facts"))
+        or _has_visible_business_artifacts(result)
+        or _completed_tool_count(result) > 0
+        or result.get("pending_approval")
+        or result.get("requires_reconciliation")
+        or status in _VISIBLE_BUSINESS_RESULT_STATUSES
+        or (
+            status == "completed"
+            and _text(result.get("summary"))
+            and _payload_has_business_execution(payload)
+        )
+    ):
+        return dict(result)
+    return None
+
+
+def extract_payload_business_result(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    sources: list[Any] = [payload]
+    data = payload.get("data")
+    if isinstance(data, dict):
+        sources.append(data)
+        inner = data.get("data")
+        if isinstance(inner, dict):
+            sources.append(inner)
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        visible = visible_chat_business_result(
+            source.get("businessResult") or source.get("business_result"),
+            payload=payload,
+        )
+        if visible is not None:
+            return visible
+    return None
+
+
+def _payload_has_explicit_business_result(payload: dict[str, Any]) -> bool:
+    sources: list[Any] = [payload]
+    data = payload.get("data")
+    if isinstance(data, dict):
+        sources.append(data)
+        inner = data.get("data")
+        if isinstance(inner, dict):
+            sources.append(inner)
+    for source in sources:
+        if isinstance(source, dict) and ("businessResult" in source or "business_result" in source):
+            return True
+    return False
+
+
+def _run_id_from_payload(payload: dict[str, Any]) -> str:
+    for source in (payload, payload.get("data") if isinstance(payload.get("data"), dict) else {}):
+        if not isinstance(source, dict):
+            continue
+        run_id = _text(source.get("run_id") or source.get("agent_run_id"), limit=96)
+        if run_id:
+            return run_id
+    return ""
+
+
+def attach_visible_business_result_to_chat_payload(
+    payload: dict[str, Any],
+    *,
+    run: Any | None = None,
+    repository: Any | None = None,
+) -> dict[str, Any]:
+    """Copy a meaningful terminal business result onto the live chat payload."""
+    if not isinstance(payload, dict):
+        return payload
+    visible = extract_payload_business_result(payload)
+    target = run
+    if visible is None and target is None and _payload_has_explicit_business_result(payload):
+        return payload
+    if visible is None and target is None:
+        run_id = _run_id_from_payload(payload)
+        if run_id:
+            repo = repository
+            if repo is None:
+                from app.application.agent_orchestrator.run_repository import (
+                    get_agent_run_repository,
+                )
+
+                repo = get_agent_run_repository()
+            target = repo.get(run_id) if repo is not None else None
+    if visible is None and target is not None:
+        final_output = getattr(target, "final_output", {})
+        raw = final_output.get("business_result") if isinstance(final_output, dict) else None
+        if not isinstance(raw, dict):
+            raw = ensure_terminal_business_result(target)
+        visible = visible_chat_business_result(raw)
+    if visible is None:
+        return payload
+    attached = dict(payload)
+    attached["businessResult"] = visible
+    return attached
+
+
+__all__ = [
+    "BUSINESS_HARNESS_PROTOCOL",
+    "TERMINAL_RUN_STATUSES",
+    "ERP_ORDER_TOOL_NAME",
+    "UNEXECUTED_ORDER_ERROR",
+    "attach_visible_business_result_to_chat_payload",
+    "ensure_business_harness_context",
+    "ensure_terminal_business_result",
+    "extract_payload_business_result",
+    "forced_order_tool_choice",
+    "harness_event_context",
+    "mark_unexecuted_order_run",
+    "order_write_requested",
+    "visible_chat_business_result",
+]

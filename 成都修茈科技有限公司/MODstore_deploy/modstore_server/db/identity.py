@@ -1,0 +1,124 @@
+"""用户身份、钱包、经验流水。"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    ForeignKey,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+)
+
+from modstore_server.db.db_base import Base
+
+
+class VerificationCode(Base):
+    __tablename__ = "verification_codes"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    email = Column(String(128), nullable=False, index=True)
+    code = Column(String(8), nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    used = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(UTC))
+
+
+class BrowserHandoffCode(Base):
+    """Short-lived browser sign-in codes; only their digest is persisted."""
+
+    __tablename__ = "browser_handoff_codes"
+
+    code_hash = Column(String(64), primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    credential_fingerprint = Column(String(64), nullable=False)
+    purpose = Column(String(16), nullable=False)
+    target = Column(String(1024), nullable=False)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    consumed_at = Column(DateTime, nullable=True)
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    username = Column(String(64), unique=True, nullable=False, index=True)
+    email = Column(String(128), unique=True, nullable=True)
+    phone = Column(String(32), unique=True, nullable=True, index=True)
+    password_hash = Column(String(256), nullable=False)
+    is_admin = Column(Boolean, default=False)
+    is_enterprise = Column(Boolean, default=False, nullable=False, index=True)
+    enterprise_subject_id = Column(String(128), nullable=True, index=True)
+    enterprise_legal_name = Column(String(256), nullable=True)
+    enterprise_verification_sha256 = Column(String(64), nullable=True)
+    enterprise_verified_at = Column(DateTime, nullable=True)
+    enterprise_verified_by_user_id = Column(Integer, nullable=True)
+    account_state = Column(String(32), default="pending_plan", nullable=False, index=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(UTC))
+    first_login_at = Column(DateTime, nullable=True, index=True)
+    last_login_at = Column(DateTime, nullable=True, index=True)
+    deleted_at = Column(DateTime, nullable=True)
+    default_llm_json = Column(Text, default="")
+    experience = Column(Integer, default=0, nullable=False)
+
+
+class Wallet(Base):
+    __tablename__ = "wallets"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False)
+    balance = Column(Numeric(12, 2), default=0.0)
+    updated_at = Column(DateTime, default=lambda: datetime.now(UTC))
+
+
+class Transaction(Base):
+    __tablename__ = "transactions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    amount = Column(Numeric(12, 2), nullable=False)
+    txn_type = Column(String(32), nullable=False)
+    status = Column(String(16), default="completed")
+    description = Column(Text, default="")
+    idempotency_key = Column(String(128), default="", index=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(UTC))
+
+
+class LandingContactSubmission(Base):
+    """官网 / 落地页公开联系表单（无登录）。"""
+
+    __tablename__ = "landing_contact_submissions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(128), nullable=False)
+    email = Column(String(256), nullable=False, index=True)
+    phone = Column(String(64), default="")
+    company = Column(String(256), default="")
+    message = Column(Text, default="")
+    source = Column(String(64), default="home", index=True)
+    meta_json = Column(Text, default="{}")
+    created_at = Column(DateTime, default=lambda: datetime.now(UTC), index=True)
+
+
+class AccountExperienceLedger(Base):
+    """账号经验流水：以 (source_type, source_order_id) 唯一标识。"""
+
+    __tablename__ = "account_experience_ledger"
+    __table_args__ = (
+        UniqueConstraint("source_type", "source_order_id", name="uq_account_xp_source"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    source_type = Column(String(32), nullable=False, index=True)
+    source_order_id = Column(String(64), nullable=False)
+    amount = Column(Numeric(12, 2), nullable=False)
+    xp_delta = Column(Integer, nullable=False)
+    description = Column(Text, default="")
+    created_at = Column(DateTime, default=lambda: datetime.now(UTC))

@@ -1,0 +1,634 @@
+"""销售门面委托、路由、引用解析与调用方事务的集成回归。"""
+
+from __future__ import annotations
+
+import inspect
+from contextlib import contextmanager
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from app.application.sales_app_service import SalesAppService
+from app.db.db_base import Base
+from app.db.models import Customer, Product, SalesOrder
+from app.domain.shared_services.tools_workflow_registered import _registered_router_sales
+from app.infrastructure.tenant_scope import tenant_scope
+
+
+def _order(order_no: str = "SO-001", state: str = "confirmed") -> SimpleNamespace:
+    order = SimpleNamespace(order_no=order_no, state=state)
+    order.to_dict = lambda: {"order_no": order_no, "state": state}
+    return order
+
+
+@contextmanager
+def _fake_get_db():
+    """替换 ``get_db``：返回 MagicMock 会话，避免真实数据库依赖。"""
+    yield MagicMock()
+
+
+def _workflow_registry():
+    from resources.config.risk_actions_loader import get_workflow_tools_from_registry
+
+    return get_workflow_tools_from_registry()
+
+
+class TestFacadeCompositionOnly:
+    """SalesAppService 为组合门面，不含旧式直写状态机逻辑。"""
+
+    def test_facade_has_no_direct_advance_status_logic(self):
+        # 旧的线性状态直写逻辑已移除，门面仅组合委托
+        assert not hasattr(SalesAppService, "_advance")
+        assert not hasattr(SalesAppService, "payment_legacy_status_write")
+
+    def test_facade_methods_delegate_to_owning_modules(self):
+        # 门面公开面只包含查询/报价创建 + 各委托入口
+        public = {m for m in dir(SalesAppService) if not m.startswith("_")}
+        assert {
+            "query",
+            "quote",
+            "confirm",
+            "cancel",
+            "deliver",
+            "invoice",
+            "credit_note",
+            "payment",
+            "refund",
+        } <= public
+
+
+class TestFacadeDelegationExactlyOnce:
+    """每个门面方法恰好一次委托到所属专属模块。"""
+
+    def test_confirm_delegates_to_lifecycle_service(self):
+        with (
+            patch("app.application.sales_app_service.get_db", _fake_get_db),
+            patch("app.application.sales_app_service.SalesLifecycleService") as lc,
+        ):
+            lc.return_value.confirm.return_value = _order("SO-001", "confirmed")
+            result = SalesAppService().confirm(5)
+        assert result["success"] is True
+        lc.assert_called_once()
+        lc.return_value.confirm.assert_called_once_with(5)
+
+    def test_cancel_delegates_to_lifecycle_service(self):
+        with (
+            patch("app.application.sales_app_service.get_db", _fake_get_db),
+            patch("app.application.sales_app_service.SalesLifecycleService") as lc,
+        ):
+            lc.return_value.cancel.return_value = _order("SO-001", "cancel")
+            result = SalesAppService().cancel(5)
+        assert result["success"] is True
+        lc.assert_called_once()
+        lc.return_value.cancel.assert_called_once_with(5)
+
+    def test_cancel_original_signature_locked_no_caller_owned_db(self):
+        """锁定原始 cancel(order_id) 公有签名：不得再引入可选 caller-owned db 扩展。"""
+        sig = inspect.signature(SalesAppService.cancel)
+        # 忽略绑定方法自带的 self（类访问时可能含 self），锁定剩余参数。
+        params = [name for name in sig.parameters if name != "self"]
+        # 仅保留必填位置参数 order_id
+        assert params == ["order_id"]
+        assert sig.parameters["order_id"].default is inspect.Parameter.empty
+        assert sig.parameters["order_id"].kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.POSITIONAL_ONLY,
+        )
+        # 不得出现任何 db / 关键字-only 扩展参数
+        assert not any(
+            p.name in ("db", "session", "ctx")
+            for p in sig.parameters.values()
+            if p.kind in (inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.VAR_KEYWORD)
+        )
+
+    def test_deliver_delegates_to_fulfillment_service(self):
+        with patch("app.application.sales_app_service.FulfillmentService") as fs:
+            fs.return_value.deliver.return_value = {"success": True}
+            result = SalesAppService().deliver(1, 2, 3.0, warehouse_id=9)
+        assert result["success"] is True
+        fs.assert_called_once()
+        fs.return_value.deliver.assert_called_once()
+        _, kwargs = fs.return_value.deliver.call_args
+        assert kwargs["warehouse_id"] == 9
+
+    def test_invoice_delegates_to_invoicing_service(self):
+        with patch(
+            "app.application.sales_app_service.invoice", return_value={"success": True}
+        ) as m:
+            result = SalesAppService().invoice(1)
+        assert result["success"] is True
+        m.assert_called_once()
+        assert m.call_args.args[0] == 1
+
+    def test_credit_note_delegates_to_invoicing_service(self):
+        with patch(
+            "app.application.sales_app_service.credit_note", return_value={"success": True}
+        ) as m:
+            result = SalesAppService().credit_note(1)
+        assert result["success"] is True
+        m.assert_called_once()
+        assert m.call_args.args[0] == 1
+
+    @pytest.mark.parametrize("key", [None, "receipt-retry-1"])
+    def test_payment_delegates_to_payment_service(self, key):
+        with patch(
+            "app.application.sales_app_service.payment", return_value={"success": True}
+        ) as m:
+            result = SalesAppService().payment(1, 100.0, idempotency_key=key)
+        assert result["success"] is True
+        m.assert_called_once()
+        kwargs = m.call_args.kwargs
+        assert kwargs["sales_order_id"] == 1
+        assert kwargs["amount"] == 100.0
+        assert kwargs["idempotency_key"] == key
+
+    def test_refund_delegates_to_payment_service(self):
+        with patch("app.application.sales_app_service.refund", return_value={"success": True}) as m:
+            result = SalesAppService().refund(7)
+        assert result["success"] is True
+        m.assert_called_once()
+        assert m.call_args.kwargs["allocation_id"] == 7
+
+
+class TestRouterRequiredParamsMatchSignatures:
+    """路由把注册表必填参数透传给门面，与门面/服务签名一致。"""
+
+    def test_router_deliver_passes_required_params(self):
+        with patch.object(SalesAppService, "deliver", return_value={"success": True}) as m:
+            result = _registered_router_sales(
+                "deliver",
+                {"order_id": 1, "item_id": 2, "quantity": 3, "warehouse_id": 9},
+                {},
+                "shared",
+                "",
+            )
+        assert result["success"] is True
+        # 交付透传 idempotency_key（GAP-3 纠正：deliver 端到端幂等）。
+        m.assert_called_once_with(1, 2, 3.0, warehouse_id=9, idempotency_key=None)
+
+    def test_router_invoice_passes_required_params(self):
+        with patch.object(SalesAppService, "invoice", return_value={"success": True}) as m:
+            result = _registered_router_sales("invoice", {"order_id": 1}, {}, "shared", "")
+        assert result["success"] is True
+        m.assert_called_once_with(1)
+
+    def test_router_credit_note_passes_required_params(self):
+        with patch.object(SalesAppService, "credit_note", return_value={"success": True}) as m:
+            result = _registered_router_sales("credit_note", {"order_id": 1}, {}, "shared", "")
+        assert result["success"] is True
+        m.assert_called_once_with(1)
+
+    @pytest.mark.parametrize("key", [None, "receipt-retry-1"])
+    def test_router_payment_passes_required_params(self, key):
+        with patch.object(SalesAppService, "payment", return_value={"success": True}) as m:
+            result = _registered_router_sales(
+                "payment",
+                {"order_id": 1, "amount": 100.0, "idempotency_key": key},
+                {},
+                "shared",
+                "",
+            )
+        assert result["success"] is True
+        m.assert_called_once_with(1, 100.0, idempotency_key=key)
+
+    def test_router_refund_passes_required_params(self):
+        with patch.object(SalesAppService, "refund", return_value={"success": True}) as m:
+            result = _registered_router_sales("refund", {"allocation_id": 7}, {}, "shared", "")
+        assert result["success"] is True
+        m.assert_called_once_with(7)
+
+    def test_router_confirm_and_cancel_pass_required_params(self):
+        with (
+            patch.object(SalesAppService, "confirm", return_value={"success": True}) as c,
+            patch.object(SalesAppService, "cancel", return_value={"success": True}) as x,
+        ):
+            assert (
+                _registered_router_sales("confirm", {"order_id": 1}, {}, "shared", "")["success"]
+                is True
+            )
+            assert (
+                _registered_router_sales("cancel", {"order_id": 1}, {}, "shared", "")["success"]
+                is True
+            )
+        c.assert_called_once_with(1)
+        x.assert_called_once_with(1)
+
+
+class TestRiskIdempotencyMetadataReflectBehavior:
+    """注册表元数据反映门面所委托服务的真实行为。"""
+
+    def test_required_params_match_real_calls(self):
+        sales = _workflow_registry()["sales"]["actions"]
+        # 交付需要明细与仓库（真实履行委托签名）
+        assert set(sales["deliver"]["required_params"]) == {
+            "order_id",
+            "item_id",
+            "quantity",
+            "warehouse_id",
+        }
+        # 收款需要金额；退款需要分配 id
+        assert set(sales["payment"]["required_params"]) == {"order_id", "amount"}
+        assert sales["refund"]["required_params"] == ["allocation_id"]
+        assert sales["invoice"]["required_params"] == ["order_id"]
+        assert sales["credit_note"]["required_params"] == ["order_id"]
+
+    def test_idempotency_matches_delegated_services(self):
+        sales = _workflow_registry()["sales"]["actions"]
+        # 只读查询幂等
+        assert sales["query"]["idempotent"] is True
+        # Optional quote deduplication does not make every invocation replay-safe.
+        assert sales["quote"]["idempotent"] is False
+        assert sales["deliver"]["idempotent"] is True
+        # 生命周期 / 开票 / 收款 / 退款委托的服务均幂等返回
+        for action in ("confirm", "invoice", "payment", "refund", "cancel"):
+            assert sales[action]["idempotent"] is True
+        # 贷项通知单重复被拒 → 非幂等
+        assert sales["credit_note"]["idempotent"] is False
+
+    def test_risk_levels_match_action_kind(self):
+        sales = _workflow_registry()["sales"]["actions"]
+        assert sales["query"]["risk"] == "low"
+        assert sales["quote"]["risk"] == "medium"
+        for action in (
+            "confirm",
+            "deliver",
+            "invoice",
+            "credit_note",
+            "payment",
+            "refund",
+            "cancel",
+        ):
+            assert sales[action]["risk"] in ("medium", "high")
+
+
+# 销售到收款闭环验收句（W1-09 R2）：实体名按句中原样保留
+EXACT_SALES_WRITE_SENTENCE = "把 A 产品卖给客户B，10 个，单价 100，开票收款"
+
+
+# ---------------------------------------------------------------------------
+# 共享会话所有权（W1-10 Shared Session Ownership Refactor）
+# 门面把调用方持有的 db=session 恰好透传一次给各专属层，且不自开 get_db。
+# ---------------------------------------------------------------------------
+class TestFacadeSessionForwarding:
+    """门面 quote/confirm/deliver/invoice/payment 对 db=session 的精确转发。"""
+
+    def test_quote_uses_supplied_session_without_get_db(self):
+        mock_db = MagicMock()
+        with patch("app.application.sales_app_service.get_db") as g:
+            g.side_effect = AssertionError("带 db 时不得调用 get_db")
+            result = SalesAppService().quote(
+                {
+                    "customer_id": 1,
+                    "items": [{"product_id": 2, "quantity": 2, "unit_price": 50}],
+                },
+                db=mock_db,
+            )
+        assert result["success"] is True
+        g.assert_not_called()
+        mock_db.commit.assert_not_called()
+        mock_db.rollback.assert_not_called()
+        mock_db.close.assert_not_called()
+        # 明细刷写 + 合计刷新各一次（autoflush=False 下必须显式 flush）
+        assert mock_db.flush.call_count >= 1
+        mock_db.refresh.assert_called_once()
+
+    def test_confirm_forwards_supplied_session_to_lifecycle(self):
+        mock_db = MagicMock()
+        with (
+            patch("app.application.sales_app_service.get_db") as g,
+            patch("app.application.sales_app_service.SalesLifecycleService") as lc,
+        ):
+            g.side_effect = AssertionError("带 db 时不得调用 get_db")
+            lc.return_value.confirm.return_value = _order("SO-001", "confirmed")
+            result = SalesAppService().confirm(5, db=mock_db)
+        assert result["success"] is True
+        g.assert_not_called()
+        lc.assert_called_once()
+        assert lc.call_args.args[0] is mock_db
+        lc.return_value.confirm.assert_called_once_with(5)
+        mock_db.commit.assert_not_called()
+        mock_db.close.assert_not_called()
+
+    def test_deliver_forwards_supplied_session_exactly_once(self):
+        mock_db = MagicMock()
+        with patch("app.application.sales_app_service.FulfillmentService") as fs:
+            fs.return_value.deliver.return_value = {"success": True}
+            result = SalesAppService().deliver(1, 2, 3.0, warehouse_id=9, db=mock_db)
+        assert result["success"] is True
+        fs.return_value.deliver.assert_called_once()
+        assert fs.return_value.deliver.call_args.kwargs["db"] is mock_db
+
+    def test_invoice_forwards_supplied_session_exactly_once(self):
+        mock_db = MagicMock()
+        with patch(
+            "app.application.sales_app_service.invoice", return_value={"success": True}
+        ) as m:
+            result = SalesAppService().invoice(1, db=mock_db)
+        assert result["success"] is True
+        m.assert_called_once()
+        assert m.call_args.kwargs["db"] is mock_db
+
+    def test_payment_forwards_supplied_session_exactly_once(self):
+        mock_db = MagicMock()
+        with patch(
+            "app.application.sales_app_service.payment", return_value={"success": True}
+        ) as m:
+            result = SalesAppService().payment(1, 100.0, db=mock_db)
+        assert result["success"] is True
+        m.assert_called_once()
+        assert m.call_args.kwargs["db"] is mock_db
+
+
+@pytest.fixture(scope="function")
+def _facade_file_db(tmp_path):
+    """文件落盘 sqlite，供 quote 跨会话可见性断言。"""
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'sales_facade_owner.db'}",
+        connect_args={"check_same_thread": False, "timeout": 30},
+    )
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    db = session_factory()
+    db.info["session_factory"] = session_factory
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def _seed_quote_owner_db(db):
+    with tenant_scope(1):
+        customer = Customer(customer_name="客户Q")
+        product = Product(model_number="P-Q", name="报价品", unit="个")
+        db.add_all([customer, product])
+        db.commit()
+        db.refresh(customer)
+        db.refresh(product)
+        return customer, product
+
+
+class TestQuoteCallerOwnedSession:
+    """quote 在调用方会话内执行：不 commit/rollback/close，跨会话可见性受调用方事务控制。"""
+
+    @pytest.mark.parametrize("confirmation_fails", [False, True])
+    @pytest.mark.parametrize("model_field", ["model_number", "product_model", "product_name"])
+    def test_create_confirmed_order_commits_all_or_rolls_back(
+        self, _facade_file_db, monkeypatch, confirmation_fails, model_field
+    ):
+        from app.application.sales_order_creation import create_confirmed_order
+        from app.db.models import PurchaseUnit, SalesOrderItem
+
+        db = _facade_file_db
+        monkeypatch.setattr("app.db.session.SessionLocal", db.info["session_factory"])
+        with tenant_scope(1):
+            db.add(PurchaseUnit(unit_name="下单客户"))
+            db.add(Product(name="订单产品", model_number="ORDER"))
+            db.commit()
+            if confirmation_fails:
+                monkeypatch.setattr(
+                    SalesAppService,
+                    "confirm",
+                    lambda *_args, **_kwargs: {"success": False, "message": "确认失败测试"},
+                )
+            result = create_confirmed_order(
+                {
+                    "customer_name": "下单客户",
+                    "items": [
+                        {model_field: "ORDER", "quantity": 10, "unit_price": 50},
+                    ],
+                }
+            )
+            assert result["success"] is not confirmation_fails
+            fresh = db.info["session_factory"]()
+            try:
+                expected = 0 if confirmation_fails else 1
+                assert fresh.query(SalesOrder).count() == expected
+                assert fresh.query(SalesOrderItem).count() == expected
+                assert fresh.query(Customer).count() == expected
+                if expected:
+                    assert fresh.query(SalesOrder).one().state == "confirmed"
+                    assert result["data"]["order_id"] == result["data"]["id"]
+                    assert float(fresh.query(SalesOrder).one().total_amount) == 500
+                    item = fresh.query(SalesOrderItem).one()
+                    assert item.product_id == fresh.query(Product).one().id
+                    assert item.product_name == "订单产品"
+            finally:
+                fresh.close()
+
+    @pytest.mark.parametrize("valid_product", [True, False])
+    def test_purchase_unit_bridge_is_written_only_with_valid_quote(
+        self, _facade_file_db, valid_product
+    ):
+        from app.db.models import PurchaseUnit
+
+        db = _facade_file_db
+        with tenant_scope(1):
+            db.add(PurchaseUnit(unit_name="客户管理客户", contact_person="联系人甲"))
+            db.add(Product(model_number="BRIDGE", name="桥接产品"))
+            db.commit()
+            result = SalesAppService().quote(
+                {
+                    "customer_name": "客户管理客户",
+                    "items": [
+                        {
+                            "model_number": "BRIDGE" if valid_product else "missing",
+                            "quantity": 2,
+                            "unit_price": 50,
+                        },
+                    ],
+                },
+                db=db,
+            )
+            db.commit()
+            assert result["success"] is valid_product
+            assert db.query(Customer).count() == int(valid_product)
+            assert db.query(SalesOrder).count() == int(valid_product)
+            if valid_product:
+                assert db.query(Customer).one().contact_person == "联系人甲"
+
+    def test_quote_resolves_exact_customer_and_model(self, _facade_file_db):
+        from app.db.models import SalesOrderItem
+
+        db = _facade_file_db
+        customer, product = _seed_quote_owner_db(db)
+        result = SalesAppService().quote(
+            {
+                "customer_name": "客户Q",
+                "items": [
+                    {"model_number": "P-Q", "quantity": 2, "unit_price": 50},
+                ],
+            },
+            db=db,
+        )
+        assert result["success"] is True
+        db.commit()
+        order = db.query(SalesOrder).one()
+        item = db.query(SalesOrderItem).one()
+        assert order.customer_id == customer.id
+        assert item.product_id == product.id
+        assert item.product_name == "报价品"
+        assert float(order.total_amount) == 100
+
+    @pytest.mark.parametrize("collision", [False, True])
+    def test_product_label_resolves_unique_tenant_reference(self, _facade_file_db, collision):
+        from app.db.models import SalesOrderItem
+
+        db = _facade_file_db
+        customer, product = _seed_quote_owner_db(db)
+        with tenant_scope(2):
+            db.add(Product(model_number="P-Q", name="其他租户产品"))
+            db.commit()
+        with tenant_scope(1):
+            if collision:
+                db.add(Product(model_number="OTHER", name="P-Q"))
+                db.commit()
+            result = SalesAppService().quote(
+                {
+                    "customer_id": customer.id,
+                    "items": [
+                        {"product_name": "P-Q", "quantity": 2, "unit_price": 50},
+                    ],
+                },
+                db=db,
+            )
+            db.commit()
+            assert result["success"] is not collision
+            assert db.query(SalesOrder).count() == int(not collision)
+            if not collision:
+                assert db.query(SalesOrderItem).one().product_id == product.id
+                assert db.query(SalesOrderItem).one().product_name == "报价品"
+
+    @pytest.mark.parametrize(
+        "problem",
+        [
+            "missing_customer",
+            "duplicate_customer",
+            "missing_product",
+            "mismatch_product",
+            "missing_alias",
+            "conflicting_alias",
+        ],
+    )
+    def test_unresolved_reference_leaves_no_order(self, _facade_file_db, problem):
+        db = _facade_file_db
+        customer, product = _seed_quote_owner_db(db)
+        name = "客户Q"
+        item = {"model_number": "P-Q", "quantity": 2, "unit_price": 50}
+        if problem == "missing_customer":
+            name = "客户不存在"
+        elif problem == "duplicate_customer":
+            with tenant_scope(1):
+                db.add(Customer(customer_name="客户Q"))
+                db.commit()
+        elif problem == "missing_product":
+            item["model_number"] = "missing"
+        elif problem == "missing_alias":
+            item.pop("model_number")
+            item["product_model"] = "missing"
+        elif problem == "conflicting_alias":
+            item["product_model"] = "wrong"
+        else:
+            item.update(product_id=product.id, model_number="wrong")
+        result = SalesAppService().quote({"customer_name": name, "items": [item]}, db=db)
+        assert result["success"] is False
+        db.commit()
+        assert db.query(SalesOrder).count() == 0
+
+    def test_explicit_zero_price_is_preserved(self, _facade_file_db):
+        db = _facade_file_db
+        customer, product = _seed_quote_owner_db(db)
+        item = {"product_id": product.id, "quantity": "2.5", "unit_price": 0}
+        result = SalesAppService().quote({"customer_id": customer.id, "items": [item]}, db=db)
+        assert result["success"] is True
+        assert result["data"]["total_amount"] == 0
+        db.commit()
+        assert db.query(SalesOrder).count() == 1
+        assert item == {"product_id": product.id, "quantity": "2.5", "unit_price": 0}
+
+    @pytest.mark.parametrize(
+        "bad_item",
+        [
+            {"quantity": 2},
+            {"unit_price": 10},
+            {"quantity": 0, "unit_price": 10},
+            {"quantity": -1, "unit_price": 10},
+            {"quantity": "NaN", "unit_price": 10},
+            {"quantity": 1, "unit_price": "Infinity"},
+            {"quantity": True, "unit_price": 10},
+            {"quantity": 1, "unit_price": "bad"},
+            {"quantity": 1, "unit_price": -10},
+            None,
+        ],
+    )
+    def test_invalid_later_item_does_not_leave_partial_order(self, _facade_file_db, bad_item):
+        db = _facade_file_db
+        customer, product = _seed_quote_owner_db(db)
+        valid = {"product_id": product.id, "quantity": 2, "unit_price": 50}
+        result = SalesAppService().quote(
+            {"customer_id": customer.id, "items": [valid, bad_item]}, db=db
+        )
+        assert result["success"] is False
+        db.commit()  # Caller may commit unrelated work after a rejected request.
+        assert db.query(SalesOrder).count() == 0
+
+    def test_quote_visible_after_flush_only_after_caller_commit(self, _facade_file_db):
+        db = _facade_file_db
+        customer, product = _seed_quote_owner_db(db)
+        fresh = db.info["session_factory"]()
+
+        with (
+            patch("app.application.sales_app_service.get_db") as g,
+            patch.object(db, "commit", wraps=db.commit) as commit_spy,
+            patch.object(db, "rollback", wraps=db.rollback) as rollback_spy,
+            patch.object(db, "close", wraps=db.close) as close_spy,
+        ):
+            g.side_effect = AssertionError("带 db 时不得调用 get_db")
+            result = SalesAppService().quote(
+                {
+                    "customer_id": customer.id,
+                    "items": [{"product_id": product.id, "quantity": 2, "unit_price": 50}],
+                },
+                db=db,
+            )
+        assert result["success"] is True
+        # 未在 refresh 前 flush 全部明细与合计时，total_amount 会被回读为 0 —— 此断言兜住该回归
+        assert result["data"]["total_amount"] == 100
+        g.assert_not_called()
+        commit_spy.assert_not_called()
+        rollback_spy.assert_not_called()
+        close_spy.assert_not_called()
+
+        # 同会话 flush 后可见
+        assert (
+            db.query(SalesOrder).filter(SalesOrder.customer_id == customer.id).first() is not None
+        )
+        # caller 提交前，新会话不可见
+        assert fresh.query(SalesOrder).filter(SalesOrder.customer_id == customer.id).first() is None
+
+        # caller 提交后，新会话可见
+        db.commit()
+        persisted = fresh.query(SalesOrder).filter(SalesOrder.customer_id == customer.id).first()
+        assert persisted is not None
+        assert persisted.total_amount == 100
+        fresh.close()
+
+    def test_quote_caller_rollback_removes(self, _facade_file_db):
+        db = _facade_file_db
+        customer, product = _seed_quote_owner_db(db)
+        fresh = db.info["session_factory"]()
+
+        with patch("app.application.sales_app_service.get_db") as g:
+            result = SalesAppService().quote(
+                {
+                    "customer_id": customer.id,
+                    "items": [{"product_id": product.id, "quantity": 1, "unit_price": 10}],
+                },
+                db=db,
+            )
+        assert result["success"] is True
+        db.rollback()
+        assert fresh.query(SalesOrder).filter(SalesOrder.customer_id == customer.id).first() is None
+        fresh.close()

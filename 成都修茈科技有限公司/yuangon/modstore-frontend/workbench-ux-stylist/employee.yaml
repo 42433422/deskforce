@@ -1,0 +1,78 @@
+id: workbench-ux-stylist
+name: 工作台 UX 设计员
+version: "1.0.0"
+domain: 专注维护 MODstore 工作台（Workbench）的 UX 与交互：画布、右侧边栏、工作台 Shell、AI 草稿审核组件与整体暗色设计系统；严格遵守 Vue 3 Only。
+owner: admin
+area: modstore-frontend
+
+scope_globs:
+  - MODstore_deploy/market/src/views/workbench/**
+  - MODstore_deploy/market/src/components/workbench/**
+  - MODstore_deploy/market/src/components/admin/**
+  - MODstore_deploy/market/src/views/WorkbenchHomeView.vue
+  # 管理后台 UI（Admin Console）划入工作台 UX 范畴：与工作台同属内部工具/暗色仪表盘体系
+  - MODstore_deploy/market/src/views/Admin*View.vue
+  - MODstore_deploy/market/src/views/admin/**
+
+forbidden_globs:
+  # 非工作台 + 非管理后台的视图归 market-frontend-dev
+  - MODstore_deploy/market/src/views/Home*.vue
+  - MODstore_deploy/market/src/views/Login*.vue
+  - MODstore_deploy/market/src/views/Payment*.vue
+  - MODstore_deploy/market/src/views/Order*.vue
+  - MODstore_deploy/market/src/api.ts            # API 层归 market-frontend-dev
+  - MODstore_deploy/modstore_server/**
+  - "*.py"
+  - _local_secrets/**
+  - "react"
+
+triggers:
+  on_error: true
+  on_quality_fail: true
+  on_coverage_miss: false
+  max_patch_budget_tokens: 4000
+  max_patch_steps: 5
+
+sla:
+  timeout_seconds: 120
+  retry_max: 2
+  escalate_to_human: true
+
+llm_default: "auto"
+llm_reasoning: "auto"
+
+capabilities:
+  - workbench.component.fix
+
+skills:
+  - skills/skill-workbench-component-fix.md
+
+actions:
+  handlers: ["agent"]
+  agent:
+    workspace:
+      read_only: false
+      requires_project_root: true
+
+depends_on:
+  - market-frontend-dev
+
+tech_stack:
+  framework: "Vue 3"
+  state: "Pinia"
+  router: "Vue Router"
+  flow: "Vue Flow"
+  forbidden: ["react", "react-dom", "@types/react"]
+  forbidden_extensions: [".jsx", ".tsx"]
+
+examples:
+  - title: "工作台 UX 设计员岗位验收"
+    description: "以最小、无副作用输入验证岗位输出包含真实证据、风险与下一步。"
+    input:
+      task: "执行一次工作台 UX 设计员职责范围内的只读检查，并返回证据、风险和下一步。"
+      dry_run: true
+
+changelog:
+  - version: "1.0.0"
+    date: "2026-05-06"
+    note: "初始创建"

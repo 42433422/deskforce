@@ -1,0 +1,83 @@
+name: desktop-security-scan
+
+# 桌面端 Electron 安全扫描(electronegativity)
+# 与 gitleaks / codeql 同级,作为 PR 门禁;每周一全量扫描一次。
+# 扫描对象: FHD/desktop/(剔除 node_modules/dist/build/coverage/.vitest-cache)
+# 失败门禁: 任何 HIGH 严重程度 finding 即阻断合并(可用 -x 在源码中按需排除并写明理由)。
+# 报告: SARIF 上传 GitHub Code Scanning + CSV/HTML artifact 保留 30 天。
+# 误报抑制: .github/electronegativity-suppressions.json (带 expires 过期强制复审)。
+
+on:
+  pull_request:
+    branches: [main, master]
+    paths:
+      - "FHD/desktop/**"
+      - ".github/workflows/desktop-security-scan.yml"
+      - ".github/scripts/parse-electronegativity-csv.js"
+      - ".github/electronegativity-suppressions.json"
+  push:
+    branches: [main, master]
+    paths:
+      - "FHD/desktop/**"
+      - ".github/workflows/desktop-security-scan.yml"
+      - ".github/scripts/parse-electronegativity-csv.js"
+      - ".github/electronegativity-suppressions.json"
+  schedule:
+    - cron: "0 3 * * 1"  # 每周一 03:00 UTC 全量扫描
+  workflow_dispatch:
+    inputs:
+      gate_severity:
+        description: "门禁阈值(high/medium/low)"
+        required: false
+        default: "high"
+        type: choice
+        options: [high, medium, low]
+
+permissions:
+  contents: read
+  security-events: write  # 上传 SARIF 到 Code Scanning
+
+concurrency:
+  group: desktop-security-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  electronegativity-scan:
+    name: Electronegativity (Electron security)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: FHD/desktop
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: FHD/desktop/package-lock.json
+
+      - name: Build, scan, validate reports, and gate
+        id: gate
+        env:
+          GATE_SEVERITY: ${{ github.event.inputs.gate_severity || (github.event_name == 'schedule' && 'medium' || 'high') }}
+          ELECTRONEGATIVITY_REPORT_DIR: /tmp/en-report
+        run: |
+          bash scripts/security-scan.sh --gate-severity "${GATE_SEVERITY}"
+
+      - name: Upload SARIF to GitHub Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: /tmp/en-report/electronegativity.sarif
+          category: electronegativity
+
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: electronegativity-report
+          path: /tmp/en-report/
+          retention-days: 30

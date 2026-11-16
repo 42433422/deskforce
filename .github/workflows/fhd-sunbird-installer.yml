@@ -1,0 +1,24 @@
+# CI SSOT: generated from FHD/.github/workflows/sunbird-installer.yml — DO NOT edit here.
+# Edit that source, then run: python scripts/dev/publish_ci_workflows_to_root.py
+# Historical customer installers are retired. Every customer uses the main Enterprise host.
+name: Sunbird Installer (retired)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: .
+
+jobs:
+  retired:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refuse retired customer installer before any checkout
+        shell: bash
+        run: |
+          echo "::error::Sunbird customer installers are retired. Use the standard Enterprise release from main and account-authorized customer Mods."
+          exit 1

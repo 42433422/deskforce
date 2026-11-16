@@ -1,0 +1,107 @@
+import packageJson from '../../package.json'
+
+/** 主版本号展示，如 8.0.0 → V8 */
+export const XCAGI_VERSION_LABEL = `V${String(packageJson.version || '8.0.0').split('.')[0]}`
+
+export type LoginSku = 'enterprise' | 'personal' | 'generic' | string
+
+export function normalizeLoginSku(raw: string | null | undefined): LoginSku {
+  const s = String(raw || 'generic')
+    .trim()
+    .toLowerCase()
+  if (s === 'enterprise' || s === 'personal') return s
+  return 'generic'
+}
+
+export function loginEyebrow(sku: LoginSku): string {
+  switch (normalizeLoginSku(sku)) {
+    case 'enterprise':
+      return `XCAGI 企业版 · ${XCAGI_VERSION_LABEL}`
+    case 'personal':
+      return `XCAGI 个人版 · ${XCAGI_VERSION_LABEL}`
+    default:
+      return `XCAGI · ${XCAGI_VERSION_LABEL}`
+  }
+}
+
+export function loginSubtitle(sku: LoginSku): string {
+  switch (normalizeLoginSku(sku)) {
+    case 'enterprise':
+      return '使用 XCAGI 账号登录'
+    case 'personal':
+      return '本地账号登录'
+    default:
+      return '登录进入工作台'
+  }
+}
+
+export function loginUsernamePlaceholder(sku: LoginSku): string {
+  return normalizeLoginSku(sku) === 'enterprise' ? 'XCAGI 账号' : '账号'
+}
+
+export function loginAccountInputPlaceholder(sku: LoginSku): string {
+  switch (normalizeLoginSku(sku)) {
+    case 'enterprise':
+      return 'XCAGI 账号或邮箱'
+    case 'personal':
+      return '本地账号'
+    default:
+      return '账号'
+  }
+}
+
+export function loginPasswordInputPlaceholder(): string {
+  return '密码'
+}
+
+export function marketBaseUrl(): string {
+  return String(import.meta.env.VITE_MARKET_BASE || 'https://xiu-ci.com/market').replace(/\/$/, '')
+}
+
+export function marketRegisterUrl(): string {
+  return `${marketBaseUrl()}/register?source=xcagi-desktop`
+}
+
+export function purchaseAuthorizationUrl(): string {
+  return String(
+    import.meta.env.VITE_XCAGI_PURCHASE_URL || `${marketBaseUrl()}/account-plans?plan=saas-trial-30&source=xcagi-desktop`,
+  ).trim()
+}
+
+export function marketForgotPasswordUrl(): string {
+  return `${marketBaseUrl()}/forgot-password`
+}
+
+export function loginHelpDocUrl(): string {
+  return String(import.meta.env.VITE_LOGIN_HELP_URL || '')
+}
+
+export type LoginHelpSection = {
+  title: string
+  items: string[]
+}
+
+export const LOGIN_HELP_PAGE_TITLE = '登录帮助'
+
+export function loginPageTitle(sku: LoginSku): string {
+  return `${loginEyebrow(sku)} · 登录`
+}
+
+export const LOGIN_HELP_SECTIONS: LoginHelpSection[] = [
+  {
+    title: '账号或密码错误',
+    items: ['核对账号密码；忘记密码时使用下方找回入口', '仍无法登录时，复制本页诊断信息联系管理员'],
+  },
+  {
+    title: '无法连接应用服务',
+    items: ['点击“检查连接”，按检测结果重试登录', '桌面用户可退出并重新打开应用；仍失败时复制诊断信息联系管理员'],
+  },
+  {
+    title: '账号同步',
+    items: ['登录后会自动同步账号信息', '同步失败时可稍后重新登录'],
+  },
+  {
+    title: '注册与购买',
+    items: ['企业版请使用登录页的“注册账号”入口', '完成支付后返回桌面重新登录即可使用'],
+  },
+]

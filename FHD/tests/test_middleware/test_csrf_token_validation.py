@@ -1,0 +1,325 @@
+"""COVERAGE_RAMP C3.0: CSRF 中间件 - safe/mutating/exception/sandbox 路径。
+
+覆盖：
+- 安全方法（GET/HEAD/OPTIONS）放行
+- mutating 方法缺 csrf cookie → 403
+- mutating 方法 cookie 与 header 不匹配 → 403
+- mutating 方法 token 一致 → 放行
+- 登录/登出 默认豁免
+- XCAGI_CSRF_EXEMPT_AUTH=0 → 登录仍校验
+- /api/mod-store/install 在 sandbox 实例下豁免
+- 非 http scope 透传
+"""
+
+from __future__ import annotations
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from app.middleware.csrf import CSRFMiddleware
+from app.security.mobile_jwt import issue_mobile_tokens
+
+
+@pytest.fixture(autouse=True)
+def _reset_env(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("XCAGI_CSRF_EXEMPT_AUTH", raising=False)
+    monkeypatch.delenv("XCAGI_SANDBOX_INSTANCE", raising=False)
+    yield
+
+
+@pytest.fixture
+def client():
+    app = FastAPI()
+    app.add_middleware(CSRFMiddleware)
+
+    @app.get("/api/items")
+    def items():
+        return {"success": True}
+
+    @app.post("/api/items")
+    def create_item():
+        return {"success": True, "created": True}
+
+    @app.post("/api/auth/login")
+    def login():
+        return {"success": True}
+
+    @app.post("/api/auth/logout")
+    def logout():
+        return {"success": True}
+
+    @app.post("/api/mobile/v1/auth/login")
+    def mobile_login():
+        return {"success": True}
+
+    @app.post("/api/mobile/v1/auth/refresh")
+    def mobile_refresh():
+        return {"success": True}
+
+    @app.post("/api/mobile/v1/items")
+    def mobile_create_item():
+        return {"success": True, "created": True}
+
+    @app.post("/api/mod-store/install")
+    def install():
+        return {"success": True}
+
+    @app.post("/api/aiopen/mcp")
+    def aiopen_mcp():
+        return {"success": True}
+
+    @app.post("/api/kellai/binding/start")
+    def kellai_pairing_start():
+        return {"success": True}
+
+    @app.post("/api/desktop/update-install-receipts/report")
+    def desktop_install_receipt():
+        return {"success": True}
+
+    @app.post("/api/ops/autonomy/actions/ingest")
+    def autonomy_ingest():
+        return {"ok": True}
+
+    @app.post("/api/xcmax/ops/founder-autonomy/refresh-internal")
+    def founder_autonomy_refresh():
+        return {"success": True}
+
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def test_safe_method_no_csrf_required(client):
+    r = client.get("/api/items")
+    assert r.status_code == 200
+
+
+def test_mutating_missing_csrf_cookie_rejected(client):
+    r = client.post("/api/items")
+    assert r.status_code == 403
+
+
+def test_mutating_cookie_header_mismatch_rejected(client):
+    client.cookies.set("csrf_token", "cookie-tok")
+    r = client.post(
+        "/api/items",
+        headers={"X-CSRF-Token": "header-tok"},
+    )
+    assert r.status_code == 403
+
+
+def test_mutating_matching_csrf_allowed(client):
+    client.cookies.set("csrf_token", "same-tok")
+    r = client.post(
+        "/api/items",
+        headers={"X-CSRF-Token": "same-tok"},
+    )
+    assert r.status_code == 200
+    assert r.json() == {"success": True, "created": True}
+
+
+def test_unverified_bearer_does_not_bypass_csrf(client):
+    """浏览器/机器接口的失效 Bearer 仍按 CSRF 失败返回 403。"""
+    r = client.post("/api/items", headers={"Authorization": "Bearer attacker-controlled"})
+    assert r.status_code == 403
+
+
+def test_expired_mobile_bearer_is_auth_failure_not_csrf_missing(client):
+    """移动端接口应返回 401（触发客户端刷新），而不是误报 CSRF 403。"""
+    r = client.post(
+        "/api/mobile/v1/items",
+        headers={"Authorization": "Bearer attacker-controlled"},
+    )
+    assert r.status_code == 401
+    assert r.json()["code"] == "UNAUTHORIZED"
+
+
+def test_verified_mobile_access_bearer_bypasses_csrf(client, monkeypatch):
+    monkeypatch.setenv("SECRET_KEY", "csrf-test-secret-at-least-32-bytes")
+    token = issue_mobile_tokens(user_id=7, session_id="sid-7")["access_token"]
+    r = client.post("/api/items", headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 200
+
+
+def test_login_exempt_by_default(client):
+    """登录默认豁免（XCAGI_CSRF_EXEMPT_AUTH 未设时）。"""
+    r = client.post("/api/auth/login")
+    assert r.status_code == 200
+
+
+def test_logout_exempt_by_default(client):
+    r = client.post("/api/auth/logout")
+    assert r.status_code == 200
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/mobile/v1/auth/login",
+        "/api/mobile/v1/auth/refresh",
+    ],
+)
+def test_mobile_auth_endpoints_exempt_by_default(client, path):
+    r = client.post(path)
+    assert r.status_code == 200
+
+
+def test_login_not_exempt_when_env_disables(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("XCAGI_CSRF_EXEMPT_AUTH", "0")
+    app = FastAPI()
+    app.add_middleware(CSRFMiddleware)
+
+    @app.post("/api/auth/login")
+    def login():
+        return {"success": True}
+
+    client = TestClient(app, raise_server_exceptions=False)
+    r = client.post("/api/auth/login")
+    assert r.status_code == 403
+
+
+def test_mobile_login_not_exempt_when_env_disables(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("XCAGI_CSRF_EXEMPT_AUTH", "0")
+    app = FastAPI()
+    app.add_middleware(CSRFMiddleware)
+
+    @app.post("/api/mobile/v1/auth/login")
+    def mobile_login():
+        return {"success": True}
+
+    client = TestClient(app, raise_server_exceptions=False)
+    r = client.post("/api/mobile/v1/auth/login")
+    assert r.status_code == 403
+
+
+def test_logout_not_exempt_when_env_disables(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("XCAGI_CSRF_EXEMPT_AUTH", "0")
+    app = FastAPI()
+    app.add_middleware(CSRFMiddleware)
+
+    @app.post("/api/auth/logout")
+    def logout():
+        return {"success": True}
+
+    client = TestClient(app, raise_server_exceptions=False)
+    r = client.post("/api/auth/logout")
+    assert r.status_code == 403
+
+
+def test_sandbox_modstore_install_exempt(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("XCAGI_SANDBOX_INSTANCE", "1")
+    app = FastAPI()
+    app.add_middleware(CSRFMiddleware)
+
+    @app.post("/api/mod-store/install")
+    def install():
+        return {"success": True}
+
+    client = TestClient(app, raise_server_exceptions=False)
+    r = client.post("/api/mod-store/install")
+    assert r.status_code == 200
+
+
+def test_sandbox_other_endpoint_still_requires_csrf(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("XCAGI_SANDBOX_INSTANCE", "1")
+    app = FastAPI()
+    app.add_middleware(CSRFMiddleware)
+
+    @app.post("/api/mod-store/publish")
+    def publish():
+        return {"success": True}
+
+    client = TestClient(app, raise_server_exceptions=False)
+    r = client.post("/api/mod-store/publish")
+    assert r.status_code == 403
+
+
+def test_aiopen_mcp_exempt_without_csrf(client):
+    """AIOPEN MCP 供外部 Agent 调用，无 CSRF Cookie。"""
+    r = client.post("/api/aiopen/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "ping"})
+    assert r.status_code == 200
+
+
+def test_kellai_pairing_requires_dedicated_local_header(client):
+    rejected = client.post("/api/kellai/binding/start")
+    allowed = client.post(
+        "/api/kellai/binding/start",
+        headers={"X-Kellai-Local-Pairing": "1"},
+    )
+
+    assert rejected.status_code == 403
+    assert allowed.status_code == 200
+
+
+def test_desktop_install_receipt_requires_dedicated_local_header(client):
+    """Electron 本机上报安装回执：无 CSRF Cookie，但必须带专用头（路由层再校验回环）。"""
+    rejected = client.post("/api/desktop/update-install-receipts/report")
+    allowed = client.post(
+        "/api/desktop/update-install-receipts/report",
+        headers={"X-XCAGI-Desktop-Local": "1"},
+    )
+
+    assert rejected.status_code == 403
+    assert allowed.status_code == 200
+
+
+def test_ops_autonomy_ingest_requires_token_header(client):
+    """CI/CVM callback：无 CSRF，但必须带 X-Autonomy-Token（或 Bearer）。"""
+    rejected = client.post("/api/ops/autonomy/actions/ingest", json={"action": "x"})
+    allowed = client.post(
+        "/api/ops/autonomy/actions/ingest",
+        headers={"X-Autonomy-Token": "probe-token"},
+        json={"action": "x"},
+    )
+    assert rejected.status_code == 403
+    assert allowed.status_code == 200
+    assert allowed.json() == {"ok": True}
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {},
+        {"X-Autonomy-Token": "automation-secret"},
+        {"Authorization": "Bearer market-admin-jwt"},
+    ],
+)
+def test_founder_autonomy_internal_refresh_requires_both_machine_credentials(client, headers):
+    rejected = client.post(
+        "/api/xcmax/ops/founder-autonomy/refresh-internal",
+        headers=headers,
+    )
+    assert rejected.status_code == 403
+
+
+def test_founder_autonomy_internal_refresh_bypasses_csrf_with_both_credentials(client):
+    allowed = client.post(
+        "/api/xcmax/ops/founder-autonomy/refresh-internal",
+        headers={
+            "Authorization": "Bearer market-admin-jwt",
+            "X-Autonomy-Token": "automation-secret",
+        },
+    )
+    assert allowed.status_code == 200
+    assert allowed.json() == {"success": True}
+
+
+def test_non_http_scope_passthrough():
+    """WebSocket / lifespan 等非 http scope 直接放行。"""
+
+    async def app(scope, receive, send):
+        assert scope["type"] == "websocket"
+        await send({"type": "websocket.accept"})
+
+    wrapped = CSRFMiddleware(app)
+    import asyncio
+
+    received = []
+
+    async def receive():
+        return {"type": "websocket.connect"}
+
+    async def send(msg):
+        received.append(msg)
+
+    asyncio.run(wrapped({"type": "websocket", "path": "/ws"}, receive, send))
+    assert received and received[0]["type"] == "websocket.accept"

@@ -1,0 +1,362 @@
+"""
+System API Routes - FastAPI Implementation
+
+Provides endpoints for:
+- GET /api/system/industries - List all available industries
+- GET /api/system/industry - Get current industry profile
+- POST /api/system/industry - Retired global switch (authenticated admin receives 410)
+- GET /api/system/industry/{industry_id} - Get specific industry profile
+
+行业数据优先级（2026-04 调整）：
+    已加载 Mod 的 manifest.industry 声明 > resources/config/industry_config.yaml
+
+Mod 在 manifest.json 顶层声明 ``"industry": {"id": "...", "name": "...", ...}``
+即把该行业注入可用集合；YAML 仅作为无 Mod 环境的开发/回退配置。详见
+resources/config/industry_config.py::_mod_industries_dict 与
+app/infrastructure/mods/manifest.py::ModMetadata.industry。
+"""
+
+import json
+import logging
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel
+
+from app.infrastructure.auth.dependencies import require_admin_user
+from app.utils.operational_errors import RECOVERABLE_ERRORS
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/system", tags=["system"])
+
+
+class IndustryResponse(BaseModel):
+    id: str
+    name: str
+    code: str
+    description: str = ""
+    config: dict[str, Any] = {}
+
+
+class IndustriesListData(BaseModel):
+    industries: list
+    current: str
+
+
+class IndustryData(BaseModel):
+    industry: dict[str, Any]
+
+
+class SetIndustryRequest(BaseModel):
+    industry_id: str
+
+
+def _build_industry_response(industry_id: str, profile: Any) -> dict[str, Any]:
+    """Build industry response dict from profile object"""
+    return {
+        "id": industry_id,
+        "name": profile.name,
+        "code": industry_id,
+        "description": profile.name,
+        "config": {
+            "units": profile.units,
+            "quantity_fields": profile.quantity_fields,
+            "product_fields": profile.product_fields,
+            "order_types": profile.order_types,
+            "print_config": profile.print_config,
+            # 行业感知子系统 schema（菜单键→label/visible/entity/fields/rules）；
+            # 前端 useIndustryFieldSchema(menuKey) 消费。缺省空 dict，向后兼容。
+            "subsystems": getattr(profile, "subsystems", {}) or {},
+        },
+    }
+
+
+async def _allowed_industry_ids_for_request(request: Request) -> tuple[set[str] | None, str | None]:
+    """Return enterprise-filtered industry ids, or None when no account filter applies."""
+    try:
+        from app.enterprise.mod_entitlements import is_admin_account_session
+        from app.mod_sdk.industry_baseline import build_onboarding_industry_catalog_for_request
+
+        catalog = await build_onboarding_industry_catalog_for_request(request)
+        if not catalog.get("enterprise_filter_applied") or is_admin_account_session():
+            return None, None
+        ids = [str(x).strip() for x in (catalog.get("open_industry_ids") or []) if str(x).strip()]
+        first = ids[0] if ids else None
+        return set(ids), first
+    except RECOVERABLE_ERRORS:
+        logger.debug("industry entitlement filter lookup skipped", exc_info=True)
+        return None, None
+
+
+@router.get("/industries")
+async def get_industries(request: Request):
+    """Get list of all available industries"""
+    try:
+        from resources.config.industry_config import (
+            get_available_industries,
+            get_current_industry,
+            get_industry_profile,
+        )
+
+        industries = get_available_industries()
+        current = get_current_industry()
+        allowed_ids, fallback_current = await _allowed_industry_ids_for_request(request)
+
+        result_industries = []
+        for ind in industries:
+            industry_id = str(ind["id"])
+            if allowed_ids is not None and industry_id not in allowed_ids:
+                continue
+            profile = get_industry_profile(industry_id)
+            result_industries.append(_build_industry_response(industry_id, profile))
+        if allowed_ids is not None and current not in allowed_ids and fallback_current:
+            current = fallback_current
+
+        return {
+            "success": True,
+            "data": {
+                "industries": result_industries,
+                "current": current,
+            },
+        }
+    except RECOVERABLE_ERRORS as e:
+        logger.error("Failed to get industries: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/industry")
+async def get_current_industry_endpoint(request: Request):
+    """Get current industry profile"""
+    try:
+        from resources.config.industry_config import (
+            get_current_industry,
+            get_industry_profile,
+        )
+
+        current_id = get_current_industry()
+        try:
+            from app.application.tenant_workspace_prefs import (
+                get_selected_industry_id,
+                resolve_workspace_owner_id,
+            )
+            from app.infrastructure.auth.dependencies import resolve_session_user
+
+            user = resolve_session_user(request)
+            if user is not None:
+                from app.mod_sdk.customer_delivery import industry_id_for_account
+
+                username = (
+                    str(user.get("username") or "").strip()
+                    if isinstance(user, dict)
+                    else str(getattr(user, "username", "") or "").strip()
+                )
+                delivery_industry = industry_id_for_account(username)
+                owner_id = resolve_workspace_owner_id(request, user)
+                saved = get_selected_industry_id(owner_id)
+                if delivery_industry:
+                    current_id = delivery_industry
+                elif saved:
+                    current_id = saved
+        except RECOVERABLE_ERRORS:
+            logger.debug("workspace industry prefs lookup skipped", exc_info=True)
+
+        allowed_ids, fallback_current = await _allowed_industry_ids_for_request(request)
+        if allowed_ids is not None and current_id not in allowed_ids and fallback_current:
+            current_id = fallback_current
+        profile = get_industry_profile(current_id)
+
+        return {"success": True, "data": _build_industry_response(current_id, profile)}
+    except RECOVERABLE_ERRORS as e:
+        logger.exception("Failed to get current industry: %s", e)
+        # 避免 Mod manifest / YAML 异常时侧栏整页 500：回退到内置「涂料」档案
+        try:
+            from resources.config.industry_config import get_industry_profile
+
+            fid = "涂料"
+            profile = get_industry_profile(fid)
+            return {"success": True, "data": _build_industry_response(fid, profile)}
+        except RECOVERABLE_ERRORS:
+            raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.post(
+    "/industry",
+    deprecated=True,
+    description="全局行业切换已停用，行业由账号资料确定；GET /api/system/industry 仅查询当前行业。",
+    status_code=410,
+    responses={
+        401: {"description": "Authentication required"},
+        403: {"description": "Administrator account required"},
+        410: {"description": "Retired industry switch; no data is changed"},
+    },
+)
+async def set_industry_endpoint(
+    request_body: SetIndustryRequest,
+    request: Request,
+    admin_user: Any = Depends(require_admin_user),
+):
+    """已停用的全局行业切换入口；保留登录及管理员门禁，不再返回虚假成功。"""
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "code": "INDUSTRY_SWITCH_RETIRED",
+            "message": "行业由账号资料确定，该切换入口已停用。",
+        },
+    )
+
+
+@router.get("/host-profile")
+async def get_host_profile():
+    """宿主 SKU profile（bridge 列表、打包白名单、工作流交付形态等）。"""
+    try:
+        from app.mod_sdk.host_profile import build_host_profile_api_payload
+
+        return {"success": True, "data": build_host_profile_api_payload()}
+    except RECOVERABLE_ERRORS as e:
+        logger.error("Failed to get host profile: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.get("/industry-presets")
+async def get_industry_presets():
+    """跨行业 UI 预设（config/industry_presets.json），供前端与 MODstore 制作端共用。"""
+    try:
+        from app.mod_sdk.host_profile import load_industry_presets_document
+
+        doc = load_industry_presets_document()
+        return {
+            "success": True,
+            "data": {
+                "schema_version": doc.get("schema_version", 1),
+                "preset_ids": doc.get("preset_ids") or list((doc.get("presets") or {}).keys()),
+                "presets": doc.get("presets") or {},
+            },
+        }
+    except RECOVERABLE_ERRORS as e:
+        logger.error("Failed to get industry presets: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.get("/workflow-employee-catalog")
+async def get_workflow_employee_catalog():
+    """工作流员工目录（配置 + 扫描 mods 目录）。"""
+    try:
+        from app.mod_sdk.host_profile import (
+            load_host_profile,
+            load_workflow_employee_catalog,
+            scan_workflow_employee_catalog_from_mods,
+        )
+
+        catalog = scan_workflow_employee_catalog_from_mods()
+        prof = load_host_profile()
+        return {
+            "success": True,
+            "data": {
+                "catalog": catalog,
+                "workflow_delivery": prof.get("workflow_delivery"),
+                "workflow_monolith_mod_id": prof.get("workflow_monolith_mod_id"),
+                "workflow_split_mod_ids": prof.get("workflow_split_mod_ids"),
+                "static_catalog": load_workflow_employee_catalog(),
+            },
+        }
+    except RECOVERABLE_ERRORS as e:
+        logger.error("Failed to get workflow employee catalog: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.get("/employee-registry-rules")
+async def get_employee_registry_rules():
+    """副窗工作流员工注册规则（替代前端硬编码过滤）。"""
+    try:
+        from app.mod_sdk.host_profile import get_employee_registry_rules
+
+        return {"success": True, "data": get_employee_registry_rules()}
+    except RECOVERABLE_ERRORS as e:
+        logger.error("Failed to get employee registry rules: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.get("/duty-roster")
+async def get_duty_roster():
+    """编制矩阵 SSOT 派生（替代前端硬编码 yuangonDutyRoster.ts）。
+
+    单一真相源：FHD/config/duty_roster.json + mods/_employees/*/manifest.json
+    运行时派生：areas / departments / employee_labels / employee_descriptions / all_planned_ids
+    """
+    try:
+        from app.mod_sdk.duty_roster import (
+            all_planned_duty_employee_ids,
+            load_duty_roster_document,
+        )
+        from app.mod_sdk.host_profile import resolve_fhd_config_dir
+
+        doc = load_duty_roster_document()
+        areas = doc.get("areas") or {}
+        departments = doc.get("departments") or {}
+
+        # 从 mods/_employees/*/manifest.json 派生员工中文名与说明
+        employee_labels: dict[str, str] = {}
+        employee_descriptions: dict[str, str] = {}
+        cfg_dir = resolve_fhd_config_dir()
+        if cfg_dir is not None:
+            employees_dir = cfg_dir.parent / "mods" / "_employees"
+            if employees_dir.is_dir():
+                for manifest_path in employees_dir.glob("*/manifest.json"):
+                    try:
+                        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+                        if not isinstance(data, dict):
+                            continue
+                        emp_id = str(data.get("id") or "").strip()
+                        if not emp_id:
+                            continue
+                        name = str(data.get("name") or "").strip()
+                        desc = str(data.get("description") or "").strip()
+                        if name:
+                            employee_labels[emp_id] = name
+                        if desc:
+                            employee_descriptions[emp_id] = desc
+                    except RECOVERABLE_ERRORS:
+                        continue
+
+        all_planned_ids = sorted(all_planned_duty_employee_ids())
+
+        return {
+            "success": True,
+            "data": {
+                "areas": areas,
+                "departments": departments,
+                "employee_labels": employee_labels,
+                "employee_descriptions": employee_descriptions,
+                "all_planned_ids": all_planned_ids,
+                "schema_version": doc.get("schema_version", 1),
+            },
+        }
+    except RECOVERABLE_ERRORS as e:
+        logger.error("Failed to get duty roster: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.get("/industry/{industry_id}")
+async def get_industry_detail(industry_id: str):
+    """Get specific industry profile"""
+    try:
+        from resources.config.industry_config import (
+            get_available_industries,
+            get_industry_profile,
+        )
+
+        available = get_available_industries()
+        industry_ids = [ind["id"] for ind in available]
+
+        if industry_id not in industry_ids:
+            raise HTTPException(status_code=404, detail=f"Industry not found: {industry_id}")
+
+        profile = get_industry_profile(industry_id)
+
+        return {"success": True, "data": _build_industry_response(industry_id, profile)}
+    except HTTPException:
+        raise
+    except RECOVERABLE_ERRORS as e:
+        logger.error("Failed to get industry %s: %s", industry_id, e)
+        raise HTTPException(status_code=500, detail=str(e))

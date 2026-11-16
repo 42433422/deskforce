@@ -1,0 +1,340 @@
+"""
+产品应用服务
+
+负责产品管理相关的用例编排，包括产品查询、创建、更新、删除、导入等
+"""
+
+from datetime import datetime
+from typing import TYPE_CHECKING, Any, Optional, cast
+
+if TYPE_CHECKING:
+    from app.services import PrinterService, ProductsService
+
+
+def _normalize_optional_str(value: str | None) -> str | None:
+    if value is None:
+        return None
+    stripped = str(value).strip()
+    return stripped if stripped else None
+
+
+class ProductApplicationService:
+    """产品应用服务 - 负责产品相关的用例编排"""
+
+    def __init__(
+        self,
+        products_service: Optional["ProductsService"] = None,
+        printer_service: Optional["PrinterService"] = None,
+    ):
+        from app.services import get_printer_service, get_products_service
+
+        self._products_service = products_service or get_products_service()
+        self._printer_service = printer_service or get_printer_service()
+
+    def get_product_units(self) -> dict[str, Any]:
+        """
+        获取产品单位列表用例
+
+        Returns:
+            单位列表
+        """
+        return self._products_service.get_product_units()
+
+    def get_products(
+        self,
+        unit: str | None = None,
+        unit_name: str | None = None,
+        model_number: str | None = None,
+        keyword: str | None = None,
+        page: int = 1,
+        per_page: int = 20,
+    ) -> dict[str, Any]:
+        """
+        获取产品列表用例
+
+        Args:
+            unit: 单位名称筛选（与 unit_name 二选一，unit_name 优先）
+            unit_name: 单位名称筛选
+            model_number: 型号筛选
+            keyword: 搜索关键词
+            page: 页码
+            per_page: 每页数量
+
+        Returns:
+            产品列表和分页信息
+        """
+        resolved_unit = _normalize_optional_str(unit_name) or _normalize_optional_str(unit)
+        resolved_model = _normalize_optional_str(model_number)
+        if resolved_model:
+            resolved_model = resolved_model.upper()
+        resolved_keyword = _normalize_optional_str(keyword)
+        return self._products_service.get_products(
+            unit_name=resolved_unit,
+            model_number=resolved_model,
+            keyword=resolved_keyword,
+            page=page,
+            per_page=per_page,
+        )
+
+    def get_product_names(self, keyword: str | None = None) -> dict[str, Any]:
+        """获取产品名称列表用例。"""
+        return self._products_service.get_product_names(keyword=keyword)
+
+    def get_product(self, product_id: int) -> dict[str, Any]:
+        """
+        获取单个产品用例
+
+        Args:
+            product_id: 产品 ID
+
+        Returns:
+            产品信息
+        """
+        return self._products_service.get_product(product_id)
+
+    def create_product(self, data: dict[str, Any]) -> dict[str, Any]:
+        """
+        创建产品用例
+
+        Args:
+            data: 产品数据，包含：
+                - unit_name: 单位名称
+                - product_name: 产品名称
+                - price: 价格
+                - description: 描述（可选）
+
+        Returns:
+            创建结果
+        """
+        raw_unit = data.get("unit_name") or data.get("unit")
+        if not _normalize_optional_str(raw_unit if isinstance(raw_unit, str) else None):
+            return {"success": False, "message": "单位名称不能为空"}
+
+        product_name = data.get("product_name") or data.get("name")
+
+        if not product_name:
+            return {"success": False, "message": "产品名称不能为空"}
+
+        if "price" in data and data["price"] < 0:
+            return {"success": False, "message": "价格不能为负数"}
+
+        result = self._products_service.create_product(data)
+
+        if result.get("success"):
+            self._log_action("create_product", product_id=result.get("product_id"), data=data)
+
+        return result
+
+    def update_product(self, product_id: int, data: dict[str, Any]) -> dict[str, Any]:
+        """
+        更新产品用例
+
+        Args:
+            product_id: 产品 ID
+            data: 更新数据
+
+        Returns:
+            更新结果
+        """
+        if "price" in data and data["price"] < 0:
+            return {"success": False, "message": "价格不能为负数"}
+
+        result = self._products_service.update_product(product_id, data)
+
+        if result.get("success"):
+            self._log_action("update_product", product_id=product_id, data=data)
+
+        return result
+
+    def delete_product(self, product_id: int) -> dict[str, Any]:
+        """
+        删除产品用例 (软删除)
+
+        Args:
+            product_id: 产品 ID
+
+        Returns:
+            删除结果
+        """
+        result = self._products_service.delete_product(product_id)
+
+        if result.get("success"):
+            self._log_action("delete_product", product_id=product_id)
+
+        return result
+
+    def import_products_from_excel(self, file_path: str, unit_name: str) -> dict[str, Any]:
+        """
+        从 Excel 导入产品用例
+
+        Args:
+            file_path: Excel 文件路径
+            unit_name: 单位名称
+
+        Returns:
+            导入结果
+        """
+        importer = getattr(self._products_service, "import_products_from_excel", None)
+        if not callable(importer):
+            from app.services import get_product_import_service
+
+            importer = get_product_import_service().import_products_from_excel
+        result = importer(file_path, unit_name)
+
+        if result.get("success"):
+            self._log_action("import_products", count=result.get("count", 0), unit_name=unit_name)
+
+        return cast("dict[str, Any]", result)
+
+    def get_product_labels(
+        self, product_id: int, quantity: int = 1, label_type: str = "default"
+    ) -> dict[str, Any]:
+        """
+        获取产品标签用例
+
+        Args:
+            product_id: 产品 ID
+            quantity: 标签数量
+            label_type: 标签类型
+
+        Returns:
+            标签数据
+        """
+        product_result = self._products_service.get_product(product_id)
+
+        if not product_result.get("success"):
+            return product_result
+
+        raw_product = product_result.get("data")
+        if not isinstance(raw_product, dict):
+            return {"success": False, "message": "产品数据格式错误"}
+        product = raw_product
+
+        label_data = {
+            "product_id": product_id,
+            "product_name": product.get("name"),
+            "model_number": product.get("model_number"),
+            "specification": product.get("specification"),
+            "unit": product.get("unit"),
+            "quantity": quantity,
+            "label_type": label_type,
+        }
+
+        return {"success": True, "data": label_data}
+
+    def print_product_labels(
+        self, product_id: int, quantity: int = 1, label_type: str = "default"
+    ) -> dict[str, Any]:
+        """
+        打印产品标签用例
+
+        Args:
+            product_id: 产品 ID
+            quantity: 标签数量
+            label_type: 标签类型
+
+        Returns:
+            打印结果
+        """
+        label_result = self.get_product_labels(product_id, quantity, label_type)
+
+        if not label_result.get("success"):
+            return label_result
+
+        label_data = label_result.get("data")
+        if not isinstance(label_data, dict):
+            return {"success": False, "message": "标签数据格式错误"}
+
+        return cast("dict[str, Any]", self._printer_service.print_labels([label_data]))
+
+    def search_products(
+        self, keyword: str, filters: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """
+        高级产品搜索用例
+
+        Args:
+            keyword: 搜索关键词
+            filters: 额外筛选条件
+
+        Returns:
+            搜索结果
+        """
+        filters = filters or {}
+
+        return self._products_service.get_products(
+            unit_name=filters.get("unit"),
+            keyword=keyword,
+            page=filters.get("page", 1),
+            per_page=filters.get("per_page", 20),
+        )
+
+    def get_product_statistics(self, unit: str | None = None) -> dict[str, Any]:
+        """
+        获取产品统计信息用例
+
+        Args:
+            unit: 单位名称筛选
+
+        Returns:
+            统计信息
+        """
+        result = self._products_service.get_products(unit_name=unit, page=1, per_page=1)
+        total = result.get("total", 0)
+
+        return {
+            "success": True,
+            "data": {
+                "total_products": total,
+                "unit": unit or "全部",
+                "statistics_time": datetime.now().isoformat(),
+            },
+        }
+
+    def _log_action(self, action: str, **kwargs):
+        """
+        记录操作审计日志
+
+        Args:
+            action: 操作名称
+            **kwargs: 操作相关参数
+        """
+        pass
+
+
+from app.neuro_bus.neuro_application_instrumentation import instrument_application_service_class
+
+instrument_application_service_class(ProductApplicationService)
+
+_product_app_service: ProductApplicationService | None = None
+
+
+def get_product_app_service() -> ProductApplicationService:
+    """获取产品应用服务单例 (别名)"""
+    return get_product_application_service()
+
+
+def get_product_application_service() -> ProductApplicationService:
+    """获取产品应用服务单例"""
+    global _product_app_service
+    if _product_app_service is None:
+        _product_app_service = ProductApplicationService()
+    return _product_app_service
+
+
+def init_product_application_service(
+    products_service: "ProductsService", printer_service: Optional["PrinterService"] = None
+) -> "ProductApplicationService":
+    """初始化产品应用服务 (用于依赖注入)"""
+    global _product_app_service
+    _product_app_service = ProductApplicationService(
+        products_service=products_service, printer_service=printer_service
+    )
+    return _product_app_service
+
+
+def init_product_app_service(
+    products_service: "ProductsService", printer_service: Optional["PrinterService"] = None
+) -> "ProductApplicationService":
+    """初始化产品应用服务 (用于依赖注入) (别名)"""
+    return init_product_application_service(products_service, printer_service)
