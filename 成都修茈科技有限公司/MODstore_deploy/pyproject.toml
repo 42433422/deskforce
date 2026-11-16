@@ -64,7 +64,7 @@ evolution-metrics = [
     "pytest-asyncio>=1.4.0",
 ]
 aliyun-tts = [
-    "dashscope>=1.14",
+    "dashscope>=2.0.4",
 ]
 vibe = [
     # vibe-coding 接入：NL → 代码 → 沙盒 → 自愈 + 仓库级 patch / heal。
